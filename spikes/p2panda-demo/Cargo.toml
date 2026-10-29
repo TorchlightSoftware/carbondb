@@ -1,0 +1,17 @@
+[package]
+name = "p2panda-demo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# p2panda's high-level spaces API is only on main (after v0.7.1), so both crates are pinned to the
+# same commit. Switch to crates.io versions once p2panda 0.8 is released.
+[dependencies]
+p2panda = { git = "https://github.com/p2panda/p2panda", rev = "da80c05b95269926bf58121cf6a2d3dd5ca41dfc" }
+p2panda-core = { git = "https://github.com/p2panda/p2panda", rev = "da80c05b95269926bf58121cf6a2d3dd5ca41dfc" }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync"] }
+tokio-stream = "0.1.18"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
