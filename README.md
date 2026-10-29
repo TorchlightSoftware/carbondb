@@ -4,7 +4,9 @@ A foundation in Rust for local-first applications that people own: identity, sto
 
 ## Why
 
-Decentralized programming is hard, so the economic incentives keep leading back to centralized services "for now", and "for now" becomes "forever". The platforms that try to change this either leave peer discovery, sync and device management for every developer to rebuild, or bundle so much runtime and domain language that they are hard to trust. CarbonDB aims for the middle: a small core that does those hard parts once, so that applications can be thin layers over data the user holds.
+Decentralized programming is hard, and economic incentives keep leading us back to centralized services "for now". "for now" becomes "forever". The platforms that try to change this either do too little: leaving peer discovery, sync and device management for every developer to rebuild; or bundle so much runtime and domain language that they become difficult to adopt and apply to diverse use cases.
+
+CarbonDB is an experiment in creating a general purpose framework for applications that prefer local-first state and personal data custody.
 
 ## Goals
 
