@@ -5,9 +5,10 @@ Status: agreed
 ## Calls
 
 ```js
-const personal = await identity.createSpace({name: 'Personal', services: ['contacts', 'chat']})
+// created with the identity (story 1)
+const {identity, personal} = await carbon.createIdentity({slug: 'brandon', device: 'laptop', services: ['contacts', 'chat']})
 // later sessions
-const personal = await identity.resumeSpace('personal')
+const personal = carbon.ref('identity:brandon').ref('personal:brandon')
 
 await personal.call('PUT [contacts]/contacts/sally', {name: 'Sally'})
 await personal.call('GET [contacts]/contacts')
@@ -15,8 +16,8 @@ await personal.call('GET [contacts]/contacts')
 
 ## Rules
 
-- A personal space is an ordinary space that starts with one member. It may be shared later (a caretaker, power of attorney); warning before sharing is up to the app.
-- `createSpace` takes a name shared with members and derives a local slug from it, adding `-N` with an incrementing integer when the slug is taken; an optional `slug` overrides it. `identity.listSpaces()` lists them.
+- Every identity has one personal space, created with it. It is the private root of what the identity owns: the refs to spaces it creates or joins, its devices' names and tags, and personal data. It starts with one member and may be shared later (a caretaker, power of attorney) without being conflated with the identity; warning before sharing is up to the app.
+- Its services are named when the identity is created, since a space's services are fixed at creation. `[space]` and `[device]` always run there.
 - `call` resolves with the handler's result or rejects with its error. A call refused on this device is not published.
 - A GET is answered from this device's copy and never becomes an op.
 - Each call runs in one transaction: queries return results immediately, and the writes commit when the handler resolves or roll back when it fails.
