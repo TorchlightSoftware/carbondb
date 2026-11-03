@@ -1,0 +1,4 @@
+1) Don't put my name "brandon" in the tests or the codebase.
+2) do "builtins" need to be stored in a form that's more hashable?  Same question for SQL migrations, both for [@carbon] and for [space], [identity], [device], etc.  The call catalog, the handler implementations, and the SQL schemas all have to be tightly versioned, and you can't run a CALL on an unknown version of code.  So it seems like we need to implement and enforce this abstraction and packaging, even in our own impls.  And it can't be language specific.
+3) space.rs: it's pretty ugly to have SQL interspersed with Rust code
+4) carbon.rs: weird to see call_system, call_space, etc. define their own keys/handlers... I would expect to see more of a structured "routing in one place", "handlers in one place" etc rather than scattered throughout the code.

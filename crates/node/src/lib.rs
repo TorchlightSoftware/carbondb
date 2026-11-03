@@ -14,7 +14,7 @@ use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
 
-use carbondb_core::{self as core, Side};
+use carbondb_core as core;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde_json::Value;
@@ -43,6 +43,23 @@ pub struct Outcome {
 impl From<core::Outcome> for Outcome {
   fn from(outcome: core::Outcome) -> Self {
     Outcome { value: outcome.value, tables: outcome.tables, wrote: outcome.wrote }
+  }
+}
+
+// The core's `Side` as JS names it: which of a space's two connections a query
+// runs on, 'writer' inside an apply or 'reader' inside a read.
+#[napi(string_enum = "lowercase")]
+pub enum Side {
+  Writer,
+  Reader,
+}
+
+impl From<Side> for core::Side {
+  fn from(side: Side) -> Self {
+    match side {
+      Side::Writer => core::Side::Writer,
+      Side::Reader => core::Side::Reader,
+    }
   }
 }
 
@@ -104,14 +121,14 @@ pub struct Space {
 impl Space {
   #[napi]
   pub fn origin(&self) -> Result<Value> {
-    let origin = core::space::origin(&self.store, Side::Reader).map_err(to_napi)?;
+    let origin = core::space::origin(&self.store, core::Side::Reader).map_err(to_napi)?;
     serde_json::to_value(origin).map_err(|error| to_napi(core::error::internal(error.to_string())))
   }
 
   // The space a ref here points to, by kind and slug.
   #[napi]
   pub fn find_ref(&self, kind: String, slug: String) -> Result<Option<Value>> {
-    let found = core::space::find_ref(&self.store, Side::Reader, &kind, &slug).map_err(to_napi)?;
+    let found = core::space::find_ref(&self.store, core::Side::Reader, &kind, &slug).map_err(to_napi)?;
     Ok(found.map(|reference| serde_json::to_value(reference).expect("a ref serializes")))
   }
 
@@ -121,29 +138,21 @@ impl Space {
     core::space::migrate(&self.store, &service, &migrations).map_err(to_napi)
   }
 
+  // A write statement, on the writer: only an open apply's handler writes.
   #[napi]
   pub fn run(&self, sql: String, params: Option<Vec<Value>>) -> Result<f64> {
-    Ok(self.store.run(Side::Writer, &sql, &params.unwrap_or_default()).map_err(to_napi)? as f64)
+    Ok(self.store.run(core::Side::Writer, &sql, &params.unwrap_or_default()).map_err(to_napi)? as f64)
+  }
+
+  // The first row, or null: on the writer inside an apply, on the reader inside a read.
+  #[napi]
+  pub fn get(&self, side: Side, sql: String, params: Option<Vec<Value>>) -> Result<Value> {
+    self.store.get(side.into(), &sql, &params.unwrap_or_default()).map_err(to_napi)
   }
 
   #[napi]
-  pub fn get(&self, sql: String, params: Option<Vec<Value>>) -> Result<Value> {
-    self.store.get(Side::Writer, &sql, &params.unwrap_or_default()).map_err(to_napi)
-  }
-
-  #[napi]
-  pub fn all(&self, sql: String, params: Option<Vec<Value>>) -> Result<Vec<Value>> {
-    self.store.all(Side::Writer, &sql, &params.unwrap_or_default()).map_err(to_napi)
-  }
-
-  #[napi]
-  pub fn read_get(&self, sql: String, params: Option<Vec<Value>>) -> Result<Value> {
-    self.store.get(Side::Reader, &sql, &params.unwrap_or_default()).map_err(to_napi)
-  }
-
-  #[napi]
-  pub fn read_all(&self, sql: String, params: Option<Vec<Value>>) -> Result<Vec<Value>> {
-    self.store.all(Side::Reader, &sql, &params.unwrap_or_default()).map_err(to_napi)
+  pub fn all(&self, side: Side, sql: String, params: Option<Vec<Value>>) -> Result<Vec<Value>> {
+    self.store.all(side.into(), &sql, &params.unwrap_or_default()).map_err(to_napi)
   }
 
   // Run an async handler in one write transaction: commit when it resolves, roll

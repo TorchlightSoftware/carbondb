@@ -33,6 +33,13 @@ function opContext(carbon, actor, key, path, input) {
   })
 }
 
+// A handler's queries on one side of the space's database: the writer inside a
+// write's transaction, the reader on a GET's snapshot. Only a write's db adds `run`.
+const queries = (native, side) => ({
+  get: (sql, params) => native.get(side, sql, params),
+  all: (sql, params) => native.all(side, sql, params)
+})
+
 export class Space {
   #writes = new Queue()
   #reads = new Queue()
@@ -78,11 +85,11 @@ export class Space {
     const service = this.#service(parts)
     const {call, path} = route(service.routes, parts.method, parts.resource)
     if (parts.method === 'GET') {
-      const db = {get: (sql, params) => native.readGet(sql, params), all: (sql, params) => native.readAll(sql, params)}
+      const db = queries(native, 'reader')
       return this.#reads.push(() => coreAsync(native.read(async () => call.handler({path, input, db}))))
     }
     const op = opContext(this.carbon, actor, key, path, input)
-    const db = {run: (sql, params) => native.run(sql, params), get: (sql, params) => native.get(sql, params), all: (sql, params) => native.all(sql, params)}
+    const db = {...queries(native, 'writer'), run: (sql, params) => native.run(sql, params)}
     const outcome = await this.#writes.push(() => coreAsync(native.apply(async () => call.handler({path, input, op, db}))))
     this.#changed(outcome.tables)
     return outcome

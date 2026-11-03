@@ -56,12 +56,7 @@ fn require_in_scope(store: &Store, call: &Call) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  fn key(key: &str) -> Call {
-    let (method, rest) = key.split_once(' ').unwrap();
-    let (service, resource) = rest.trim_start_matches('[').split_once(']').unwrap();
-    Call { method: Some(method.into()), service: service.into(), resource: resource.into(), confined: false }
-  }
+  use crate::testing::call as key;
 
   fn brandon() -> Actor {
     Actor { identity: Some("brandon".into()), device: Some("pixel".into()) }

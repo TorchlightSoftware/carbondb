@@ -2380,3 +2380,10 @@ Update the plans and I'll commit the repo.
 
 ---
 
+    Four lines in the docs still put validation in the runtime, so I'd fix them:
+
+Yes, get rid of that.
+
+Then proceed with implementation.  Ideally accomplish the entire agenda, and only stop if you have something truly show stopping.  Feel free to make decisions and just note them in the agenda if you want my review.  You have a lot of detailed context from all the planning we have done in the last few days, so don't stop for minor issues.
+
+Thanks and godspeed!
