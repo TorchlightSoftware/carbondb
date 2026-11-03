@@ -1,6 +1,6 @@
 # CarbonDB first draft: implementation notes
 
-Status: agreed — first draft, nothing built yet
+Status: agreed — single-node hello world built (build steps 1 to 3); replicated mode not started
 
 This is everything we agreed that the code has to honour, gathered in one place for whoever builds the first draft. The nine numbered stories say what a person can do, [services.md](services.md) lists the builtin calls, and [oplog-examples.md](oplog-examples.md) shows them in use. This file covers what happens underneath. Where older notes disagree with it, this file wins.
 
@@ -71,7 +71,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 ## Stack
 
 - **Packaging:** one native binary per platform. JS apps drive it as a library, and the Node binding is a napi-rs native module.
-- **Handlers:** service handlers run in the host Node process and call the core for storage and sync. Route definitions stay in JS, and input validation uses zod as is.
+- **Handlers:** service handlers run in the host Node process and call the core for storage and sync. Route definitions stay in JS. Validating a call's input is the service's own business: a handler that validates throws `validationError`, and CarbonDB never sees its schema.
 - **SQLite:** real SQLite in the Rust core. Internally, Rust exposes one `execute(sql, params, method)` host function to handlers, where `method` is Drizzle sqlite-proxy's run, all, get or values.
 - **rusqlite:** pinned to 0.39.0 with the `session` and `bundled` features. Version 0.41.1 cannot link beside sqlx 0.9, because it needs libsqlite3-sys 0.39 and sqlx-sqlite 0.9.0 needs below 0.38.
 - **p2panda:** provides transport, signed per-author logs and spaces, so sqlite-sync and cr-sqlite are not needed. Only capture and merge are ours.
@@ -128,7 +128,7 @@ Creating a space cannot be undone. If a rewind rejects a parent's ref, the space
 - The author comes from the signed envelope, never from a field on the call.
 - The op hash is computed over CarbonDB's signed envelope before the handler runs. It is separate from the p2panda operation hash, which does not exist yet at that point and covers ciphertext.
 - Ops relate through the hybrid logical clock, not through lists of other ops. The one exception is the per-device removal cutoff.
-- Op shape is validated by the service's zod input schema, as data. There is no separate cross-record validation layer; a handler error rejects the op.
+- CarbonDB treats an op's input as opaque data. A handler error, including the service's own input validation, rejects the op.
 - The op log, aligned with p2panda, is the space's audit log.
 - GET is never an op. PUT and DELETE are idempotent and scoped to the path they name, and POST and PATCH promise nothing unless tagged. A POST may carry an optional tag such as `append`.
 
@@ -305,7 +305,7 @@ During a partition, GETs read the local copy, and writes apply locally and publi
 
 **The core (Rust)** owns the p2panda nodes and spaces, identity and devices, the op envelope and clock, the shared order, SQLite execution, sessions, undo, rewind, the apply loop and `[@carbon]`, `[space]`, `[identity]` and `[device]`. It knows nothing of app schemas, routes, zod, roles or merge strategy.
 
-**The service runtime (JS)** owns routing, input validation, the handler context, migrations and access checks for app services.
+**The service runtime (JS)** owns routing, the handler context, migrations and access checks for app services.
 
 CarbonDB is a message bus that handles state management: handlers and triggers subscribe to service keys, and handlers are language agnostic.
 

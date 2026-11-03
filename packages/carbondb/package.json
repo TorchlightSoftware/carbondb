@@ -1,0 +1,27 @@
+{
+  "name": "@tlsft/carbondb",
+  "version": "0.1.0",
+  "description": "CarbonDB for Node: services as ordinary backend code, with state that lives on every member's device",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "carbondb.node",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "cargo build --release -p carbondb-node && cp ../../target/release/libcarbondb_node.so carbondb.node",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@tlsft/service-error": "^0.1.0",
+    "@tlsft/service-key": "^0.5.0"
+  },
+  "license": "MIT OR Apache-2.0"
+}

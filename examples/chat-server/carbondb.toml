@@ -1,0 +1,4 @@
+system = "data/system.db"
+
+[sync]
+mode = "none"

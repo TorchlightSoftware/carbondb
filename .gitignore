@@ -1,2 +1,4 @@
 target/
+*.node
 .claude/scheduled_tasks.lock
+node_modules/

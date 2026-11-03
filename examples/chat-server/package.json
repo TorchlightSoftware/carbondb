@@ -1,0 +1,18 @@
+{
+  "name": "@tlsft/chat-server-example",
+  "version": "0.1.0",
+  "private": true,
+  "description": "[chat] on single-node CarbonDB, behind a small HTTP adapter",
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js carbondb.toml",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@tlsft/carbondb": "^0.1.0",
+    "@tlsft/chat-service": "^0.1.0",
+    "@tlsft/service-error": "^0.1.0"
+  },
+  "license": "MIT OR Apache-2.0"
+}

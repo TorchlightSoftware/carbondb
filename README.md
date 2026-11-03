@@ -26,13 +26,21 @@ CarbonDB is an experiment in creating a general purpose framework for applicatio
 
 ## Status
 
-Early design and prototyping. After evaluating existing platforms, p2panda (on iroh) is the base for a first command-line demo: create a room, invite with consent, post offline and merge, enroll a second device, remove a member, and talk through an always-on Pull-only relay.
+Early prototyping. p2panda (on iroh) is the base for replication. The single-node hello world runs: [chat] on the Rust core with its JS runtime, served over HTTP by an example app. Replicated mode, with p2panda spaces, is next. The design is in [stories/](stories/README.md).
+
+`npm test` runs everything: the core's Rust tests, a native build, and the JS and end-to-end tests. It needs Rust and Node 22.
 
 ## Repository
 
 - [components/](components/README.md): one file per architectural component (identity, device constellation, contacts, private communication, blind relay nodes, state synchronization, storage, wallet, client platform, service calls), with what is agreed and what is open.
 - [platforms/](platforms/README.md): evaluations of the candidate platforms and the feature matrix.
-- [spikes/p2panda-demo/](spikes/p2panda-demo/README.md): the p2panda chat demo.
+- [stories/](stories/README.md): what a person can do with CarbonDB, and the agreed design underneath.
+- [crates/core/](crates/core/): the Rust core: spaces on SQLite, identities and devices, and the builtin services.
+- [crates/node/](crates/node/): the core's Node bindings, through napi-rs.
+- [packages/carbondb/](packages/carbondb/README.md): `@tlsft/carbondb`, the JS runtime apps use.
+- [services/chat/](services/chat/): the [chat] service.
+- [examples/chat-server/](examples/chat-server/): [chat] behind a small HTTP adapter, with end-to-end tests.
+- [spikes/](spikes/): experiments: the p2panda chat demo, and an async JS handler inside a Rust transaction.
 - [perspectives/](perspectives/): reviews and position notes from contributors.
 
 Terminology follows the [Vision for Decentralized Web](https://github.com/bitmage/vision-for-decentralized-web) wiki.

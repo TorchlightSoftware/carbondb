@@ -68,7 +68,7 @@ TODO: expand this as a set of rules that services need to follow in order to ens
 
 ### Service runtime (JavaScript)
 
-- **Routing:** a service key to its handler, and input validation.
+- **Routing:** a service key to its handler. Validating input is the service's own business.
 - **The handler context:** the call's input and path parameters, the author, and time, ids and randomness taken from the op so every replica computes the same values.
 - **Migrations:** the service's table definitions.
 - **Access:** whether this author may make this call.

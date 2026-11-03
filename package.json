@@ -1,0 +1,16 @@
+{
+  "name": "carbondb-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CarbonDB: the core, its JS runtime, the [chat] service and examples",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @tlsft/carbondb",
+    "test": "cargo test --workspace && npm run build && npm test --workspaces --if-present"
+  }
+}

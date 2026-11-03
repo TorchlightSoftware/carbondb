@@ -1,0 +1,13 @@
+{
+  "name": "@tlsft/chat-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "[chat]: post, edit, delete and list messages in a space",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "@tlsft/service-error": "^0.1.0",
+    "zod": "^4.1.12"
+  },
+  "license": "MIT OR Apache-2.0"
+}

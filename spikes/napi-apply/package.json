@@ -1,0 +1,11 @@
+{
+  "name": "napi-apply-spike",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Spike: an async JS handler running inside a SQLite transaction owned by Rust, through napi-rs",
+  "type": "module",
+  "scripts": {
+    "build": "cargo build --release && cp target/release/libnapi_apply.so napi-apply.node",
+    "test": "npm run build && node --test test/*.test.js"
+  }
+}
