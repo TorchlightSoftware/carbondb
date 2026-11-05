@@ -1,0 +1,5 @@
+name = "identity"
+
+[[sql]]
+binding = "db"
+migrations_dir = "migrations"

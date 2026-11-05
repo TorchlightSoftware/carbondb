@@ -3,8 +3,8 @@
 //! database is the root space: local, never replicated, and answering only
 //! local services.
 //!
-//! What a space is (its origin, its refs) is `[space]`'s business, in
-//! `builtins::space`.
+//! What a space is (its origin, its refs) is `[space]`'s business; the host
+//! keeps only which services it has provisioned here, and how far.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -17,10 +17,11 @@ use crate::error::{Result, bad_request, conflict, not_found};
 use crate::oplog;
 use crate::run_queue::RunQueue;
 use crate::services::Service;
-use crate::store::{Db, Store};
+use crate::store::Store;
+use crate::Db;
 
 // What the core keeps in every space for itself, beside the op log.
-const HOST_SCHEMA: &str = include_str!("../sql/host/space.sql");
+const HOST_SCHEMA: &str = include_str!("../migrations/space.sql");
 
 // Called with the tables each commit wrote.
 pub type Listener = Rc<dyn Fn(&[String])>;
@@ -72,6 +73,13 @@ impl Space {
   // Whether a replicated service runs here: one this space has provisioned.
   pub fn runs(&self, service: &str) -> bool {
     self.provisioned.borrow().iter().any(|name| name == service)
+  }
+
+  // The services provisioned here, as the host recorded them, to provision
+  // again on open.
+  pub fn provisioned(&self) -> Result<Vec<String>> {
+    let rows = self.store.all("SELECT service FROM carbon_migration ORDER BY service", &[])?;
+    Ok(rows.iter().filter_map(|row| row["service"].as_str().map(str::to_string)).collect())
   }
 
   // Provision a service: run the migrations it has not run here yet. Done when
@@ -145,7 +153,7 @@ mod tests {
   }
 
   fn service(name: &str, migrations: &[&str]) -> Service {
-    Service { name: name.into(), local: false, migrations: migrations.iter().map(|sql| sql.to_string()).collect(), entry: Rc::new(|_| {}) }
+    Service::replicated(name, migrations.iter().map(|sql| sql.to_string()).collect(), Rc::new(|_| {}))
   }
 
   #[test]
@@ -162,6 +170,7 @@ mod tests {
     space.provision(&first).unwrap();
     space.provision(&first).unwrap();
     assert!(space.runs("chat"));
+    assert_eq!(space.provisioned().unwrap(), vec!["chat"]);
     let second = service("chat", &["CREATE TABLE message (id TEXT PRIMARY KEY, text TEXT)", "ALTER TABLE message ADD COLUMN edited_at INTEGER"]);
     space.provision(&second).unwrap();
     assert_eq!(space.store().all("SELECT id, text, edited_at FROM message", &[]).unwrap(), Vec::<serde_json::Value>::new());

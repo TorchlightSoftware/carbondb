@@ -520,3 +520,37 @@ Yes.  You'd be changing the semantics of existing services otherwise.
 Certainly fine now, and I think it may even be the right decision long term.
 
 Ok, proceed with phase 1.
+
+---
+
+    - New interface crate, crates/service-api: this is everything a service is written against.
+
+Hmm... I'm not sure why you made that a crate?  I don't think "service" is a Rust abstraction?  Please explain.
+
+    - crates/services/{space,identity,device}: each depends only on the interface crate,
+
+Interesting... what would an NPM package use?  I suppose we would have the equivalent of a Node.js interface?
+
+    - Frame: the core's per-call struct is now Frame (crates/core/src/frame.rs), which implements Invocation
+
+You're introducing more domain logic we didn't agree upon.
+
+    - [@carbon] calls one function in the [identity] crate directly: carbondb_identity::id_of. It needs the new identity's id before it can author that identity's ops.
+
+Does identity have local state outside of that which is replicated through its `space`?  I'm thinking it probably shouldn't, but open to discuss.  Where is the data for `carbondb_identity::id_of` stored?  Moving something identity specific into the interface also feels a bit weird...  Please explain more.
+
+    ask only works while every builtin answers at once. That holds for Rust services, and will for WASM ones, whose calls into the host are synchronous. A builtin could never ask an async npm service this way.
+
+You're again referring to internal jargon that you created, outside of the language and calls we agreed upon.  I assume by this you have some `ask()` function which is used somewhere in the delegation chain.  Why didn't you build it to be async compatible?  You know that's a requirement for 95% of services...  I guess you could wait until we're supporting [chat], as long as you haven't backed yourself into a corner.
+
+    - Two folders are both called "services". crates/services/ holds the builtins and services/chat holds [chat]
+
+That's fine.
+
+    - Tables are not yet namespaced per service in the one shared file. Builtins keep their carbon_ prefix by convention. A service also declares at most one sql binding for now.
+
+I think you should implement the namespacing now.  And also why don't you just include the binding name in the namespacing path?  If we need everything to run in the same DB instance for rewind/rollback purposes, then why not just implement everything that way?
+
+---
+
+

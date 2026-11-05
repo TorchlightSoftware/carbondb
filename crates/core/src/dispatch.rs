@@ -10,16 +10,24 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::call::{Actor, Call, Settled};
 use crate::carbon::Carbon;
 use crate::error::{Result, not_found};
-use crate::invocation::{Conn, Invocation, Settle};
-use crate::op::{Applying, Op};
+use crate::frame::{Conn, Frame, Settle};
+use crate::op::Applying;
 use crate::oplog;
 use crate::services::Service;
 use crate::space::Space;
+use crate::{Actor, Call, Invocation, Op};
+
+// What a call settled with, and the tables it read or wrote, for watch.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Settled {
+  pub value: Value,
+  pub tables: Vec<String>,
+}
 
 // How a submitted call answers whoever submitted it.
 pub type Reply = Box<dyn FnOnce(Result<Settled>)>;
@@ -74,11 +82,11 @@ impl Carbon {
       reply(settled);
       carbon.drain(&here);
     });
-    let invocation = Invocation::new(self, space, actor, call, input, Conn::Writer, Some(applying), live, settle);
+    let frame = Frame::new(self, space, actor, call, input, Conn::Writer, Some(applying), live, settle);
     match space.store().begin_write() {
-      Ok(()) => self.route(invocation),
+      Ok(()) => self.route(frame),
       Err(error) => {
-        let _ = invocation.settle(Err(error));
+        let _ = frame.settle(Err(error));
       }
     }
   }
@@ -96,15 +104,15 @@ impl Carbon {
       let tables = snapshot.end();
       reply(result.and_then(|value| Ok(Settled { value, tables: tables? })))
     });
-    self.route(Invocation::new(self, space, actor, call, input, Conn::Reader(reader), None, live, settle));
+    self.route(Frame::new(self, space, actor, call, input, Conn::Reader(reader), None, live, settle));
   }
 
   // Hand a call to the entry point of the service that answers it here.
-  pub(crate) fn route(&self, invocation: Rc<Invocation>) {
-    match answering(self, invocation.space(), &invocation.call) {
-      Ok(service) => (service.entry)(invocation),
+  pub(crate) fn route(&self, frame: Rc<Frame>) {
+    match answering(self, frame.space(), &frame.call) {
+      Ok(service) => (service.entry)(frame),
       Err(error) => {
-        let _ = invocation.settle(Err(error));
+        let _ = frame.settle(Err(error));
       }
     }
   }

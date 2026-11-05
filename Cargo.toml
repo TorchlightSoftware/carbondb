@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/node"]
+members = ["crates/core", "crates/node", "crates/service-api", "crates/services/*"]
 # Spikes are standalone experiments with their own lockfiles.
 exclude = ["spikes"]
 

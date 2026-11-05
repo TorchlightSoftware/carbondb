@@ -12,15 +12,14 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
-use crate::builtins;
-use crate::call::{Actor, Call};
 use crate::clock::Clock;
 use crate::config::{Config, SyncMode};
 use crate::error::{Result, bad_request, not_built};
-use crate::identity::{self, Identity};
-use crate::op::Op;
+use crate::op::stamp;
+use crate::services::carbon::{self as local, Identity};
 use crate::services::Services;
 use crate::space::{self, Space};
+use crate::{Actor, Call, Op, now};
 
 pub struct Carbon {
   config: Config,
@@ -37,8 +36,8 @@ impl Carbon {
       return Err(not_built("Replicated mode"));
     }
     std::fs::create_dir_all(config.directory()).map_err(|error| bad_request(format!("Cannot create {}: {error}", config.directory().display())))?;
-    let system = Rc::new(Space::root(identity::open_system(&config.system)?)?);
-    Ok(Rc::new(Carbon { config, clock: Clock::default(), services: builtins::services(), system, spaces: RefCell::default() }))
+    let system = Rc::new(Space::root(local::open_system(&config.system)?)?);
+    Ok(Rc::new(Carbon { config, clock: Clock::default(), services: Services::builtin(), system, spaces: RefCell::default() }))
   }
 
   pub fn services(&self) -> &Services {
@@ -52,7 +51,7 @@ impl Carbon {
 
   // Stamp a call as an op, now.
   pub(crate) fn stamp(&self, actor: &Actor, call: &Call, input: &Value) -> Op {
-    Op::stamp(actor, call, input, self.services.version(&call.service), self.clock.now())
+    stamp(actor, call, input, self.services.version(&call.service), self.clock.now())
   }
 
   // Where a space's database sits: beside the system database, named by space id.
@@ -60,8 +59,9 @@ impl Carbon {
     self.config.directory().join(format!("{id}.db"))
   }
 
-  // A space on this device, opened on first use with every service its origin
-  // names provisioned. A space naming a service this device does not run is refused.
+  // A space on this device, opened on first use with every service it has
+  // provisioned provisioned again. A space running a service this device does
+  // not run is refused.
   pub fn space(&self, id: &str) -> Result<Rc<Space>> {
     if let Some(space) = self.spaces.borrow().get(id) {
       return Ok(Rc::clone(space));
@@ -71,9 +71,7 @@ impl Carbon {
       return Err(space::missing(id));
     }
     let opened = Rc::new(Space::open(&path, id)?);
-    self.provision(&opened, &["space".to_string()])?;
-    let origin = builtins::space::origin(&opened.store().reader()?)?;
-    self.provision(&opened, &origin.services)?;
+    self.provision(&opened, &opened.provisioned()?)?;
     self.spaces.borrow_mut().insert(id.to_string(), Rc::clone(&opened));
     Ok(opened)
   }
@@ -95,7 +93,14 @@ impl Carbon {
   }
 
   pub fn identity(&self, slug: &str) -> Result<Identity> {
-    identity::find(&self.system.store().reader()?, slug)
+    local::find(&self.system.store().reader()?, slug)
+  }
+
+  // Ask a space's services something on the host's own behalf, as a call
+  // answered at once, as CarbonDB's own services answer.
+  pub fn ask(self: &Rc<Self>, space: &Rc<Space>, key: &str, input: Value) -> Result<Value> {
+    let call = Call::from_key(key)?;
+    now(|reply| self.submit(space, Actor::default(), call, input, Box::new(move |settled| reply(settled.map(|settled| settled.value)))))
   }
 }
 

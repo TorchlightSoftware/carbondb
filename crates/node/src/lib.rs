@@ -19,7 +19,6 @@
 use std::rc::Rc;
 
 use carbondb_core as core;
-use carbondb_core::Db;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde_json::{Value, json};
@@ -80,14 +79,14 @@ impl Carbon {
   pub fn register(&self, env: Env, name: String, migrations: Vec<String>, entry: Function<'_, Invocation, ()>) -> Result<()> {
     let entry = entry.create_ref()?;
     let raw = env.raw();
-    let run: core::Entry = Rc::new(move |invocation: Rc<core::Invocation>| {
+    let run: core::Entry = Rc::new(move |invocation: Rc<dyn core::Invocation>| {
       let env = Env::from_raw(raw);
       let called = entry.borrow_back(&env).and_then(|entry| entry.call(Invocation { inner: Rc::clone(&invocation) }));
       if let Err(error) = called {
         let _ = invocation.settle(Err(core::error::internal(error.reason.clone())));
       }
     });
-    self.inner.services().register(core::Service { name, local: false, migrations, entry: run }).map_err(to_napi)
+    self.inner.services().register(core::Service::replicated(&name, migrations, run)).map_err(to_napi)
   }
 
   // Submit a call to a space, or to the system handle when no space is named.
@@ -120,13 +119,11 @@ impl Carbon {
     to_json(self.inner.identity(&slug).map_err(to_napi)?)
   }
 
-  // The space a ref in a space points to, by kind and slug.
+  // The ref a space holds by kind and slug, or null, as `[space]` answers.
   #[napi]
-  pub fn find_ref(&self, space: String, kind: String, slug: String) -> Result<Option<Value>> {
+  pub fn find_ref(&self, space: String, kind: String, slug: String) -> Result<Value> {
     let space = self.space(Some(space))?;
-    let reader = space.store().reader().map_err(to_napi)?;
-    let found = core::builtins::space::find_ref(&reader, &kind, &slug).map_err(to_napi)?;
-    found.map(to_json).transpose()
+    self.inner.ask(&space, "GET [space]/ref", json!({"kind": kind, "slug": slug})).map_err(to_napi)
   }
 }
 
@@ -142,7 +139,7 @@ impl Carbon {
 // One call as an npm service's entry point receives it.
 #[napi]
 pub struct Invocation {
-  inner: Rc<core::Invocation>,
+  inner: Rc<dyn core::Invocation>,
 }
 
 #[napi]
@@ -150,7 +147,8 @@ impl Invocation {
   // The call as data: key, method, resource, input, and the op when it writes.
   #[napi]
   pub fn request(&self) -> Value {
-    self.inner.request()
+    let call = self.inner.call();
+    json!({"key": call.key(), "method": call.method(), "resource": call.resource, "input": self.inner.input(), "op": self.inner.op()})
   }
 
   // A write statement, inside the op's transaction.
@@ -180,7 +178,7 @@ impl Invocation {
   #[napi]
   pub fn call(&self, env: Env, call: Value, input: Value, reply: Function<'_, FnArgs<(Value, Value)>, ()>) -> Result<()> {
     let reply = answer(&env, reply)?;
-    self.inner.call(from_json(call)?, input, reply);
+    Rc::clone(&self.inner).send(from_json(call)?, input, reply);
     Ok(())
   }
 

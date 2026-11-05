@@ -5,9 +5,9 @@ use std::rc::Rc;
 
 use serde_json::{Value, json};
 
-use crate::call::Actor;
+use crate::Actor;
 use crate::oplog;
-use crate::store::Db;
+use crate::Db;
 use crate::testing::{actor, alice, call_now, carbon, room, texts};
 
 // The keys of a space's op log, in order.
@@ -140,33 +140,37 @@ mod oplog_entries {
 
 mod identities {
   use super::*;
-  use crate::builtins::{device, identity as identity_service, space as space_service};
-  use crate::identity::{id_of, list};
+  use crate::services::carbon::Identity;
+
+  // What a call answers in a space, as the identity.
+  fn read(carbon: &Rc<crate::Carbon>, space: &Rc<crate::Space>, identity: &Identity, key: &str, input: Value) -> Value {
+    call_now(carbon, space, &actor(identity), key, input).unwrap().value
+  }
 
   #[test]
   fn sets_up_both_spaces_by_ops_and_logs_its_own_call_in_the_system_log() {
     let (_directory, carbon) = carbon();
     let identity = alice(&carbon);
     assert_eq!(carbon.identity("alice").unwrap(), identity);
-    assert_eq!(identity.id, id_of(&identity.device));
+    assert_eq!(identity.id, carbondb_identity::id_of(&identity.device));
     assert_eq!(logged(carbon.system()), vec!["POST [@carbon]/identity"]);
 
     let identity_space = carbon.space(&identity.space).unwrap();
     assert_eq!(logged(&identity_space), vec!["POST [space]/origin", "POST [identity]/origin", "POST [device]/origin", "POST [space]/ref"]);
     let authors: Vec<_> = oplog::entries(identity_space.store()).unwrap().into_iter().map(|entry| (entry.author, entry.device)).collect();
     assert!(authors.iter().all(|author| *author == (Some(identity.id.clone()), Some(identity.device.clone()))));
-    let reader = identity_space.store().reader().unwrap();
-    assert_eq!(space_service::managers(&reader).unwrap(), vec![identity.id.clone()]);
-    assert_eq!(identity_service::id(&reader).unwrap(), Some(identity.id.clone()));
-    assert_eq!(device::devices(&reader).unwrap(), vec![identity.device.clone()]);
-    assert_eq!(space_service::find_ref(&reader, "personal", "alice").unwrap().unwrap().space, identity.personal);
+    let ask = |key: &str, input: Value| read(&carbon, &identity_space, &identity, key, input);
+    assert_eq!(ask("GET [space]/manage", Value::Null), json!([identity.id]));
+    assert_eq!(ask("GET [identity]/origin", Value::Null), json!({"id": identity.id, "device": identity.device}));
+    assert_eq!(ask("GET [device]/devices", Value::Null), json!([identity.device]));
+    assert_eq!(ask("GET [space]/ref", json!({"kind": "personal", "slug": "alice"}))["space"], json!(identity.personal));
 
     let personal = carbon.space(&identity.personal).unwrap();
     assert_eq!(logged(&personal), vec!["POST [space]/origin", "POST [device]/ref"]);
-    let reader = personal.store().reader().unwrap();
-    let origin = space_service::origin(&reader).unwrap();
-    assert_eq!((origin.kind.as_str(), origin.services, origin.manage), ("personal", vec!["device".to_string(), "notes".to_string()], vec![identity.id.clone()]));
-    assert_eq!(device::device_refs(&reader).unwrap(), vec![device::DeviceRef { pubkey: identity.device.clone(), name: "Pixel9".into(), tags: vec!["manage".into()] }]);
+    let origin = read(&carbon, &personal, &identity, "GET [space]/origin", Value::Null);
+    assert_eq!(origin, json!({"kind": "personal", "name": "alice", "services": ["device", "notes"], "manage": [identity.id]}));
+    let devices = read(&carbon, &personal, &identity, "GET [device]/refs", Value::Null);
+    assert_eq!(devices, json!([{"pubkey": identity.device, "name": "Pixel9", "tags": ["manage"]}]));
   }
 
   #[test]
@@ -180,7 +184,8 @@ mod identities {
       let bytes = std::fs::read(directory.path().join("data").join(format!("{id}.db"))).unwrap();
       assert!(!String::from_utf8_lossy(&bytes).contains(&secret));
     }
-    assert!(list(&carbon.system().store().reader().unwrap()).unwrap()[0].get("secret").is_none());
+    let listed = call_now(&carbon, carbon.system(), &Actor::default(), "GET [@carbon]/identities", Value::Null).unwrap().value;
+    assert!(listed[0].get("secret").is_none());
     let logged = serde_json::to_string(&oplog::entries(carbon.system().store()).unwrap()[0].output).unwrap();
     assert!(!logged.contains(&secret));
   }
@@ -205,7 +210,6 @@ mod identities {
 
 mod spaces {
   use super::*;
-  use crate::builtins::space as space_service;
 
   #[test]
   fn creates_a_space_by_a_ref_op_in_the_calling_space_and_an_origin_op_in_the_new_one() {
@@ -243,7 +247,7 @@ mod spaces {
     let stranger = Actor { identity: Some("someone-else".into()), device: None };
     let error = call_now(&carbon, &personal, &stranger, "POST [@carbon]/space", json!({"name": "Room"})).unwrap_err();
     assert_eq!(error.status, 403);
-    assert_eq!(space_service::refs(&personal.store().reader().unwrap()).unwrap(), vec![]);
+    assert_eq!(call_now(&carbon, &personal, &actor(&identity), "GET [space]/refs", Value::Null).unwrap().value, json!([]));
     assert_eq!(logged(&personal), vec!["POST [space]/origin", "POST [device]/ref"]);
   }
 

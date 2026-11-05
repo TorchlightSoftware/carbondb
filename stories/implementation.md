@@ -305,9 +305,9 @@ During a partition, GETs read the local copy, and writes apply locally and publi
 
 ## Core and runtime
 
-**The core (Rust)** owns the p2panda nodes and spaces, identity and devices, the op envelope and clock, the shared order, SQLite execution, sessions, undo, rewind, the apply loop and `[@carbon]`, `[space]`, `[identity]` and `[device]`. It knows nothing of app schemas, routes, zod, roles or merge strategy.
+**The core (Rust)** owns the p2panda nodes and spaces, identity and devices, the op envelope and clock, the shared order, SQLite execution, sessions, undo, rewind, the apply loop, routing by service name, and `[@carbon]`. It ships `[space]`, `[identity]` and `[device]` as packages written against the service API, like any other service: the core reads and writes their records only through calls to them. It knows nothing of app schemas, routes, zod, roles or merge strategy.
 
-**The service runtime (JS)** owns routing, the handler context, migrations and access checks for app services.
+**The service runtime (JS)** owns the entry point of each npm service: its route matching, the handler context, its migrations and its access checks.
 
 CarbonDB is a message bus that handles state management: handlers and triggers subscribe to service keys, and handlers are language agnostic.
 

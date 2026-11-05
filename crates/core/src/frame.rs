@@ -1,8 +1,8 @@
-//! An invocation: one call as its service's entry point receives it. It
-//! carries the call, its input and the acting identity; the database the
-//! handler queries, inside the op's transaction or a GET's snapshot; the op it
-//! runs within, if it writes; a way to make calls of its own; and the way to
-//! settle it, once.
+//! A frame: one call running in the core, as its service's entry point sees it
+//! through the `Invocation` interface. It holds the call, its input and the
+//! acting identity; the connection its queries run on, inside the op's
+//! transaction or a GET's snapshot; the op it runs within, if it writes; the
+//! calls it has made; and the way to settle it, once.
 //!
 //! A call made inside another runs inside the same op, under a savepoint, so
 //! it sees the writes before it, and a failure rolls back only its own writes
@@ -16,29 +16,30 @@ use std::rc::Rc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::call::{Actor, Call, Settled};
 use crate::carbon::Carbon;
+use crate::dispatch::Settled;
 use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal};
-use crate::op::{Applying, Op};
+use crate::op::Applying;
 use crate::oplog;
 use crate::space::Space;
-use crate::store::{Db, Reader};
+use crate::store::Reader;
+use crate::{Actor, Call, Db, Invocation, Op};
 
-// How an invocation ends: what it settled with, and the calls it made.
+// How a frame ends: what it settled with, and the calls it made.
 pub(crate) type Settle = Box<dyn FnOnce(Result<Value>, Vec<CallRecord>)>;
 
-// How a call made inside an invocation answers the handler that made it.
-pub type Reply = Box<dyn FnOnce(Result<Value>)>;
+// How a call made inside a frame answers the handler that made it.
+pub type Reply = carbondb_service_api::Reply;
 
-// The connection an invocation queries: the space's writer inside an op, or a GET's own reader.
+// The connection a frame queries: the space's writer inside an op, or a GET's own reader.
 #[derive(Clone)]
 pub(crate) enum Conn {
   Writer,
   Reader(Rc<Reader>),
 }
 
-// A call an invocation made, kept with the op on this device: what it was
-// asked, what it answered, and the calls it made in turn.
+// A call a frame made, kept with the op on this device: what it was asked,
+// what it answered, and the calls it made in turn.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CallRecord {
   pub key: String,
@@ -87,7 +88,7 @@ fn within(caller: &Call, callee: &Call) -> Result<Within> {
   }
 }
 
-pub struct Invocation {
+pub struct Frame {
   carbon: Rc<Carbon>,
   space: Rc<Space>,
   pub actor: Actor,
@@ -103,7 +104,7 @@ pub struct Invocation {
   settle: RefCell<Option<Settle>>,
 }
 
-impl Invocation {
+impl Frame {
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     carbon: &Rc<Carbon>,
@@ -115,8 +116,8 @@ impl Invocation {
     applying: Option<Rc<Applying>>,
     live: Rc<Cell<bool>>,
     settle: Settle,
-  ) -> Rc<Invocation> {
-    Rc::new(Invocation {
+  ) -> Rc<Frame> {
+    Rc::new(Frame {
       carbon: Rc::clone(carbon),
       space: Rc::clone(space),
       actor,
@@ -139,32 +140,9 @@ impl Invocation {
     &self.space
   }
 
-  // The op this call writes within; none for a GET.
-  pub fn op(&self) -> Option<&Op> {
-    self.applying.as_ref().filter(|_| self.call.writes()).map(|applying| &applying.op)
-  }
-
-  // The call as plain data, for an entry point in another language.
-  pub fn request(&self) -> Value {
-    json!({
-      "key": self.call.key(),
-      "method": self.call.method(),
-      "resource": self.call.resource,
-      "input": self.input,
-      "op": self.op(),
-    })
-  }
-
-  // The next value drawn from the op, the source of its ids and randomness.
-  pub fn draw(&self) -> Result<String> {
-    let applying = self.applying.as_ref().filter(|_| self.call.writes());
-    applying.map(|applying| applying.draw()).ok_or_else(|| bad_request(format!("{} is not an op, so it draws nothing", self.call.key())))
-  }
-
-  // Make a call in this space, as the acting identity.
-  pub fn call(self: &Rc<Self>, call: Call, input: Value, reply: Reply) {
-    let space = Rc::clone(&self.space);
-    self.call_in(&space, self.actor.clone(), call, input, reply)
+  // The op being applied, when this call writes within it.
+  fn writing(&self) -> Option<&Rc<Applying>> {
+    self.applying.as_ref().filter(|_| self.call.writes())
   }
 
   // Make a call in a space, as an identity. Only a local service calls into
@@ -225,7 +203,7 @@ impl Invocation {
       caller.returned(record);
       reply(result)
     });
-    let callee = Invocation::new(&self.carbon, &self.space, actor, call, input, self.conn.clone(), applying, Rc::clone(&self.live), settle);
+    let callee = Frame::new(&self.carbon, &self.space, actor, call, input, self.conn.clone(), applying, Rc::clone(&self.live), settle);
     self.carbon.route(callee);
   }
 
@@ -250,18 +228,6 @@ impl Invocation {
     self.calls.borrow_mut().push(record);
   }
 
-  // Settle the call, once. A handler that finishes before the calls it made
-  // fails, since their writes would land outside its op.
-  pub fn settle(&self, result: Result<Value>) -> Result<()> {
-    let settle = self.settle.borrow_mut().take().ok_or_else(|| conflict(format!("{} has already settled", self.call.key())))?;
-    let result = match result {
-      Ok(_) if self.pending.get() > 0 => Err(internal(format!("{} finished before the calls it made", self.call.key()))),
-      result => result,
-    };
-    settle(result, self.calls.take());
-    Ok(())
-  }
-
   fn ended(&self) -> ServiceError {
     internal(format!("{} has ended; nothing more runs inside it", self.call.key()))
   }
@@ -278,7 +244,7 @@ impl Invocation {
 }
 
 // A handler's queries, inside its op's transaction or its GET's snapshot.
-impl Db for Invocation {
+impl Db for Frame {
   fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
     if !self.call.writes() {
       return Err(bad_request(format!("{} is a GET, which never writes", self.call.key())));
@@ -288,6 +254,45 @@ impl Db for Invocation {
 
   fn all(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
     self.db()?.all(sql, params)
+  }
+}
+
+impl Invocation for Frame {
+  fn call(&self) -> &Call {
+    &self.call
+  }
+
+  fn input(&self) -> &Value {
+    &self.input
+  }
+
+  fn actor(&self) -> &Actor {
+    &self.actor
+  }
+
+  fn op(&self) -> Option<&Op> {
+    self.writing().map(|applying| &applying.op)
+  }
+
+  fn draw(&self) -> Result<String> {
+    self.writing().map(|applying| applying.draw()).ok_or_else(|| bad_request(format!("{} is not an op, so it draws nothing", self.call.key())))
+  }
+
+  fn send(self: Rc<Self>, call: Call, input: Value, reply: Reply) {
+    let (space, actor) = (Rc::clone(&self.space), self.actor.clone());
+    self.call_in(&space, actor, call, input, reply)
+  }
+
+  // A handler that finishes before the calls it made fails, since their writes
+  // would land outside its op.
+  fn settle(&self, result: Result<Value>) -> Result<()> {
+    let settle = self.settle.borrow_mut().take().ok_or_else(|| conflict(format!("{} has already settled", self.call.key())))?;
+    let result = match result {
+      Ok(_) if self.pending.get() > 0 => Err(internal(format!("{} finished before the calls it made", self.call.key()))),
+      result => result,
+    };
+    settle(result, self.calls.take());
+    Ok(())
   }
 }
 

@@ -12,20 +12,13 @@
 //!   {"call": .., "catch": true}                    the same, adding a failure's status instead of failing
 //!   {"fail": "why"}                                fail with a 409
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
 use serde_json::{Value, json};
 
-use crate::call::{Actor, Call, Settled};
-use crate::carbon::Carbon;
 use crate::error::{Result, conflict};
-use crate::identity::Identity;
-use crate::invocation::Invocation;
-use crate::services::Service;
-use crate::space::Space;
-use crate::store::Db;
+use crate::{Actor, Call, Carbon, Db, Identity, Invocation, Service, Settled, Space, now};
 
 // A single-node CarbonDB in a temporary directory, which lives as long as the
 // directory, running `[notes]`.
@@ -40,15 +33,12 @@ pub fn carbon() -> (tempfile::TempDir, Rc<Carbon>) {
 
 pub fn register_notes(carbon: &Carbon) {
   let migrations = vec!["CREATE TABLE note (id TEXT PRIMARY KEY, text TEXT NOT NULL)".to_string()];
-  carbon.services().register(Service { name: "notes".into(), local: false, migrations, entry: Rc::new(notes) }).unwrap();
+  carbon.services().register(Service::replicated("notes", migrations, Rc::new(notes))).unwrap();
 }
 
 // Make a call and return its answer, which every service here gives at once.
 pub fn call_now(carbon: &Rc<Carbon>, space: &Rc<Space>, actor: &Actor, key: &str, input: Value) -> Result<Settled> {
-  let answer = Rc::new(RefCell::new(None));
-  let slot = Rc::clone(&answer);
-  carbon.submit(space, actor.clone(), Call::from_key(key).unwrap(), input, Box::new(move |settled| *slot.borrow_mut() = Some(settled)));
-  answer.borrow_mut().take().expect("the call answered at once")
+  now(|reply| carbon.submit(space, actor.clone(), Call::from_key(key).unwrap(), input, reply))
 }
 
 pub fn alice(carbon: &Rc<Carbon>) -> Identity {
@@ -74,10 +64,10 @@ pub fn texts(db: &dyn Db) -> Result<Value> {
   Ok(Value::Array(rows.into_iter().map(|row| row["text"].clone()).collect()))
 }
 
-fn notes(invocation: Rc<Invocation>) {
-  match invocation.call.resource.as_str() {
+fn notes(invocation: Rc<dyn Invocation>) {
+  match invocation.call().resource.as_str() {
     "/run" => {
-      let script = invocation.input["do"].as_array().cloned().unwrap_or_default();
+      let script = invocation.input()["do"].as_array().cloned().unwrap_or_default();
       step(invocation, VecDeque::from(script), vec![])
     }
     "/texts" => {
@@ -85,13 +75,13 @@ fn notes(invocation: Rc<Invocation>) {
       let _ = invocation.settle(result);
     }
     _ => {
-      let _ = invocation.settle(Err(invocation.call.unknown()));
+      let _ = invocation.settle(Err(invocation.call().unknown()));
     }
   }
 }
 
 // Run the rest of a script, then settle with what it gathered.
-fn step(invocation: Rc<Invocation>, mut script: VecDeque<Value>, mut output: Vec<Value>) {
+fn step(invocation: Rc<dyn Invocation>, mut script: VecDeque<Value>, mut output: Vec<Value>) {
   let Some(next) = script.pop_front() else {
     let _ = invocation.settle(Ok(json!(output)));
     return;
@@ -106,7 +96,7 @@ fn step(invocation: Rc<Invocation>, mut script: VecDeque<Value>, mut output: Vec
     let call = Call::from_key(next["call"].as_str().unwrap()).unwrap();
     let catch = next["catch"] == json!(true);
     let caller = Rc::clone(&invocation);
-    return invocation.call(call, next["input"].clone(), Box::new(move |result| match result {
+    return invocation.send(call, next["input"].clone(), Box::new(move |result| match result {
       Ok(value) => {
         output.push(value);
         step(caller, script, output)

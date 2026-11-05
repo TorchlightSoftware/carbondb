@@ -1,36 +1,20 @@
-//! An op: a service call that writes, stamped with who made it and when. Its
-//! hash covers the envelope and the time, so it names the op on every replica.
-//! Everything a handler derives from an op, such as ids and randomness, comes
-//! from that hash, so every replica computes the same.
+//! Stamping ops, and drawing from one while it applies. An op's hash covers
+//! its envelope and its time, so it names the op on every replica; everything a
+//! handler derives from it, such as ids and randomness, is drawn from that hash.
 
 use std::cell::Cell;
 
-use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::call::{Actor, Call};
 use crate::hash::hash;
+use crate::{Actor, Call, Op};
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Op {
-  pub key: String,
-  pub input: Value,
-  pub author: Option<String>,
-  pub device: Option<String>,
-  // The schema version: how many migrations the called service declares.
-  pub version: usize,
-  pub time: u64,
-  pub hash: String,
-}
-
-impl Op {
-  // Stamp a call as an op at `time`.
-  pub fn stamp(actor: &Actor, call: &Call, input: &Value, version: usize, time: u64) -> Op {
-    let key = call.key();
-    let envelope = json!({"key": key, "input": input, "author": actor.identity, "device": actor.device, "version": version});
-    let hash = hash(&json!({"envelope": envelope, "time": time}));
-    Op { key, input: input.clone(), author: actor.identity.clone(), device: actor.device.clone(), version, time, hash }
-  }
+// Stamp a call as an op at `time`.
+pub fn stamp(actor: &Actor, call: &Call, input: &Value, version: usize, time: u64) -> Op {
+  let key = call.key();
+  let envelope = json!({"key": key, "input": input, "author": actor.identity, "device": actor.device, "version": version});
+  let hash = hash(&json!({"envelope": envelope, "time": time}));
+  Op { key, input: input.clone(), author: actor.identity.clone(), device: actor.device.clone(), version, time, hash }
 }
 
 // An op being applied, and how many values its handlers have drawn from it.
@@ -58,7 +42,7 @@ mod tests {
 
   fn op(time: u64) -> Op {
     let actor = Actor { identity: Some("alice".into()), device: Some("pixel".into()) };
-    Op::stamp(&actor, &Call::from_key("POST [chat]/messages").unwrap(), &json!({"text": "hi"}), 1, time)
+    stamp(&actor, &Call::from_key("POST [chat]/messages").unwrap(), &json!({"text": "hi"}), 1, time)
   }
 
   #[test]

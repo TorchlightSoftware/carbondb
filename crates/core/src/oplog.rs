@@ -7,10 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::Result;
-use crate::op::Op;
-use crate::store::Db;
+use crate::{Db, Op};
 
-pub const SCHEMA: &str = include_str!("../sql/host/oplog.sql");
+pub const SCHEMA: &str = include_str!("../migrations/oplog.sql");
 
 // An op as the log holds it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]

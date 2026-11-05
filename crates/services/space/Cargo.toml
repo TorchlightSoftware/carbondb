@@ -1,0 +1,15 @@
+[package]
+name = "carbondb-space"
+description = "[space], a CarbonDB builtin service"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+carbondb-service-api = { path = "../../service-api" }
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+carbondb-service-api = { path = "../../service-api" }

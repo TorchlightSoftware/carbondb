@@ -1,16 +1,19 @@
 [package]
 name = "carbondb-core"
-description = "CarbonDB's core: spaces on SQLite, identities and devices, and the builtin services"
+description = "CarbonDB's core: spaces on SQLite, the services this device runs, and the one path every call takes to them"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 publish = false
 
 [dependencies]
+carbondb-service-api = { path = "../service-api" }
+carbondb-space = { path = "../services/space" }
+carbondb-identity = { path = "../services/identity" }
+carbondb-device = { path = "../services/device" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-blake3 = "1.8.7"
 ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
 toml = "1.1.8"

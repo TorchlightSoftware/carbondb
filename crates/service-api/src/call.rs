@@ -1,14 +1,13 @@
-//! A call as the core receives it: the service key parsed into parts, the
-//! acting identity, and what the call settled with.
+//! A call as a service receives it: the service key parsed into parts, and the
+//! identity acting.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::error::{Result, bad_request, not_found};
+use crate::error::{Result, ServiceError, bad_request, not_found};
 
 // A service key's parts: `POST [space]/ref` is {method: POST, service: space, resource: /ref}.
 // A confined key, `[@carbon]`, names a local service.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Call {
   pub method: Option<String>,
   pub service: String,
@@ -18,8 +17,8 @@ pub struct Call {
 }
 
 impl Call {
-  // A call from its service key, for calls the core makes itself. Apps' keys
-  // are parsed by the runtime, which knows the full syntax.
+  // A call from its service key, for calls a Rust service makes. Apps' keys are
+  // parsed by their runtime, which knows the full syntax.
   pub fn from_key(key: &str) -> Result<Call> {
     let malformed = || bad_request(format!("'{key}' is not a service key"));
     let (method, rest) = key.split_once(' ').ok_or_else(malformed)?;
@@ -42,7 +41,8 @@ impl Call {
     format!("{} [{at}{}]{}", self.method(), self.service, self.resource).trim_start().to_string()
   }
 
-  pub fn unknown(&self) -> crate::error::ServiceError {
+  // The refusal for a method and resource a service does not answer.
+  pub fn unknown(&self) -> ServiceError {
     not_found(format!("{} is not a call CarbonDB answers", self.key()))
   }
 }
@@ -52,13 +52,6 @@ impl Call {
 pub struct Actor {
   pub identity: Option<String>,
   pub device: Option<String>,
-}
-
-// What a call settled with, and the tables it read or wrote, for watch.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Settled {
-  pub value: Value,
-  pub tables: Vec<String>,
 }
 
 #[cfg(test)]
