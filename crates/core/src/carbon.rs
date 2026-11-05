@@ -1,99 +1,109 @@
-//! This device's CarbonDB: its config, the system database and its clock. It
-//! opens spaces, stamps ops, and routes every call it answers by service name:
-//! `[@carbon]` to the device's local service, and the replicated builtins to
-//! theirs. App services are routed by the runtime that hosts them.
+//! This device's CarbonDB: its config, its clock, the services it runs, the
+//! system database as its root space, and the spaces opened so far. Every call
+//! goes through `submit`, in `dispatch`.
 //!
-//! This is the single-node core: no p2panda, no network and no op log. Calls
-//! that need peers are refused.
+//! This is the single-node core: no p2panda and no network. Calls that need
+//! peers are refused.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::builtins;
-use crate::call::{Actor, Call, Outcome};
+use crate::call::{Actor, Call};
 use crate::clock::Clock;
 use crate::config::{Config, SyncMode};
-use crate::error::{Result, bad_request, not_built, not_found};
-use crate::hash::hash;
+use crate::error::{Result, bad_request, not_built};
 use crate::identity::{self, Identity};
-use crate::space;
-use crate::store::Store;
-
-// When an op happened, and its hash over the envelope and that time.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Stamp {
-  pub time: u64,
-  pub hash: String,
-}
-
-// Where a call is made: on the system handle, or in a space.
-#[derive(Clone, Copy)]
-pub enum Context<'a> {
-  System,
-  Space(&'a Store),
-}
+use crate::op::Op;
+use crate::services::Services;
+use crate::space::{self, Space};
 
 pub struct Carbon {
   config: Config,
-  system: Store,
   clock: Clock,
+  services: Services,
+  system: Rc<Space>,
+  spaces: RefCell<HashMap<String, Rc<Space>>>,
 }
 
 impl Carbon {
-  pub fn open(config_path: &Path) -> Result<Carbon> {
+  pub fn open(config_path: &Path) -> Result<Rc<Carbon>> {
     let config = Config::load(config_path)?;
     if config.sync != SyncMode::None {
       return Err(not_built("Replicated mode"));
     }
     std::fs::create_dir_all(config.directory()).map_err(|error| bad_request(format!("Cannot create {}: {error}", config.directory().display())))?;
-    let system = identity::open_system(&config.system)?;
-    Ok(Carbon { config, system, clock: Clock::default() })
+    let system = Rc::new(Space::root(identity::open_system(&config.system)?)?);
+    Ok(Rc::new(Carbon { config, clock: Clock::default(), services: builtins::services(), system, spaces: RefCell::default() }))
   }
 
-  // Stamp an op's envelope with a time, and hash the two together.
-  pub fn stamp(&self, envelope: &Value) -> Stamp {
-    let time = self.clock.now();
-    Stamp { time, hash: hash(&json!({"envelope": envelope, "time": time})) }
+  pub fn services(&self) -> &Services {
+    &self.services
   }
 
-  pub(crate) fn system(&self) -> &Store {
+  // The root space: the system database, where identities live.
+  pub fn system(&self) -> &Rc<Space> {
     &self.system
   }
 
+  // Stamp a call as an op, now.
+  pub(crate) fn stamp(&self, actor: &Actor, call: &Call, input: &Value) -> Op {
+    Op::stamp(actor, call, input, self.services.version(&call.service), self.clock.now())
+  }
+
   // Where a space's database sits: beside the system database, named by space id.
-  pub(crate) fn space_path(&self, id: &str) -> PathBuf {
+  fn space_path(&self, id: &str) -> PathBuf {
     self.config.directory().join(format!("{id}.db"))
   }
 
-  pub fn open_space(&self, id: &str) -> Result<Store> {
+  // A space on this device, opened on first use with every service its origin
+  // names provisioned. A space naming a service this device does not run is refused.
+  pub fn space(&self, id: &str) -> Result<Rc<Space>> {
+    if let Some(space) = self.spaces.borrow().get(id) {
+      return Ok(Rc::clone(space));
+    }
     let path = self.space_path(id);
     if !path.exists() {
-      return Err(not_found(format!("No space {id} on this device")));
+      return Err(space::missing(id));
     }
-    space::open(&path)
+    let opened = Rc::new(Space::open(&path, id)?);
+    self.provision(&opened, &["space".to_string()])?;
+    let origin = builtins::space::origin(&opened.store().reader()?)?;
+    self.provision(&opened, &origin.services)?;
+    self.spaces.borrow_mut().insert(id.to_string(), Rc::clone(&opened));
+    Ok(opened)
+  }
+
+  // A new space, running only `[space]` until its origin op names the rest.
+  pub(crate) fn create_space(&self, id: &str) -> Result<Rc<Space>> {
+    let created = Rc::new(Space::create(&self.space_path(id), id)?);
+    self.provision(&created, &["space".to_string()])?;
+    self.spaces.borrow_mut().insert(id.to_string(), Rc::clone(&created));
+    Ok(created)
+  }
+
+  // Provision the services a space names: every one must run on this device.
+  pub(crate) fn provision(&self, space: &Space, names: &[String]) -> Result<()> {
+    for name in names {
+      space.provision(self.services.get(name)?.as_ref())?;
+    }
+    Ok(())
   }
 
   pub fn identity(&self, slug: &str) -> Result<Identity> {
-    identity::find(&self.system, slug)
-  }
-
-  // A call this core answers, routed by its service name.
-  pub fn call(&self, context: Context, actor: &Actor, call: &Call, input: Value) -> Result<Outcome> {
-    match (call.confined, context) {
-      (true, _) if call.service == "carbon" => builtins::carbon::handle(self, context, actor, call, input),
-      (true, _) => Err(not_found(format!("No local service [@{}] on this device", call.service))),
-      (false, Context::Space(store)) => builtins::handle(store, actor, call, input),
-      (false, Context::System) => Err(not_found(format!("The system handle answers only [@carbon], not {}", call.key()))),
-    }
+    identity::find(&self.system.store().reader()?, slug)
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::testing::{actor, alice, call, carbon};
+  use crate::testing::{actor, alice, call_now, carbon};
+  use serde_json::json;
 
   #[test]
   fn refuses_replicated_mode_for_now() {
@@ -107,16 +117,31 @@ mod tests {
   fn routes_by_service_name_and_refuses_services_it_does_not_run() {
     let (_directory, carbon) = carbon();
     let identity = alice(&carbon);
-    let personal = carbon.open_space(&identity.personal).unwrap();
-    assert_eq!(carbon.call(Context::Space(&personal), &actor(&identity), &call("GET [device]/refs"), Value::Null).unwrap().value[0]["name"], json!("Pixel9"));
-    assert_eq!(carbon.call(Context::System, &Actor::default(), &call("GET [@carbon]/identities"), Value::Null).unwrap().value[0]["slug"], json!("alice"));
+    let personal = carbon.space(&identity.personal).unwrap();
+    let system = Rc::clone(carbon.system());
+    assert_eq!(call_now(&carbon, &personal, &actor(&identity), "GET [device]/refs", Value::Null).unwrap().value[0]["name"], json!("Pixel9"));
+    assert_eq!(call_now(&carbon, &system, &Actor::default(), "GET [@carbon]/identities", Value::Null).unwrap().value[0]["slug"], json!("alice"));
     let refused = [
-      (Context::Space(&personal), "GET [@elsewhere]/x"),
-      (Context::System, "GET [space]/refs"),
-      (Context::System, "GET [@carbon]/status"),
+      (&personal, "GET [@elsewhere]/x"),
+      (&personal, "GET [identity]/origin"),
+      (&personal, "GET [chat]/messages"),
+      (&personal, "GET [@device]/refs"),
+      (&system, "GET [space]/refs"),
+      (&system, "GET [@carbon]/status"),
     ];
-    for (context, key) in refused {
-      assert_eq!(carbon.call(context, &actor(&identity), &call(key), Value::Null).unwrap_err().status, 404, "{key}");
+    for (space, key) in refused {
+      assert_eq!(call_now(&carbon, space, &actor(&identity), key, Value::Null).unwrap_err().status, 404, "{key}");
     }
+  }
+
+  #[test]
+  fn refuses_a_space_naming_a_service_it_does_not_run() {
+    let (directory, carbon) = carbon();
+    let identity = alice(&carbon);
+    drop(carbon);
+    let config = directory.path().join("carbondb.toml");
+    let restarted = Carbon::open(&config).unwrap();
+    let error = restarted.space(&identity.personal).err().unwrap();
+    assert_eq!((error.status, error.details), (404, Some(json!({"service": "notes"}))));
   }
 }

@@ -14,11 +14,11 @@ import {SystemHandle} from './handle.js'
 
 // One CarbonDB on this device: the core, the registered services, and the spaces opened so far.
 class Carbon {
-  services = new Services()
   #spaces = new Map()
 
   constructor(native) {
     this.native = native
+    this.services = new Services(native)
   }
 
   space(id) {

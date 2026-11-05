@@ -3,8 +3,8 @@
 // through it, set when the ref chain passes through an identity.
 
 import {notFound} from '@tlsft/service-error'
-import {core} from './native.js'
-import {parseKey} from './space.js'
+import {answered, core} from './native.js'
+import {parseKey} from './routes.js'
 
 // `kind:slug`, as in `team:sales`.
 function parseName(name) {
@@ -80,15 +80,15 @@ export class SystemHandle {
     return new SpaceHandle(this.#carbon, identity.space, identity)
   }
 
-  // A call on the system handle. The core answers it at once, so it needs no queue.
+  // A call on the system handle, the root space, which runs only local services.
   async call(key, input = null) {
     const parts = parseKey(key)
-    return core(() => this.#carbon.native.callSystem(parts, input)).value
+    const outcome = await answered((reply) => this.#carbon.native.call(null, actorOf(null), parts, input, reply))
+    return outcome.value
   }
 
   // An identity, its first device and its personal space, which runs the services named.
   async createIdentity({slug, device, services = []}) {
-    this.services.requireRegistered(services)
     const identity = await this.call('POST [@carbon]/identity', {slug, device, services})
     return {
       identity: new SpaceHandle(this.#carbon, identity.space, identity),

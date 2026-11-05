@@ -31,7 +31,24 @@ const notes = {
         db.run("INSERT INTO note (id, author, text, at) VALUES ('same', 'a', 'x', 0)")
       }
     },
+    // Writes a note, reads through a call inside the op, then optionally makes
+    // another call and refuses: the shapes a nested transaction must get right.
+    'POST [notes]/nested': {
+      handler: async ({input, op, db, call}) => {
+        db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [op.id(), op.author, input.text, op.time])
+        const seen = (await call('GET [notes]/notes')).map((row) => row.text)
+        if (input.inner) await call('POST [notes]/notes', input.inner).catch((error) => { if (!input.catch) throw error })
+        if (input.refuse) throw conflict('Refused after its calls')
+        return {seen}
+      }
+    },
+    'POST [notes]/unawaited': {
+      handler: ({call}) => {
+        call('POST [notes]/notes', {text: 'late'}).catch(() => {})
+      }
+    },
     'GET [notes]/notes': {handler: ({db}) => db.all('SELECT text FROM note ORDER BY at, text')},
+    'GET [notes]/writes': {handler: ({call}) => call('POST [notes]/tags', {name: 'red'})},
     'POST [notes]/tags': {handler: ({input, db}) => db.run('INSERT INTO tag (name) VALUES (?)', [input.name])},
     'GET [notes]/broken': {handler: ({db}) => db.all('SELECT * FROM nowhere')}
   }
@@ -91,8 +108,8 @@ describe('identities', () => {
 
 describe('services', () => {
   it('refuses registering a service twice, or under a CarbonDB service name', () => {
-    assert.throws(() => carbon.services.add('notes', notes), TypeError)
-    assert.throws(() => carbon.services.add('space', notes), TypeError)
+    assert.throws(() => carbon.services.add('notes', notes), {status: 409})
+    assert.throws(() => carbon.services.add('space', notes), {status: 409})
   })
 
   it('refuses an identity or space naming a service this device has not registered', async () => {
@@ -143,7 +160,31 @@ describe('calls', () => {
     assert.deepStrictEqual(await texts(personal), ['slow', 'slow again'])
   })
 
+  const nested = [
+    {why: 'a call inside a handler sees its writes, across awaits', input: {text: 'outer'}, seen: ['outer'], committed: ['outer']},
+    {why: 'a call that succeeds commits with the op', input: {text: 'outer', inner: {text: 'in'}}, seen: ['outer'], committed: ['in', 'in again', 'outer']},
+    {why: 'a failing call the handler catches rolls back only its own writes', input: {text: 'outer', inner: {text: 'in', refuse: true}, catch: true}, seen: ['outer'], committed: ['outer']},
+    {why: 'a failing call the handler does not catch rolls back the whole op', input: {text: 'outer', inner: {text: 'in', refuse: true}}, status: 409, committed: []},
+    {why: 'a handler failing after its calls rolls them back too', input: {text: 'outer', inner: {text: 'in'}, refuse: true}, status: 409, committed: []}
+  ]
+
+  for (const {why, input, seen, status, committed} of nested) {
+    it(why, async () => {
+      const call = personal.call('POST [notes]/nested', input)
+      if (status) await assert.rejects(call, {status})
+      else assert.deepStrictEqual((await call).seen, seen)
+      assert.deepStrictEqual(await texts(personal), committed)
+    })
+  }
+
+  it('fails a handler that finishes before the calls it made, and commits none of them', async () => {
+    await assert.rejects(personal.call('POST [notes]/unawaited'), {status: 500, message: /finished before the calls it made/})
+    await tick()
+    assert.deepStrictEqual(await texts(personal), [])
+  })
+
   const refused = [
+    {key: 'GET [notes]/writes', status: 400, why: 'a GET calling a write'},
     {key: 'GET [chat]/messages', status: 404, why: 'a service the space does not run'},
     {key: 'GET [notes]/nothing', status: 404, why: 'a resource the service does not have'},
     {key: 'DELETE [notes]/notes', status: 405, why: 'a method the resource does not answer'},

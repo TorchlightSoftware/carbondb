@@ -1,10 +1,13 @@
 //! One SQLite file, the store behind a space or the system database.
 //!
-//! A store has two connections. The writer applies one transaction at a time;
-//! while one is open, the authorizer records every table it writes, the write
-//! set a commit notice carries. The reader is read-only and, in WAL mode, sees
-//! only committed state; while a read is open, the authorizer records every
-//! table it reads, the read set `watch` re-runs on.
+//! A store keeps one writer connection, on which one op's transaction runs at a
+//! time; while it is open, the authorizer records every table it writes, the
+//! write set a commit notice carries. A call made inside an op runs under a
+//! savepoint, so its writes roll back alone when it fails.
+//!
+//! Each top-level GET opens its own read-only `Reader`, which in WAL mode sees
+//! only committed state and records every table it reads, the read set `watch`
+//! re-runs on. Reads therefore never wait for a write, nor for each other.
 //!
 //! Statements are prepared fresh each time, never from a cache, because the
 //! authorizer only runs when a statement is prepared.
@@ -20,22 +23,32 @@ use serde_json::{Map, Value};
 
 use crate::error::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-  Writer,
-  Reader,
+// What a service's queries run against: the writer inside an op, or a reader
+// inside a GET. Only a write may `run`.
+pub trait Db {
+  fn run(&self, sql: &str, params: &[Value]) -> Result<u64>;
+  fn all(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>>;
+
+  // The first row, or null when there is none.
+  fn get(&self, sql: &str, params: &[Value]) -> Result<Value> {
+    Ok(self.all(sql, params)?.into_iter().next().unwrap_or(Value::Null))
+  }
 }
 
-// The tables an open transaction or read has touched.
+// The tables a transaction or read has touched. SQLite's authorizer must be Send.
 type TableSet = Arc<Mutex<BTreeSet<String>>>;
+
+// Which way a connection's touched tables are recorded: writes on the writer, reads on a reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Touch {
+  Write,
+  Read,
+}
 
 pub struct Store {
   path: PathBuf,
   writer: Connection,
-  reader: Connection,
-  // Each side records separately, since a read may run while a write is open.
   written: TableSet,
-  read: TableSet,
 }
 
 impl Store {
@@ -43,53 +56,37 @@ impl Store {
     let writer = Connection::open(path)?;
     writer.pragma_update(None, "journal_mode", "wal")?;
     writer.pragma_update(None, "foreign_keys", "on")?;
-    let reader = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    Ok(Store { path: path.to_path_buf(), writer, reader, written: TableSet::default(), read: TableSet::default() })
+    Ok(Store { path: path.to_path_buf(), writer, written: TableSet::default() })
   }
 
   pub fn path(&self) -> &Path {
     &self.path
   }
 
-  fn connection(&self, side: Side) -> &Connection {
-    match side {
-      Side::Writer => &self.writer,
-      Side::Reader => &self.reader,
-    }
-  }
-
-  fn tables(&self, side: Side) -> &TableSet {
-    match side {
-      Side::Writer => &self.written,
-      Side::Reader => &self.read,
-    }
-  }
-
   // Open a write transaction and start recording the tables it writes.
   pub fn begin_write(&self) -> Result<()> {
     self.writer.execute_batch("BEGIN IMMEDIATE")?;
-    self.record(Side::Writer)
+    record(&self.writer, Touch::Write, &self.written)
   }
 
   // End the write transaction, committing or rolling back, and return the tables it wrote.
   pub fn end_write(&self, commit: bool) -> Result<Vec<String>> {
     let ended = self.writer.execute_batch(if commit { "COMMIT" } else { "ROLLBACK" });
-    let tables = self.stop_recording(Side::Writer)?;
+    let tables = stop_recording(&self.writer, &self.written)?;
     ended?;
     Ok(tables)
   }
 
-  // Open a read on a snapshot of committed state and start recording the tables it reads.
-  pub fn begin_read(&self) -> Result<()> {
-    self.reader.execute_batch("BEGIN")?;
-    self.record(Side::Reader)
+  // A call inside the open transaction starts here; its writes keep or roll back on their own.
+  // Savepoints share one name: the innermost is always the one released or rolled back to.
+  pub fn savepoint(&self) -> Result<()> {
+    Ok(self.writer.execute_batch("SAVEPOINT carbon_call")?)
   }
 
-  pub fn end_read(&self) -> Result<Vec<String>> {
-    let ended = self.reader.execute_batch("COMMIT");
-    let tables = self.stop_recording(Side::Reader)?;
-    ended?;
-    Ok(tables)
+  // End the innermost savepoint, keeping its writes or undoing them.
+  pub fn end_savepoint(&self, keep: bool) -> Result<()> {
+    let sql = if keep { "RELEASE carbon_call" } else { "ROLLBACK TO carbon_call; RELEASE carbon_call" };
+    Ok(self.writer.execute_batch(sql)?)
   }
 
   // Run a synchronous write in one transaction: commit on success, roll back on error.
@@ -104,67 +101,98 @@ impl Store {
     }
   }
 
-  pub fn read<T>(&self, work: impl FnOnce(&Store) -> Result<T>) -> Result<(T, Vec<String>)> {
-    self.begin_read()?;
-    let value = work(self);
-    let tables = self.end_read()?;
-    Ok((value?, tables))
-  }
-
-  // Record the tables the writer writes, or the reader reads, until recording stops.
-  fn record(&self, side: Side) -> Result<()> {
-    let touched = Arc::clone(self.tables(side));
-    touched.lock().expect("table set").clear();
-    self.connection(side).authorizer(Some(move |context: AuthContext<'_>| {
-      if let Some(table) = touched_table(side, &context.action) {
-        touched.lock().expect("table set").insert(table.to_string());
-      }
-      Authorization::Allow
-    }))?;
-    Ok(())
-  }
-
-  fn stop_recording(&self, side: Side) -> Result<Vec<String>> {
-    self.connection(side).authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
-    let tables = std::mem::take(&mut *self.tables(side).lock().expect("table set"));
-    Ok(tables.into_iter().collect())
-  }
-
-  pub fn run(&self, side: Side, sql: &str, params: &[Value]) -> Result<u64> {
-    Ok(self.connection(side).execute(sql, params_from_iter(params.iter().map(to_sql)))? as u64)
+  // A read on its own connection, over a snapshot of committed state.
+  pub fn reader(&self) -> Result<Reader> {
+    let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    connection.execute_batch("BEGIN")?;
+    let read = TableSet::default();
+    record(&connection, Touch::Read, &read)?;
+    Ok(Reader { connection, read })
   }
 
   // Several statements with no parameters, such as a migration.
   pub fn run_batch(&self, sql: &str) -> Result<()> {
     Ok(self.writer.execute_batch(sql)?)
   }
+}
 
-  pub fn all(&self, side: Side, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
-    let connection = self.connection(side);
-    let mut statement = connection.prepare(sql)?;
-    let columns: Vec<String> = statement.column_names().iter().map(|name| name.to_string()).collect();
-    let rows = statement.query_map(params_from_iter(params.iter().map(to_sql)), |row| {
-      let mut object = Map::new();
-      for (index, column) in columns.iter().enumerate() {
-        object.insert(column.clone(), from_sql(row.get(index)?));
-      }
-      Ok(Value::Object(object))
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<Value>>>()?)
+impl Db for Store {
+  fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
+    run(&self.writer, sql, params)
   }
 
-  // The first row, or null when there is none.
-  pub fn get(&self, side: Side, sql: &str, params: &[Value]) -> Result<Value> {
-    Ok(self.all(side, sql, params)?.into_iter().next().unwrap_or(Value::Null))
+  fn all(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
+    all(&self.writer, sql, params)
   }
 }
 
-// The table an authorizer action writes, on the writer, or reads, on the reader.
+// A GET's snapshot of committed state, recording the tables it reads.
+pub struct Reader {
+  connection: Connection,
+  read: TableSet,
+}
+
+impl Reader {
+  // End the read and return the tables it read.
+  pub fn end(&self) -> Result<Vec<String>> {
+    let ended = self.connection.execute_batch("COMMIT");
+    let tables = stop_recording(&self.connection, &self.read)?;
+    ended?;
+    Ok(tables)
+  }
+}
+
+impl Db for Reader {
+  fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
+    run(&self.connection, sql, params)
+  }
+
+  fn all(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
+    all(&self.connection, sql, params)
+  }
+}
+
+// Record the tables a connection writes, or reads, until recording stops.
+fn record(connection: &Connection, touch: Touch, tables: &TableSet) -> Result<()> {
+  tables.lock().expect("table set").clear();
+  let touched = Arc::clone(tables);
+  connection.authorizer(Some(move |context: AuthContext<'_>| {
+    if let Some(table) = touched_table(touch, &context.action) {
+      touched.lock().expect("table set").insert(table.to_string());
+    }
+    Authorization::Allow
+  }))?;
+  Ok(())
+}
+
+fn stop_recording(connection: &Connection, tables: &TableSet) -> Result<Vec<String>> {
+  connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+  Ok(std::mem::take(&mut *tables.lock().expect("table set")).into_iter().collect())
+}
+
+fn run(connection: &Connection, sql: &str, params: &[Value]) -> Result<u64> {
+  Ok(connection.execute(sql, params_from_iter(params.iter().map(to_sql)))? as u64)
+}
+
+fn all(connection: &Connection, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
+  let mut statement = connection.prepare(sql)?;
+  let columns: Vec<String> = statement.column_names().iter().map(|name| name.to_string()).collect();
+  let rows = statement.query_map(params_from_iter(params.iter().map(to_sql)), |row| {
+    let mut object = Map::new();
+    for (index, column) in columns.iter().enumerate() {
+      object.insert(column.clone(), from_sql(row.get(index)?));
+    }
+    Ok(Value::Object(object))
+  })?;
+  Ok(rows.collect::<rusqlite::Result<Vec<Value>>>()?)
+}
+
+// The table an authorizer action writes, on the writer, or reads, on a reader.
 // SQLite's own tables are left out.
-fn touched_table<'a>(side: Side, action: &AuthAction<'a>) -> Option<&'a str> {
-  let table = match (side, action) {
-    (Side::Writer, AuthAction::Insert { table_name } | AuthAction::Delete { table_name } | AuthAction::Update { table_name, .. }) => table_name,
-    (Side::Reader, AuthAction::Read { table_name, .. }) => table_name,
+fn touched_table<'a>(touch: Touch, action: &AuthAction<'a>) -> Option<&'a str> {
+  let table = match (touch, action) {
+    (Touch::Write, AuthAction::Insert { table_name } | AuthAction::Delete { table_name } | AuthAction::Update { table_name, .. }) => table_name,
+    (Touch::Read, AuthAction::Read { table_name, .. }) => table_name,
     _ => return None,
   };
   (!table.starts_with("sqlite_")).then_some(table)
@@ -204,13 +232,17 @@ mod tests {
     (directory, store)
   }
 
+  fn texts(db: &dyn Db) -> Vec<Value> {
+    db.all("SELECT id FROM message ORDER BY id", &[]).unwrap().into_iter().map(|row| row["id"].clone()).collect()
+  }
+
   #[test]
   fn a_write_reports_the_tables_it_wrote() {
     let (_directory, store) = store();
     let (_, tables) = store
       .write(|store| {
-        store.run(Side::Writer, "INSERT INTO message (id, text) VALUES (?, ?)", &[json!("m1"), json!("hi")])?;
-        store.all(Side::Writer, "SELECT * FROM member", &[])
+        store.run("INSERT INTO message (id, text) VALUES (?, ?)", &[json!("m1"), json!("hi")])?;
+        store.all("SELECT * FROM member", &[])
       })
       .unwrap();
     assert_eq!(tables, vec!["message"]);
@@ -220,28 +252,44 @@ mod tests {
   fn a_read_reports_the_tables_it_read_and_sees_only_committed_state() {
     let (_directory, store) = store();
     store.begin_write().unwrap();
-    store.run(Side::Writer, "INSERT INTO message (id, text) VALUES ('m1', 'hi')", &[]).unwrap();
-    let (rows, tables) = store.read(|store| store.all(Side::Reader, "SELECT m.id FROM message m JOIN member p ON p.id = m.id", &[])).unwrap();
-    assert_eq!((rows, tables), (vec![], vec!["member".to_string(), "message".to_string()]));
+    store.run("INSERT INTO message (id, text) VALUES ('m1', 'hi')", &[]).unwrap();
+    let reader = store.reader().unwrap();
+    let rows = reader.all("SELECT m.id FROM message m JOIN member p ON p.id = m.id", &[]).unwrap();
+    assert_eq!((rows, reader.end().unwrap()), (vec![], vec!["member".to_string(), "message".to_string()]));
     store.end_write(true).unwrap();
-    assert_eq!(store.get(Side::Reader, "SELECT text FROM message", &[]).unwrap(), json!({"text": "hi"}));
+    assert_eq!(store.reader().unwrap().get("SELECT text FROM message", &[]).unwrap(), json!({"text": "hi"}));
   }
 
   #[test]
   fn a_failed_write_rolls_back() {
     let (_directory, store) = store();
     let result = store.write(|store| {
-      store.run(Side::Writer, "INSERT INTO message (id) VALUES ('m1')", &[])?;
-      store.run(Side::Writer, "INSERT INTO message (id) VALUES ('m1')", &[])
+      store.run("INSERT INTO message (id) VALUES ('m1')", &[])?;
+      store.run("INSERT INTO message (id) VALUES ('m1')", &[])
     });
     assert_eq!(result.unwrap_err().status, 500);
-    assert_eq!(store.all(Side::Reader, "SELECT * FROM message", &[]).unwrap(), Vec::<Value>::new());
+    assert_eq!(texts(&store.reader().unwrap()), Vec::<Value>::new());
   }
 
   #[test]
-  fn the_reader_cannot_write() {
+  fn a_savepoint_rolls_back_only_its_own_writes_at_any_depth() {
     let (_directory, store) = store();
-    assert!(store.run(Side::Reader, "INSERT INTO message (id) VALUES ('m1')", &[]).unwrap_err().message.contains("readonly"));
+    store.begin_write().unwrap();
+    store.run("INSERT INTO message (id) VALUES ('outer')", &[]).unwrap();
+    store.savepoint().unwrap();
+    store.run("INSERT INTO message (id) VALUES ('kept')", &[]).unwrap();
+    store.savepoint().unwrap();
+    store.run("INSERT INTO message (id) VALUES ('undone')", &[]).unwrap();
+    store.end_savepoint(false).unwrap();
+    store.end_savepoint(true).unwrap();
+    store.end_write(true).unwrap();
+    assert_eq!(texts(&store.reader().unwrap()), vec![json!("kept"), json!("outer")]);
+  }
+
+  #[test]
+  fn a_reader_cannot_write() {
+    let (_directory, store) = store();
+    assert!(store.reader().unwrap().run("INSERT INTO message (id) VALUES ('m1')", &[]).unwrap_err().message.contains("readonly"));
   }
 
   #[test]
@@ -251,9 +299,9 @@ mod tests {
     store.run_batch("CREATE TABLE cell (id TEXT PRIMARY KEY, value)").unwrap();
     let cases = [json!("hello"), json!(42), json!(1.5), json!(null), json!({"nested": [1]})];
     for (index, value) in cases.iter().enumerate() {
-      store.run(Side::Writer, "INSERT INTO cell (id, value) VALUES (?, ?)", &[json!(index.to_string()), value.clone()]).unwrap();
+      store.run("INSERT INTO cell (id, value) VALUES (?, ?)", &[json!(index.to_string()), value.clone()]).unwrap();
     }
-    let texts: Vec<Value> = store.all(Side::Reader, "SELECT value FROM cell ORDER BY id", &[]).unwrap().into_iter().map(|row| row["value"].clone()).collect();
-    assert_eq!(texts, vec![json!("hello"), json!(42), json!(1.5), json!(null), json!("{\"nested\":[1]}")]);
+    let values: Vec<Value> = store.reader().unwrap().all("SELECT value FROM cell ORDER BY id", &[]).unwrap().into_iter().map(|row| row["value"].clone()).collect();
+    assert_eq!(values, vec![json!("hello"), json!(42), json!(1.5), json!(null), json!("{\"nested\":[1]}")]);
   }
 }

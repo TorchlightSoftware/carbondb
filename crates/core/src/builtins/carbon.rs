@@ -1,20 +1,28 @@
-//! `[@carbon]`, the device's local service: host code that never replicates,
-//! so no peer checks its version. It answers on the system handle, where
+//! `[@carbon]`, the device's local service: host code that runs once, on this
+//! device, and never replicates. It answers on the system handle, where
 //! identities are created and listed, and in every space, where spaces are
-//! created and the space's status is read. It routes its own calls; the setup
-//! it asks for lives in `identity` and `space`. Calls that need peers, or that
-//! are designed but not built, are refused here.
+//! created and the space's status is read. Calls that need peers, or that are
+//! designed but not built, are refused here.
+//!
+//! What it sets up in replicated spaces it writes as ops there, through the
+//! services that own those records, so every replica sees them. Its own call is
+//! logged where it ran, marked with this device. Setting something up is a list
+//! of steps, run in order, stopping at the first that fails.
+
+use std::collections::VecDeque;
+use std::rc::Rc;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::call::{Actor, Call, Outcome};
-use crate::carbon::{Carbon, Context};
+use crate::builtins::space;
+use crate::call::{Actor, Call};
 use crate::error::{Result, bad_request, conflict, not_built, single_node};
-use crate::identity::{self, NewIdentity};
-use crate::names::{slugify, unique_slug};
-use crate::space::{self, Origin, Ref};
-use crate::store::{Side, Store};
+use crate::hash::hash;
+use crate::identity::{self, Identity};
+use crate::invocation::Invocation;
+use crate::keys;
+use crate::names::slugify;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,67 +51,209 @@ fn default_kind() -> String {
   "space".to_string()
 }
 
-pub fn handle(carbon: &Carbon, context: Context, actor: &Actor, call: &Call, input: Value) -> Result<Outcome> {
-  match (context, call.method(), call.resource.as_str()) {
-    (Context::System, "POST", "/identity") => create_identity(carbon, call, input),
-    (Context::System, "GET", "/identities") => Outcome::read(carbon.system(), |system| Ok(json!(identity::list(system, Side::Reader)?))),
-    (Context::System, "POST", "/devices") => Err(single_node("Adding a device")),
-    (Context::Space(store), "GET", "/status") => Outcome::read(store, |store| status(store, actor)),
-    (Context::Space(store), "POST", "/space") => create_space(carbon, store, actor, call, input),
-    (Context::Space(store), "GET", "/manage") => Outcome::read(store, |store| Ok(json!(space::managers(store, Side::Reader)?))),
-    (Context::Space(_), _, "/members" | "/join" | "/sync/start" | "/sync/stop") => Err(single_node(&call.key())),
-    (Context::Space(_), "POST", "/manage") => Err(not_built("Changing a manage list")),
-    (Context::Space(_), "DELETE", "/data") => Err(not_built("Deleting a space's data")),
-    _ => Err(call.unknown()),
+pub fn entry(invocation: Rc<Invocation>) {
+  let root = invocation.space().is_root();
+  let answer = |result: Result<Value>| {
+    let _ = invocation.settle(result);
+  };
+  match (root, invocation.call.method(), invocation.call.resource.as_str()) {
+    (true, "POST", "/identity") => create_identity(Rc::clone(&invocation)),
+    (true, "GET", "/identities") => answer(identity::list(invocation.as_ref()).map(|identities| json!(identities))),
+    (true, "POST", "/devices") => answer(Err(single_node("Adding a device"))),
+    (false, "GET", "/status") => answer(status(&invocation)),
+    (false, "POST", "/space") => create_space(Rc::clone(&invocation)),
+    (false, "GET", "/manage") => answer(space::managers(invocation.as_ref()).map(|managers| json!(managers))),
+    (false, _, "/members" | "/join" | "/sync/start" | "/sync/stop") => answer(Err(single_node(&invocation.call.key()))),
+    (false, "POST", "/manage") => answer(Err(not_built("Changing a manage list"))),
+    (false, "DELETE", "/data") => answer(Err(not_built("Deleting a space's data"))),
+    _ => answer(Err(invocation.call.unknown())),
   }
 }
 
-// Create an identity on this device. The system database records it in the
-// same write, so an identity is listed only once both its spaces exist.
-fn create_identity(carbon: &Carbon, call: &Call, input: Value) -> Result<Outcome> {
-  let request: IdentityInput = serde_json::from_value(input)?;
+// Where a step's call runs: the space `[@carbon]` was called in, or another by id.
+#[derive(Debug, Clone, PartialEq)]
+enum Target {
+  Here,
+  Space(String),
+}
+
+// One step of setting something up.
+#[derive(Debug, Clone, PartialEq)]
+enum Step {
+  // A new space's database, on this device.
+  Create(String),
+  // A call, as an op of its own in its space.
+  Call { target: Target, actor: Actor, key: &'static str, input: Value },
+  // Provision the services a space's origin named, once that origin applies.
+  Provision(String, Vec<String>),
+}
+
+// What the steps' calls returned, in order, or the first error.
+type Done = Box<dyn FnOnce(Result<Vec<Value>>)>;
+
+// Run steps in order, each once the one before it has applied.
+fn run(invocation: Rc<Invocation>, mut steps: VecDeque<Step>, mut returned: Vec<Value>, done: Done) {
+  let Some(step) = steps.pop_front() else { return done(Ok(returned)) };
+  let carbon = Rc::clone(invocation.carbon());
+  let host = match step {
+    Step::Create(id) => carbon.create_space(&id).map(|_| ()),
+    Step::Provision(id, services) => carbon.space(&id).and_then(|space| carbon.provision(&space, &services)),
+    Step::Call { target, actor, key, input } => {
+      let space = match target {
+        Target::Here => Ok(Rc::clone(invocation.space())),
+        Target::Space(id) => carbon.space(&id),
+      };
+      let (space, call) = match space.and_then(|space| Ok((space, Call::from_key(key)?))) {
+        Ok(found) => found,
+        Err(error) => return done(Err(error)),
+      };
+      let next = Rc::clone(&invocation);
+      return invocation.call_in(&space, actor, call, input, Box::new(move |result| match result {
+        Ok(value) => {
+          returned.push(value);
+          run(next, steps, returned, done)
+        }
+        Err(error) => done(Err(error)),
+      }));
+    }
+  };
+  match host {
+    Ok(()) => run(invocation, steps, returned, done),
+    Err(error) => done(Err(error)),
+  }
+}
+
+// Create an identity on this device: its first device's key pair, its identity
+// and personal spaces, each set up by ops, and its record in the system
+// database, written in this call's own transaction, so an identity is listed
+// only once both its spaces are set up.
+fn create_identity(invocation: Rc<Invocation>) {
+  let (identity, secret, steps) = match plan_identity(&invocation) {
+    Ok(planned) => planned,
+    Err(error) => {
+      let _ = invocation.settle(Err(error));
+      return;
+    }
+  };
+  let caller = Rc::clone(&invocation);
+  run(invocation, steps, vec![], Box::new(move |result| {
+    let kept = result.and_then(|_| identity::keep(caller.as_ref(), &identity, &secret)).map(|_| json!(identity));
+    let _ = caller.settle(kept);
+  }));
+}
+
+// Check an identity can be created, and plan its setup. Both spaces are named
+// by this call's op, so a retry after a crash reaches the same spaces.
+fn plan_identity(invocation: &Invocation) -> Result<(Identity, String, VecDeque<Step>)> {
+  let request: IdentityInput = serde_json::from_value(invocation.input.clone())?;
   if request.slug.is_empty() || slugify(&request.slug) != request.slug {
     return Err(bad_request(format!("'{}' is not a lowercase kebab-case slug", request.slug)));
   }
-  if carbon.identity(&request.slug).is_ok() {
+  if identity::find(invocation, &request.slug).is_ok() {
     return Err(conflict(format!("An identity '{}' is already on this device", request.slug)));
   }
-  let new = NewIdentity { slug: request.slug, device: request.device, services: request.services };
-  let op = carbon.stamp(&json!({"key": call.key(), "input": {"slug": new.slug, "device": new.device, "services": new.services}})).hash;
-  Outcome::write(carbon.system(), |_| Ok(json!(identity::create(carbon, &op, &new)?)))
+  invocation.carbon().services().require_registered(&request.services)?;
+  let op = invocation.op().map(|op| op.hash.clone()).expect("a POST is an op");
+  let keys = keys::generate()?;
+  let identity = Identity {
+    slug: request.slug,
+    id: identity::id_of(&keys.public),
+    space: hash(&json!({"op": op, "space": "identity"})),
+    personal: hash(&json!({"op": op, "space": "personal"})),
+    device: keys.public,
+  };
+  let personal_services = [vec!["device".to_string()], request.services.into_iter().filter(|service| service != "device").collect()].concat();
+  let steps = identity_steps(&identity, &request.device, personal_services);
+  Ok((identity, keys.secret, steps))
 }
 
-// Create a space nested in the calling one: the caller must manage it, since
-// the new space is attached by a ref written there. The id is the op's hash.
-fn create_space(carbon: &Carbon, parent: &Store, actor: &Actor, call: &Call, input: Value) -> Result<Outcome> {
-  let author = actor.identity.clone().ok_or_else(|| bad_request("Creating a space needs an acting identity"))?;
-  let request: SpaceInput = serde_json::from_value(input.clone())?;
-  let base = request.slug.clone().unwrap_or_else(|| slugify(&request.name));
-  if base.is_empty() || slugify(&base) != base {
-    return Err(bad_request(format!("'{}' gives no usable slug", request.name)));
-  }
-  let id = carbon.stamp(&json!({"key": call.key(), "input": input, "author": author})).hash;
-  let origin = Origin { kind: request.kind.clone(), name: request.name.clone(), services: request.services, manage: request.manage.unwrap_or_else(|| vec![author.clone()]) };
+// An identity's setup, acting as the new identity from its first device.
+fn identity_steps(identity: &Identity, device_name: &str, personal_services: Vec<String>) -> VecDeque<Step> {
+  let actor = Actor { identity: Some(identity.id.clone()), device: Some(identity.device.clone()) };
+  let call = |space: &str, key: &'static str, input: Value| Step::Call { target: Target::Space(space.to_string()), actor: actor.clone(), key, input };
+  let identity_services = vec!["identity".to_string(), "device".to_string()];
+  VecDeque::from([
+    Step::Create(identity.space.clone()),
+    call(&identity.space, "POST [space]/origin", json!({
+      "kind": "identity",
+      "name": identity.slug,
+      "services": identity_services,
+      "manage": ["self"],
+    })),
+    Step::Provision(identity.space.clone(), identity_services),
+    call(&identity.space, "POST [identity]/origin", json!({"device": identity.device})),
+    call(&identity.space, "POST [device]/origin", json!({"pubkey": identity.device})),
+    Step::Create(identity.personal.clone()),
+    call(&identity.personal, "POST [space]/origin", json!({
+      "kind": "personal",
+      "name": identity.slug,
+      "services": personal_services,
+      "manage": [identity.id],
+    })),
+    Step::Provision(identity.personal.clone(), personal_services.clone()),
+    call(&identity.personal, "POST [device]/ref", json!({"pubkey": identity.device, "name": device_name, "tags": ["manage"]})),
+    call(&identity.space, "POST [space]/ref", json!({
+      "space": identity.personal,
+      "kind": "personal",
+      "name": identity.slug,
+      "slug": identity.slug,
+    })),
+  ])
+}
 
-  Outcome::write(parent, |parent| {
-    space::require_manage(parent, Some(&author))?;
-    let slug = unique_slug(&base, |slug| space::find_ref(parent, Side::Writer, &request.kind, slug).ok().flatten().is_some());
-    space::create(&carbon.space_path(&id), &origin, |_| Ok(()))?;
-    let reference = Ref { space: id.clone(), kind: request.kind, name: request.name, slug, cascade: request.cascade };
-    space::add_ref(parent, &reference)?;
-    Ok(json!(reference))
-  })
+// Create a space nested in the calling one. The calling space must accept the
+// ref first, so a caller without manage there creates nothing. The id is this
+// call's op hash, so a retry after a crash reaches the same space.
+fn create_space(invocation: Rc<Invocation>) {
+  let steps = match plan_space(&invocation) {
+    Ok(steps) => steps,
+    Err(error) => {
+      let _ = invocation.settle(Err(error));
+      return;
+    }
+  };
+  let caller = Rc::clone(&invocation);
+  run(invocation, steps, vec![], Box::new(move |result| {
+    let reference = result.map(|mut returned| returned.swap_remove(0));
+    let _ = caller.settle(reference);
+  }));
+}
+
+fn plan_space(invocation: &Invocation) -> Result<VecDeque<Step>> {
+  let actor = invocation.actor.clone();
+  let author = actor.identity.clone().ok_or_else(|| bad_request("Creating a space needs an acting identity"))?;
+  let request: SpaceInput = serde_json::from_value(invocation.input.clone())?;
+  invocation.carbon().services().require_registered(&request.services)?;
+  let id = invocation.op().map(|op| op.hash.clone()).expect("a POST is an op");
+  let origin = json!({
+    "kind": request.kind,
+    "name": request.name,
+    "services": request.services,
+    "manage": request.manage.unwrap_or_else(|| vec![author]),
+  });
+  let reference = json!({
+    "space": id,
+    "kind": request.kind,
+    "name": request.name,
+    "slug": request.slug,
+    "cascade": request.cascade,
+  });
+  Ok(VecDeque::from([
+    Step::Call { target: Target::Here, actor: actor.clone(), key: "POST [space]/ref", input: reference },
+    Step::Create(id.clone()),
+    Step::Call { target: Target::Space(id.clone()), actor, key: "POST [space]/origin", input: origin },
+    Step::Provision(id, request.services),
+  ]))
 }
 
 // What a space is, and its state on this device. Single-node: sync is off, there
 // are no peers, and every identity here has full access.
-fn status(store: &Store, actor: &Actor) -> Result<Value> {
-  let origin = space::origin(store, Side::Reader)?;
-  let managers = space::managers(store, Side::Reader)?;
-  let manages = actor.identity.as_ref().is_some_and(|identity| managers.contains(identity));
-  let id = store.path().file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+fn status(invocation: &Invocation) -> Result<Value> {
+  let origin = space::origin(invocation)?;
+  let managers = space::managers(invocation)?;
+  let manages = invocation.actor.identity.as_ref().is_some_and(|identity| managers.contains(identity));
   Ok(json!({
-    "space": id,
+    "space": invocation.space().id,
     "kind": origin.kind,
     "name": origin.name,
     "services": origin.services,
@@ -112,71 +262,4 @@ fn status(store: &Store, actor: &Actor) -> Result<Value> {
     "sync": "off",
     "peers": [],
   }))
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use crate::testing::{actor, alice, call, carbon};
-
-  #[test]
-  fn refuses_a_second_identity_with_the_same_slug_and_malformed_slugs() {
-    let (_directory, carbon) = carbon();
-    alice(&carbon);
-    let cases = [("alice", 409), ("Alice", 400), ("", 400)];
-    for (slug, status) in cases {
-      let error = carbon.call(Context::System, &Actor::default(), &call("POST [@carbon]/identity"), json!({"slug": slug, "device": "x"})).unwrap_err();
-      assert_eq!(error.status, status, "{slug}");
-    }
-  }
-
-  #[test]
-  fn creates_a_space_nested_in_the_calling_one() {
-    let (_directory, carbon) = carbon();
-    let identity = alice(&carbon);
-    let personal = carbon.open_space(&identity.personal).unwrap();
-    let create = |name: &str| carbon.call(Context::Space(&personal), &actor(&identity), &call("POST [@carbon]/space"), json!({"name": name, "services": ["chat"]}));
-
-    let created = create("Randall's Playhouse").unwrap();
-    assert_eq!((created.value["slug"].as_str(), created.value["kind"].as_str()), (Some("randalls-playhouse"), Some("space")));
-    let again = create("Randall's Playhouse").unwrap();
-    assert_eq!(again.value["slug"].as_str(), Some("randalls-playhouse-2"));
-
-    let room = carbon.open_space(created.value["space"].as_str().unwrap()).unwrap();
-    let status = carbon.call(Context::Space(&room), &actor(&identity), &call("GET [@carbon]/status"), Value::Null).unwrap();
-    assert_eq!(status.value["name"], json!("Randall's Playhouse"));
-    assert_eq!(status.value["services"], json!(["chat"]));
-    assert_eq!(status.value["manage"], json!([identity.id]));
-    assert_eq!((status.value["access"].clone(), status.value["sync"].clone(), status.value["peers"].clone()), (json!(["manage"]), json!("off"), json!([])));
-  }
-
-  #[test]
-  fn only_a_manager_may_create_a_space_in_another() {
-    let (_directory, carbon) = carbon();
-    let identity = alice(&carbon);
-    let personal = carbon.open_space(&identity.personal).unwrap();
-    let stranger = Actor { identity: Some("someone-else".into()), device: None };
-    let error = carbon.call(Context::Space(&personal), &stranger, &call("POST [@carbon]/space"), json!({"name": "Room"})).unwrap_err();
-    assert_eq!(error.status, 403);
-    assert_eq!(space::refs(&personal, Side::Reader).unwrap(), vec![]);
-  }
-
-  #[test]
-  fn refuses_calls_that_need_peers_or_are_not_built() {
-    let (_directory, carbon) = carbon();
-    let identity = alice(&carbon);
-    let personal = carbon.open_space(&identity.personal).unwrap();
-    let cases = [
-      ("POST [@carbon]/members", "SINGLE_NODE"),
-      ("POST [@carbon]/join", "SINGLE_NODE"),
-      ("POST [@carbon]/sync/start", "SINGLE_NODE"),
-      ("POST [@carbon]/manage", "NOT_BUILT"),
-      ("DELETE [@carbon]/data", "NOT_BUILT"),
-    ];
-    for (key, code) in cases {
-      let error = carbon.call(Context::Space(&personal), &actor(&identity), &call(key), json!({})).unwrap_err();
-      assert_eq!((error.status, error.code.as_str()), (501, code), "{key}");
-    }
-    assert_eq!(carbon.call(Context::System, &Actor::default(), &call("POST [@carbon]/devices"), json!({})).unwrap_err().code, "SINGLE_NODE");
-  }
 }

@@ -8,10 +8,10 @@ The spec is the app interface: what an app calls and what CarbonDB guarantees in
 
 ## Build order
 
-1. **Single-node CarbonDB:** the Rust core behind napi-rs, with no p2panda and no op log, delivering the whole app interface below.
+1. **Single-node CarbonDB:** the Rust core behind napi-rs, with no p2panda, delivering the whole app interface below. Ops already apply through each space's RunQueue into its op log, the same path synced ops will take.
 2. **[chat] on it:** `main()` loads CarbonDB, registers [chat] with `carbon.services.add('chat', chat)` and gets a handle. [chat] stays small, resembling an ordinary backend service with minimal dependencies, with plain SQL and no build step.
 3. **A small JS HTTP adapter** in front of [chat]. The tests talk to it over HTTP.
-4. **Replicated mode:** the op log, the apply loop, sessions and p2panda spaces, switched on by config with no change to the app.
+4. **Replicated mode:** sessions, rewind and p2panda spaces, switched on by config with no change to the app.
 
 The hello world is create a space, post, edit, delete, list and watch, on single-node CarbonDB. Adding a member and joining (story 7) arrive with replicated mode. Richer service runtimes come later on the same app interface.
 
@@ -22,7 +22,7 @@ The hello world is create a space, post, edit, delete, list and watch, on single
 - **`call(key, input)`:** runs the service's handler and resolves with its result once this device has applied it, or rejects with a service error.
 - **`watch(key, fn)`:** re-runs a GET and hands `fn` the result after each commit that touched what it read, and returns a function that stops it.
 - **Service errors:** a rejection carries an HTTP-style status, a code and details, preserved across the core boundary (see [Service errors](#service-errors)).
-- **Handlers** receive `path`, `input`, `op` and `db`. `op` carries the key, path, input, the verified author and device as plain data, the time, `id()` and `random()`.
+- **Handlers** receive `path`, `input`, `db` and `call`, and `op` when the call writes. `op` carries the key, path, input, the verified author and device as plain data, the time, `id()` and `random()`. `call(key, input)` makes a call inside this one (see [Applying an op](#applying-an-op)).
 
 The host function handlers use for SQL is internal and is not part of the spec.
 
@@ -35,7 +35,7 @@ mode = "none"   # single-node: no p2panda node is started
 
 - The same app interface and builtin services, on the Rust core with no p2panda and no network.
 - Identities, spaces and refs exist locally, so handles reach spaces the same way.
-- No op log for the first draft. Nothing observable depends on it until there is a second replica. It comes back if the API grows undo or audit.
+- The op log is kept from the first draft, so local calls and synced ops share one apply path from the start.
 - Calls that need p2panda reject: `POST [@carbon]/members`, `POST [@carbon]/join`, `POST [@carbon]/sync/start`, and `POST [device]/origin` for a second device.
 - `GET [@carbon]/status` answers `sync: 'off'`, `peers: []`, and full access for the local identity, since nothing else answers who has access.
 - A single-node instance cannot switch to replicated later. Its data does not carry over.
@@ -93,7 +93,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 - **`[space]`** runs in every replicated space: its origin, refs, members and manage list.
 - **`[identity]`** runs in identity spaces: the identity's origin. An app may run its own service of the same name, such as one holding roles, in other spaces; the two never share a space.
 - **`[device]`** follows `[space]`'s pattern: `POST [device]/origin` in the identity space authorizes a device's public key, and `POST [device]/ref` in the personal space records its name and tags. A second ref for the same key replaces the first.
-- **Local log:** ops on local services are kept in the system log, each row naming its space. That gives one debug log and one place to finish interrupted work after a crash.
+- **Local ops:** an op on a local service is kept in the op log of the space it ran in, marked with the device that ran it, and other devices skip it, so the log shows every action behind a space's state. Calls on the system handle, which belong to no space, go in the system log, the system database's op log. Either gives one place to finish interrupted work after a crash.
 
 ### Creating a space
 
@@ -135,13 +135,15 @@ Creating a space cannot be undone. If a rewind rejects a parent's ref, the space
 ## Applying an op
 
 - Every replica sorts ops by (hybrid logical clock, device, op hash), drops duplicates, and re-runs the service's handler in that order, so business rules give the same result everywhere.
-- The core owns the order and the changesets, so it decides when a handler runs or re-runs. The seam between core and runtime is `apply(op, db)`.
-- Each space has one queue for local calls and synced ops, and applies one op at a time. A local call takes its clock time when it starts, so it follows everything already applied.
+- The core owns the order and the changesets, so it decides when a handler runs or re-runs. It routes every call by service name to the service's entry point, the same for Rust builtins, npm services and WASM packages, and the entry point settles it once.
+- Each space has one RunQueue for local calls and synced ops, and applies one op at a time. A local call takes its clock time when its turn comes, so it follows everything already applied.
+- An op is appended to its space's op log once, when it applies, in the same transaction, with its output and the calls it made, which stay on this device. A call refused on its author's device is never appended.
+- A call a handler makes runs inside the same op, under a savepoint: it sees the writes before it, and when it fails only its own writes roll back and the error reaches the handler that made it. A GET inside an op reads through the op's transaction. The exception is a local service writing to a replicated service: that write is an op of its own, since the local service never replicates. Replicated services never call local ones.
 
 The steps for each op:
 
 1. The core opens a transaction and a session on the space's database.
-2. It calls the runtime's `apply` and awaits the Promise. Handlers may be async.
+2. It hands the call to the service's entry point and waits for it to settle. Handlers may be async.
 3. Database calls from the handler are synchronous and run inside the open transaction.
 4. When the Promise resolves, the core commits and keeps the session's changeset with the op. When it rejects or returns an error, the core rolls back and records the op as rejected.
 5. The core gives the runtime one notice per commit: op, outcome and tables touched. `watch` is built on this, and apps get no separate event API.
