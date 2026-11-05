@@ -1,6 +1,6 @@
 # Design goals: CarbonDB as a runtime for services
 
-CarbonDB lets a service written in the shape of an ordinary backend service (named calls, SQL tables, handlers) run on every member's device, with the replication protocol taking the place of HTTP. This note records who is responsible for what, how an op is applied, and a first sketch of the API. [implementation.md](implementation.md) holds the full agreed design, [services.md](services.md) the builtin calls, and [oplog-examples.md](oplog-examples.md) worked examples.
+CarbonDB lets a service written in the shape of an ordinary backend service (named calls, SQL tables, handlers) run on every member's device, with the replication protocol taking the place of HTTP. This note records who is responsible for what, how an op is applied, and a first sketch of the API. [implementation.md](implementation.md) holds the full agreed design, [services.md](services.md) the builtin calls, [packages.md](packages.md) how services are packaged and versioned, and [oplog-examples.md](oplog-examples.md) worked examples.
 
 ## The promise to a service author
 
@@ -16,7 +16,7 @@ CarbonDB lets a service written in the shape of an ordinary backend service (nam
 - **Device**: a physical machine enrolled in one identity. It generates its own keys, which never leave it; it signs, and authorizes subkeys. One machine holding several identities has separate device keys for each, so they cannot be linked. Its metadata (name, type, platform) is self-declared; no fingerprinting. A paper key is an offline device.
 - **Personal space**: the private root of what an identity owns, created with it, like `/home` beside `/`. It holds refs to the spaces the identity creates or joins, its devices' names and tags, and personal data. Others, such as a caretaker, may join it without being conflated with the identity.
 - **Space**: a unit of replication with its own log and SQLite database. Membership decides access; when a device syncs a space is a setting. It runs an immutable set of services fixed when it is created. A personal space starts with one member. A space is not a tenant: a tenant holds many spaces.
-- **Service**: a module of tables and calls keyed by service key (`POST [chat]/messages`). Its schema version is the number of its migrations. Every implementation of a service in a space must behave identically, whatever its language, or replicas drift silently.
+- **Service**: a module of tables and calls keyed by service key (`POST [chat]/messages`). Its schema version is the number of its migrations.
 - **Registered services**: the services an app registers in `main()` on every start with `carbon.services.add(name, impl)`. A device applies ops only for services it has registered.
 - **system**: the root space, this device's local database and op log, holding what must be readable before any identity opens, such as the identities on this device. It is never replicated. Every other space is reached from it through refs, and `carbon` is its handle. Each space has one handle.
 - **Op**: a service call carried in a space's log, applied by every member's device in one shared order. An op on a local service never replicates; it is kept in the system log, with each row naming its space.
@@ -120,6 +120,10 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 - [A company can allow or prevent adding a member to its team](backlog/parent-rules-on-child-members.md)
 - [Anyone can verify an identity's devices and public proofs](backlog/public-identity-proofs.md)
 - [A manager can add a service to an existing space](backlog/add-services-to-space.md)
+- [A manager can move a space to a new version of a service](backlog/upgrade-package-version.md)
+- [A service can store files in a space](backlog/file-bindings.md)
+- [An app developer can install @tlsft/carbondb on any desktop platform](backlog/native-packaging-per-platform.md)
+- [An iOS user runs the app's shipped services at native speed](backlog/ios-ahead-of-time-packages.md)
 
 ## API sketch
 
@@ -197,7 +201,7 @@ const carbon = await configure('./carbondb.toml')
 carbon.services.add('chat', chat)
 
 // An identity, its first device and its personal space, with keys generated here.
-const {personal} = await carbon.createIdentity({slug: 'brandon', device: 'laptop', services: []})
+const {personal} = await carbon.createIdentity({slug: 'alice', device: 'laptop', services: []})
 
 // A space is one chat room, nested privately under the personal space.
 const room = await personal.createSpace({name: 'Room', services: ['chat']})

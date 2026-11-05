@@ -54,7 +54,7 @@ let config, carbon, identity, personal
 beforeEach(async () => {
   config = configFile()
   carbon = await start(config)
-  ;({identity, personal} = await carbon.createIdentity({slug: 'brandon', device: 'Pixel9', services: ['notes']}))
+  ;({identity, personal} = await carbon.createIdentity({slug: 'alice', device: 'Pixel9', services: ['notes']}))
 })
 
 const texts = async (space) => (await space.call('GET [notes]/notes')).map((row) => row.text)
@@ -68,8 +68,8 @@ describe('configure', () => {
 describe('identities', () => {
   it('lists the identity and resumes it in a fresh start with the same id and device', async () => {
     const [listed] = await carbon.listIdentities()
-    assert.deepStrictEqual([listed.slug, listed.id, listed.device], ['brandon', identity.identity.id, identity.identity.device])
-    const again = (await start(config)).resumeIdentity('brandon')
+    assert.deepStrictEqual([listed.slug, listed.id, listed.device], ['alice', identity.identity.id, identity.identity.device])
+    const again = (await start(config)).resumeIdentity('alice')
     assert.deepStrictEqual(again.identity, identity.identity)
   })
 
@@ -79,7 +79,7 @@ describe('identities', () => {
   })
 
   it('reaches the personal space through refs from the system handle', () => {
-    assert.strictEqual(carbon.ref('identity:brandon').ref('personal:brandon').space, personal.space)
+    assert.strictEqual(carbon.ref('identity:alice').ref('personal:alice').space, personal.space)
   })
 
   it('refuses a ref that does not exist', () => {
@@ -102,9 +102,9 @@ describe('services', () => {
 
   it('keeps data across a restart that registers the service again, and refuses the space when it does not', async () => {
     await personal.call('POST [notes]/notes', {text: 'kept'})
-    const restarted = (await start(config)).resumeIdentity('brandon').ref('personal:brandon')
+    const restarted = (await start(config)).resumeIdentity('alice').ref('personal:alice')
     assert.deepStrictEqual(await texts(restarted), ['kept', 'kept again'])
-    const unregistered = (await configure(config)).resumeIdentity('brandon').ref('personal:brandon')
+    const unregistered = (await configure(config)).resumeIdentity('alice').ref('personal:alice')
     await assert.rejects(unregistered.call('GET [notes]/notes'), {status: 404, details: {service: 'notes'}})
   })
 })
@@ -133,6 +133,14 @@ describe('calls', () => {
   it('applies concurrent calls one at a time', async () => {
     await Promise.all(['a', 'b', 'c'].map((text) => personal.call('POST [notes]/notes', {text})))
     assert.deepStrictEqual(await texts(personal), ['a', 'a again', 'b', 'b again', 'c', 'c again'])
+  })
+
+  it('reads committed state while a write is still running', async () => {
+    const writing = personal.call('POST [notes]/notes', {text: 'slow'})
+    assert.deepStrictEqual(await texts(personal), [])
+    assert.deepStrictEqual(await personal.call('GET [space]/refs'), [])
+    await writing
+    assert.deepStrictEqual(await texts(personal), ['slow', 'slow again'])
   })
 
   const refused = [

@@ -1,32 +1,20 @@
-//! What CarbonDB itself records in a space's database, beside the app's
-//! tables: the origin, refs, an identity's origin, its devices, and how far
-//! each service's migrations have run. Every table is prefixed `carbon_`.
+//! A space's database and what CarbonDB records in it for `[space]`: its
+//! origin, its refs to other spaces, and how far each service's migrations have
+//! run. Setting up a space, the host's work, lives here too; the `[space]`
+//! calls that read and write these records are in `builtins::space`.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::builtins;
 use crate::error::{Result, bad_request, conflict, forbidden, not_found};
+use crate::identity;
 use crate::store::{Side, Store};
 
-const SCHEMA: &str = "
-  CREATE TABLE IF NOT EXISTS carbon_origin (
-    one INTEGER PRIMARY KEY CHECK (one = 1),
-    kind TEXT NOT NULL, name TEXT NOT NULL, services TEXT NOT NULL, manage TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS carbon_ref (
-    space TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, slug TEXT NOT NULL, cascade TEXT NOT NULL,
-    UNIQUE (kind, slug)
-  );
-  CREATE TABLE IF NOT EXISTS carbon_identity (id TEXT PRIMARY KEY, device TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS carbon_device (pubkey TEXT PRIMARY KEY);
-  CREATE TABLE IF NOT EXISTS carbon_device_ref (pubkey TEXT PRIMARY KEY, name TEXT NOT NULL, tags TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS carbon_migration (service TEXT PRIMARY KEY, count INTEGER NOT NULL);
-";
-
-// The services CarbonDB itself runs, which an app never registers.
-pub const BUILTIN_SERVICES: [&str; 3] = ["space", "identity", "device"];
+// What the core keeps in every space for itself, before any service's migrations.
+const HOST_SCHEMA: &str = include_str!("../sql/host/space.sql");
 
 // What a space is, fixed by its first op.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,23 +36,15 @@ pub struct Ref {
   pub cascade: Vec<String>,
 }
 
-// A device's private description, kept in the personal space.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DeviceRef {
-  pub pubkey: String,
-  pub name: String,
-  #[serde(default)]
-  pub tags: Vec<String>,
-}
-
-// Create a space's database, writing its origin and whatever else its creator
-// writes in the same transaction.
+// Set up a space's database: its builtin services' tables, its origin, and
+// whatever else its creator writes in the same transaction.
 pub fn create(path: &Path, origin: &Origin, setup: impl FnOnce(&Store) -> Result<()>) -> Result<Store> {
   if path.exists() {
     return Err(conflict(format!("A space already exists at {}", path.display())));
   }
   let store = Store::open(path)?;
-  store.run_batch(SCHEMA)?;
+  store.run_batch(HOST_SCHEMA)?;
+  builtins::migrate(&store, &origin.services)?;
   store.write(|store| {
     write_origin(store, origin)?;
     setup(store)
@@ -72,7 +52,14 @@ pub fn create(path: &Path, origin: &Origin, setup: impl FnOnce(&Store) -> Result
   Ok(store)
 }
 
-fn json_column(row: &Value, column: &str) -> Result<Vec<String>> {
+// Open a space's database, running any builtin migrations it has not run yet.
+pub fn open(path: &Path) -> Result<Store> {
+  let store = Store::open(path)?;
+  builtins::migrate(&store, &origin(&store, Side::Reader)?.services)?;
+  Ok(store)
+}
+
+pub(crate) fn json_column(row: &Value, column: &str) -> Result<Vec<String>> {
   Ok(serde_json::from_str(row[column].as_str().unwrap_or("[]"))?)
 }
 
@@ -102,11 +89,11 @@ pub fn origin(store: &Store, side: Side) -> Result<Origin> {
 }
 
 // The identities that manage this space, with `self` resolved to the identity
-// whose identity space this is.
+// whose identity space this is. Only an identity space names `self`.
 pub fn managers(store: &Store, side: Side) -> Result<Vec<String>> {
-  let manage = origin(store, side)?.manage;
-  let own = identity_id(store, side)?;
-  Ok(manage.into_iter().filter_map(|entry| if entry == "self" { own.clone() } else { Some(entry) }).collect())
+  let resolve = |entry: String| if entry == "self" { identity::id(store, side) } else { Ok(Some(entry)) };
+  let resolved: Vec<Option<String>> = origin(store, side)?.manage.into_iter().map(resolve).collect::<Result<_>>()?;
+  Ok(resolved.into_iter().flatten().collect())
 }
 
 pub fn require_manage(store: &Store, actor: Option<&str>) -> Result<()> {
@@ -148,68 +135,17 @@ pub fn find_ref(store: &Store, side: Side, kind: &str, slug: &str) -> Result<Opt
   if row.is_null() { Ok(None) } else { to_ref(&row).map(Some) }
 }
 
-pub fn write_identity_origin(store: &Store, id: &str, device: &str) -> Result<()> {
-  if identity_id(store, Side::Writer)?.is_some() {
-    return Err(conflict("An identity's origin is written once"));
-  }
-  store.run(Side::Writer, "INSERT INTO carbon_identity (id, device) VALUES (?, ?)", &[json!(id), json!(device)])?;
-  Ok(())
-}
-
-pub fn identity_id(store: &Store, side: Side) -> Result<Option<String>> {
-  let row = store.get(side, "SELECT id FROM carbon_identity", &[])?;
-  Ok(row["id"].as_str().map(str::to_string))
-}
-
-pub fn add_device(store: &Store, pubkey: &str) -> Result<()> {
-  if !store.get(Side::Writer, "SELECT 1 AS present FROM carbon_device WHERE pubkey = ?", &[json!(pubkey)])?.is_null() {
-    return Err(conflict("A device's origin is written once"));
-  }
-  store.run(Side::Writer, "INSERT INTO carbon_device (pubkey) VALUES (?)", &[json!(pubkey)])?;
-  Ok(())
-}
-
-pub fn devices(store: &Store, side: Side) -> Result<Vec<String>> {
-  let rows = store.all(side, "SELECT pubkey FROM carbon_device ORDER BY pubkey", &[])?;
-  Ok(rows.iter().filter_map(|row| row["pubkey"].as_str().map(str::to_string)).collect())
-}
-
-// A second ref for the same device replaces the first.
-pub fn put_device_ref(store: &Store, device: &DeviceRef) -> Result<()> {
-  store.run(
-    Side::Writer,
-    "INSERT INTO carbon_device_ref (pubkey, name, tags) VALUES (?, ?, ?)
-       ON CONFLICT (pubkey) DO UPDATE SET name = excluded.name, tags = excluded.tags",
-    &[json!(device.pubkey), json!(device.name), json!(device.tags)],
-  )?;
-  Ok(())
-}
-
-pub fn device_refs(store: &Store, side: Side) -> Result<Vec<DeviceRef>> {
-  store
-    .all(side, "SELECT pubkey, name, tags FROM carbon_device_ref ORDER BY name", &[])?
-    .iter()
-    .map(|row| {
-      Ok(DeviceRef {
-        pubkey: row["pubkey"].as_str().unwrap_or_default().to_string(),
-        name: row["name"].as_str().unwrap_or_default().to_string(),
-        tags: json_column(row, "tags")?,
-      })
-    })
-    .collect()
-}
-
 // Run a service's migrations that this space has not run yet. Every table must
 // keep a primary key: sessions record no changes to a table without one, so
 // undo would silently miss it.
-pub fn migrate(store: &Store, service: &str, migrations: &[String]) -> Result<()> {
+pub fn migrate(store: &Store, service: &str, migrations: &[impl AsRef<str>]) -> Result<()> {
   store.write(|store| {
     let done = store.get(Side::Writer, "SELECT count FROM carbon_migration WHERE service = ?", &[json!(service)])?["count"].as_u64().unwrap_or(0) as usize;
     if done > migrations.len() {
       return Err(conflict(format!("Service '{service}' has run {done} migrations here, more than the {} it declares", migrations.len())));
     }
     for migration in &migrations[done..] {
-      store.run_batch(migration)?;
+      store.run_batch(migration.as_ref())?;
     }
     require_primary_keys(store)?;
     store.run(
@@ -237,8 +173,9 @@ fn require_primary_keys(store: &Store) -> Result<()> {
 mod tests {
   use super::*;
 
-  fn origin_of(manage: &[&str]) -> Origin {
-    Origin { kind: "team".into(), name: "Sales".into(), services: vec!["chat".into()], manage: manage.iter().map(|entry| entry.to_string()).collect() }
+  fn origin_of(services: &[&str], manage: &[&str]) -> Origin {
+    let strings = |items: &[&str]| items.iter().map(|item| item.to_string()).collect();
+    Origin { kind: "team".into(), name: "Sales".into(), services: strings(services), manage: strings(manage) }
   }
 
   fn space(origin: &Origin) -> (tempfile::TempDir, Store) {
@@ -247,18 +184,45 @@ mod tests {
     (directory, store)
   }
 
+  fn tables(store: &Store) -> Vec<String> {
+    let rows = store.all(Side::Reader, "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name", &[]).unwrap();
+    rows.iter().filter_map(|row| row["name"].as_str().map(str::to_string)).collect()
+  }
+
   #[test]
   fn writes_the_origin_once() {
-    let (_directory, store) = space(&origin_of(&["brandon"]));
-    assert_eq!(origin(&store, Side::Reader).unwrap(), origin_of(&["brandon"]));
-    let second = store.write(|store| write_origin(store, &origin_of(&["sally"])));
+    let (_directory, store) = space(&origin_of(&["chat"], &["alice"]));
+    assert_eq!(origin(&store, Side::Reader).unwrap(), origin_of(&["chat"], &["alice"]));
+    let second = store.write(|store| write_origin(store, &origin_of(&["chat"], &["sally"])));
     assert_eq!(second.unwrap_err().status, 409);
   }
 
   #[test]
+  fn holds_the_tables_of_space_and_of_the_builtins_its_origin_names() {
+    let cases = [
+      (vec!["chat"], vec!["carbon_migration", "carbon_origin", "carbon_ref"]),
+      (vec!["device"], vec!["carbon_device", "carbon_device_ref", "carbon_migration", "carbon_origin", "carbon_ref"]),
+      (vec!["identity", "device"], vec!["carbon_device", "carbon_device_ref", "carbon_identity", "carbon_migration", "carbon_origin", "carbon_ref"]),
+    ];
+    for (services, expected) in cases {
+      let (_directory, store) = space(&origin_of(&services, &["alice"]));
+      assert_eq!(tables(&store), expected, "{services:?}");
+    }
+  }
+
+  #[test]
+  fn reopens_a_space_without_rerunning_its_migrations() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("s.db");
+    create(&path, &origin_of(&["device"], &["alice"]), |_| Ok(())).unwrap();
+    let store = open(&path).unwrap();
+    assert_eq!(store.get(Side::Reader, "SELECT count FROM carbon_migration WHERE service = 'device'", &[]).unwrap(), json!({"count": 1}));
+  }
+
+  #[test]
   fn only_managers_may_manage() {
-    let (_directory, store) = space(&origin_of(&["brandon"]));
-    assert!(require_manage(&store, Some("brandon")).is_ok());
+    let (_directory, store) = space(&origin_of(&[], &["alice"]));
+    assert!(require_manage(&store, Some("alice")).is_ok());
     for actor in [Some("sally"), None] {
       assert_eq!(require_manage(&store, actor).unwrap_err().status, 403);
     }
@@ -267,14 +231,14 @@ mod tests {
   #[test]
   fn self_resolves_to_the_identity_of_an_identity_space() {
     let directory = tempfile::tempdir().unwrap();
-    let identity = Origin { kind: "identity".into(), name: "brandon".into(), services: vec![], manage: vec!["self".into()] };
-    let store = create(&directory.path().join("i.db"), &identity, |store| write_identity_origin(store, "id-brandon", "key-1")).unwrap();
-    assert_eq!(managers(&store, Side::Reader).unwrap(), vec!["id-brandon"]);
+    let origin = Origin { kind: "identity".into(), name: "alice".into(), services: vec!["identity".into()], manage: vec!["self".into()] };
+    let store = create(&directory.path().join("i.db"), &origin, |store| identity::write_origin(store, "id-alice", "key-1")).unwrap();
+    assert_eq!(managers(&store, Side::Reader).unwrap(), vec!["id-alice"]);
   }
 
   #[test]
   fn a_second_ref_to_the_same_space_replaces_the_first() {
-    let (_directory, store) = space(&origin_of(&["brandon"]));
+    let (_directory, store) = space(&origin_of(&[], &["alice"]));
     let first = Ref { space: "s1".into(), kind: "team".into(), name: "Sales".into(), slug: "sales".into(), cascade: vec![] };
     let renamed = Ref { name: "Sales West".into(), slug: "sales-west".into(), ..first.clone() };
     store.write(|store| add_ref(store, &first).and_then(|_| add_ref(store, &renamed))).unwrap();
@@ -285,7 +249,7 @@ mod tests {
 
   #[test]
   fn migrations_run_once_and_need_primary_keys() {
-    let (_directory, store) = space(&origin_of(&["brandon"]));
+    let (_directory, store) = space(&origin_of(&["chat"], &["alice"]));
     let first = vec!["CREATE TABLE message (id TEXT PRIMARY KEY, text TEXT)".to_string()];
     migrate(&store, "chat", &first).unwrap();
     migrate(&store, "chat", &first).unwrap();

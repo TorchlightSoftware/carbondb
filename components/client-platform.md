@@ -14,7 +14,7 @@ Critical path: yes. Depends on: none.
 - Freenet: no mobile node and no Dart SDK; Rust and TypeScript clients talk to a node over WebSocket.
 - Autonomi: Dart antd_client talks to a local antd daemon; Swift and Kotlin bindings via UniFFI; mobile SDKs in progress.
 - Ockam: FFI and Swift layers were removed; no Dart support.
-- Brandon intends networking and persistence in Rust, services in JS, Flutter calling in; proposal: Flutter calls the Rust core, which hosts the JS services (QuickJS via rquickjs or LLRT, since iOS forbids JIT), so one resolver serves UI, local and peer calls.
+- The project owner intends networking and persistence in Rust, services in JS, Flutter calling in; proposal: Flutter calls the Rust core, which hosts the JS services (QuickJS via rquickjs or LLRT, since iOS forbids JIT), so one resolver serves UI, local and peer calls.
 
 ## Agreed
 

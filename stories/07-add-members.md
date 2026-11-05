@@ -5,7 +5,7 @@ Status: agreed
 ## Calls
 
 ```js
-// Brandon has Sally's contact, exchanged by QR code
+// Alice has Sally's contact, exchanged by QR code
 const {code} = await rph.call('POST [@carbon]/members', {contact: sallyContact})
 
 // on Sally's device, once the code reaches her by any medium; the ref lands in her personal space
@@ -25,6 +25,6 @@ const rph = await sallyPersonal.call('POST [@carbon]/join', {code})
 
 ## Acceptance
 
-- After Sally joins and a device with manage adds her, her device holds the space and sees Brandon's earlier [chat] messages.
+- After Sally joins and a device with manage adds her, her device holds the space and sees Alice's earlier [chat] messages.
 - Before she joins, her device holds nothing from the space.
 - After she joins and before she is added, `GET [@carbon]/status` shows `access: []` or `undefined`, and she cannot read the space.

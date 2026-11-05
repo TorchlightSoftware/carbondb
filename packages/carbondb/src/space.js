@@ -1,11 +1,11 @@
 // One space on this device: its database in the core, the services its origin
-// names, and the watches on it. Calls reach either a builtin service in the
-// core or an app service's handler, which runs in a transaction the core holds.
+// names, and the watches on it. A call is routed by its service name, to a
+// service the core answers or to an app service's handler, and runs as a job
+// on the side of the space it needs, in the order the core's queue gives it.
 
 import {parseServiceKey} from '@tlsft/service-key'
 import {badRequest, notFound} from '@tlsft/service-error'
 import {core, coreAsync, hash} from './native.js'
-import {Queue} from './queue.js'
 import {route} from './routes.js'
 import {BUILTIN_SERVICES} from './services.js'
 
@@ -15,7 +15,7 @@ export function parseKey(key) {
   return parts
 }
 
-// Whether CarbonDB answers a call itself: `[@carbon]`, or a replicated builtin.
+// Whether the core answers a call itself: any local `[@name]`, or a replicated builtin.
 const isBuiltin = (parts) => parts.confined || BUILTIN_SERVICES.includes(parts.service)
 
 // An op's context: who made it, when, and the ids and randomness a handler
@@ -40,9 +40,10 @@ const queries = (native, side) => ({
   all: (sql, params) => native.all(side, sql, params)
 })
 
+// The side of the space a call runs on: GETs read a snapshot, everything else writes.
+const sideOf = (parts) => parts.method === 'GET' ? 'reader' : 'writer'
+
 export class Space {
-  #writes = new Queue()
-  #reads = new Queue()
   #watches = new Set()
   #flushing = false
   #opened = null
@@ -81,30 +82,47 @@ export class Space {
   async #request(actor, key, input = null) {
     const parts = parseKey(key)
     const {native} = this.#open()
-    if (isBuiltin(parts)) return this.#builtin(native, actor, parts, input)
-    const service = this.#service(parts)
-    const {call, path} = route(service.routes, parts.method, parts.resource)
-    if (parts.method === 'GET') {
-      const db = queries(native, 'reader')
-      return this.#reads.push(() => coreAsync(native.read(async () => call.handler({path, input, db}))))
-    }
-    const op = opContext(this.carbon, actor, key, path, input)
-    const db = {...queries(native, 'writer'), run: (sql, params) => native.run(sql, params)}
-    const outcome = await this.#writes.push(() => coreAsync(native.apply(async () => call.handler({path, input, op, db}))))
-    this.#changed(outcome.tables)
+    const side = sideOf(parts)
+    const job = isBuiltin(parts) ? this.#builtinJob(native, actor, parts, input) : this.#serviceJob(native, actor, key, parts, input)
+    const outcome = await this.#turn(native, side, job)
+    if (side === 'writer') this.#changed(outcome.tables)
     return outcome
   }
 
-  async #builtin(native, actor, parts, input) {
-    if (parts.confined && parts.service !== 'carbon') throw notFound(`No local service [@${parts.service}] on this device`)
+  // Run a job when its turn on this side of the space comes, and settle with
+  // what it returns. A job never throws into the core.
+  #turn(native, side, job) {
+    return new Promise((resolve, reject) => native.enqueue(side, () => {
+      try {
+        resolve(job())
+      } catch (thrown) {
+        reject(thrown)
+      }
+    }))
+  }
+
+  // A job for a call the core answers.
+  #builtinJob(native, actor, parts, input) {
     if (parts.service === 'carbon' && parts.method === 'POST' && parts.resource === '/space') this.carbon.services.requireRegistered(input?.services)
-    const queue = parts.method === 'GET' ? this.#reads : this.#writes
-    const outcome = await queue.push(() => core(() => this.carbon.native.callSpace(native, actor, parts, input)))
-    if (outcome.wrote) this.#changed(outcome.tables)
-    return outcome
+    return () => core(() => this.carbon.native.callSpace(native, actor, parts, input))
   }
 
-  #service(parts) {
+  // A job for a call to an app service, routed to its handler. A write takes
+  // its op's time when its turn comes, so it follows everything applied before it.
+  #serviceJob(native, actor, key, parts, input) {
+    const {call, path} = route(this.#registered(parts).routes, parts.method, parts.resource)
+    if (sideOf(parts) === 'reader') {
+      const db = queries(native, 'reader')
+      return () => coreAsync(native.read(async () => call.handler({path, input, db})))
+    }
+    const db = {...queries(native, 'writer'), run: (sql, params) => native.run(sql, params)}
+    return () => {
+      const op = opContext(this.carbon, actor, key, path, input)
+      return coreAsync(native.apply(async () => call.handler({path, input, op, db})))
+    }
+  }
+
+  #registered(parts) {
     const {services, origin} = this.#open()
     if (!origin.services.includes(parts.service)) throw notFound(`[${parts.service}] does not run in this space`)
     return services.get(parts.service)

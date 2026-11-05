@@ -6,9 +6,9 @@ Status: agreed
 
 ```js
 const carbon = await configure('./carbondb.toml')
-const {identity, personal, paperKey} = await carbon.createIdentity({slug: 'brandon', device: 'laptop', services: ['contacts']})
+const {identity, personal, paperKey} = await carbon.createIdentity({slug: 'alice', device: 'laptop', services: ['contacts']})
 // later runs
-const identity = await carbon.resumeIdentity('brandon')
+const identity = await carbon.resumeIdentity('alice')
 ```
 
 ## Rules
@@ -24,7 +24,7 @@ const identity = await carbon.resumeIdentity('brandon')
 
 ## Acceptance
 
-- After `createIdentity`, `resumeIdentity('brandon')` in a fresh process returns the same identity id and device.
+- After `createIdentity`, `resumeIdentity('alice')` in a fresh process returns the same identity id and device.
 - The id is the hash of the identity's `POST [identity]/origin` op, signed by the first device; the device's private key never appears in any op or message.
 - A second identity on the same machine has different device keys from the first.
 - The export of a new identity holds its origin and its device's public key, and not the device's name or tags.

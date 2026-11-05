@@ -4,7 +4,6 @@
 
 import {notFound} from '@tlsft/service-error'
 import {core} from './native.js'
-import {Queue} from './queue.js'
 import {parseKey} from './space.js'
 
 // `kind:slug`, as in `team:sales`.
@@ -64,7 +63,6 @@ export class SpaceHandle {
 // The system handle, `carbon`: this device's root, where identities live.
 export class SystemHandle {
   #carbon
-  #system = new Queue()
 
   constructor(carbon) {
     this.#carbon = carbon
@@ -82,9 +80,10 @@ export class SystemHandle {
     return new SpaceHandle(this.#carbon, identity.space, identity)
   }
 
-  call(key, input = null) {
+  // A call on the system handle. The core answers it at once, so it needs no queue.
+  async call(key, input = null) {
     const parts = parseKey(key)
-    return this.#system.push(() => core(() => this.#carbon.native.callSystem(parts, input))).then((outcome) => outcome.value)
+    return core(() => this.#carbon.native.callSystem(parts, input)).value
   }
 
   // An identity, its first device and its personal space, which runs the services named.

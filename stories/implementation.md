@@ -86,7 +86,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 ## Spaces and services
 
 - **system** is the root space, local and never replicated. It holds what must be readable before any identity opens. It is a plain local log, not a p2panda space, because a p2panda space needs a node and a node needs an identity. `carbon` is its handle.
-- **Names:** a space is named by its kind and a lowercase kebab-case slug, such as `identity:brandon`, `company:foo-corp` and `team:sales`. The root is `system`.
+- **Names:** a space is named by its kind and a lowercase kebab-case slug, such as `identity:alice`, `company:foo-corp` and `team:sales`. The root is `system`.
 - **Kind** is a free label for apps and interfaces. CarbonDB gives meaning only to `identity` and `personal`, the kinds it creates itself.
 - **Local services,** marked `[@name]`, run on this device in the context of the space they are called from. They are often built to facilitate system calls which need to be called once and only once.  They can call replicated services, and often do in order to set up replicated record keeping. Replicated services can never call local services, because this would cause them to duplicate their effects. This means that for now a replicated handler therefore cannot create a space - we may revisit this.
 - **`[@carbon]`** is the core's local service, implemented in Rust because it reaches keys and p2panda. Its API calls must happen once, on one device.
@@ -218,8 +218,8 @@ A test harness runs the same ops on two fresh databases in different delivery or
 
 | Space | Holds | Who reads it |
 |---|---|---|
-| `identity:brandon` | The identity's origin, device public keys, later public proofs, and one ref, to its personal space | The identity's devices; publishable |
-| `personal:brandon` | Refs to the spaces the identity creates or joins, device names and tags, and personal data | The identity, plus anyone it adds |
+| `identity:alice` | The identity's origin, device public keys, later public proofs, and one ref, to its personal space | The identity's devices; publishable |
+| `personal:alice` | Refs to the spaces the identity creates or joins, device names and tags, and personal data | The identity, plus anyone it adds |
 
 - **Put nothing in the identity space that you would not publish.** Privacy comes from nesting under the personal space, so companies and teams hang from personal, not from identity.
 - **Device public keys stay in the identity space** because public proofs need them. A proof such as "I own this GitHub account" is signed by a device, and an outsider verifies it by tracing that device back to the identity's origin through `[device]/origin` entries. That reveals how many devices the identity has. Their names and tags, the inventory, stay in personal as `[device]/ref` entries.
@@ -324,7 +324,7 @@ CarbonDB is a message bus that handles state management: handlers and triggers s
 Spaces and handles are one to one. `carbon` is the system handle, and every other space is reached through refs, which also sets the acting identity:
 
 ```js
-const sales = carbon.ref('identity:brandon').ref('personal:brandon').ref('company:foo-corp').ref('team:sales')
+const sales = carbon.ref('identity:alice').ref('personal:alice').ref('company:foo-corp').ref('team:sales')
 await sales.call('POST [chat]/messages', {text: 'lunch?'})
 ```
 

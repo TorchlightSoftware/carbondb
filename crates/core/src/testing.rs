@@ -4,7 +4,8 @@
 use serde_json::json;
 
 use crate::call::{Actor, Call};
-use crate::carbon::{Carbon, Identity};
+use crate::carbon::{Carbon, Context};
+use crate::identity::Identity;
 
 // A call from its service key: `POST [@carbon]/space` is confined, `POST [space]/ref` is not.
 pub fn call(key: &str) -> Call {
@@ -23,8 +24,8 @@ pub fn carbon() -> (tempfile::TempDir, Carbon) {
   (directory, carbon)
 }
 
-pub fn brandon(carbon: &Carbon) -> Identity {
-  let created = carbon.call_system(&call("POST [@carbon]/identity"), json!({"slug": "brandon", "device": "Pixel9", "services": ["chat"]})).unwrap();
+pub fn alice(carbon: &Carbon) -> Identity {
+  let created = carbon.call(Context::System, &Actor::default(), &call("POST [@carbon]/identity"), json!({"slug": "alice", "device": "Pixel9", "services": ["chat"]})).unwrap();
   serde_json::from_value(created.value).unwrap()
 }
 

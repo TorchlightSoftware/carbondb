@@ -6,7 +6,7 @@ Status: agreed
 
 ```js
 const identities = await carbon.listIdentities()
-// [{slug: 'brandon', id, device: 'laptop', lastUsed}, ...]
+// [{slug: 'alice', id, device: 'laptop', lastUsed}, ...]
 const identity = await carbon.resumeIdentity(identities[0].slug)
 ```
 

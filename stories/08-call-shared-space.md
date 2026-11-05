@@ -21,6 +21,6 @@ The same `call` as in a personal space.
 
 ## Acceptance
 
-- Brandon posts while Sally is offline; when she syncs, `GET [chat]/messages` on her device returns the message with Brandon as author.
+- Alice posts while Sally is offline; when she syncs, `GET [chat]/messages` on her device returns the message with Alice as author.
 - Concurrent edits on two offline devices converge to the same state on both after sync.
 - An edit replayed after a concurrent delete is rejected identically on every device.

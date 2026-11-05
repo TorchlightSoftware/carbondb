@@ -2,31 +2,31 @@
 
 Each block is a space with its ops indented under it, in the order they run. `[@carbon]` is local: it runs on this device in the context of that space and never replicates. The ops listed after it in a block are the ones its handler writes, and every op on a replicated service reaches the space's other members.
 
-## Brandon creates an identity and a company
+## Alice creates an identity and a company
 
 The identity space holds only what may be published. Everything private, including the company's ref, hangs from the personal space.
 
 ```
 system
-  POST [@carbon]/identity {slug:'brandon', device:'Pixel9', services:['contacts']}   # generates the key pair
+  POST [@carbon]/identity {slug:'alice', device:'Pixel9', services:['contacts']}   # generates the key pair
 
-identity:brandon
+identity:alice
   POST [space]/origin {kind:'identity', services:['identity','device'], manage:[self]}
   POST [identity]/origin {device:'asdf942'}                     # its hash is the identity's id
   POST [device]/origin {pubkey:'asdf942'}
-  POST [space]/ref {space:personal:brandon, kind:'personal'}
+  POST [space]/ref {space:personal:alice, kind:'personal'}
 
-personal:brandon
-  POST [space]/origin {kind:'personal', services:['device','contacts'], manage:[identity:brandon]}
+personal:alice
+  POST [space]/origin {kind:'personal', services:['device','contacts'], manage:[identity:alice]}
   POST [device]/ref {pubkey:'asdf942', name:'Pixel9', tags:['manage']}
-  POST [@carbon]/space {kind:'company', name:'FooCorp', services:['identity','chat','books'], manage:[identity:brandon]}
+  POST [@carbon]/space {kind:'company', name:'FooCorp', services:['identity','chat','books'], manage:[identity:alice]}
   POST [space]/ref {space:company:foo-corp, kind:'company', name:'FooCorp'}
 
 company:foo-corp
-  POST [space]/origin {kind:'company', name:'FooCorp', services:['identity','chat','books'], manage:[identity:brandon]}
+  POST [space]/origin {kind:'company', name:'FooCorp', services:['identity','chat','books'], manage:[identity:alice]}
 ```
 
-## Brandon creates the teams
+## Alice creates the teams
 
 Each team is created from FooCorp, so it runs under FooCorp's rules. FooCorp accepts the team's ref first; if it refuses, the team is not attached to FooCorp.
 
@@ -53,7 +53,7 @@ team:service
   POST [space]/origin {kind:'team', name:'Service', services:['worklog'], manage:[company:foo-corp]}
 ```
 
-## Brandon adds members
+## Alice adds members
 
 Being added to a team does not add someone to the company, so each person has a `members` op in both. Tom is shown; Sally joins FooCorp and Marketing, and Hank and Forest join FooCorp and Service, the same way.
 

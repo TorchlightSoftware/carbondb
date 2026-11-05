@@ -3,7 +3,7 @@
 //
 //   const carbon = await configure('./carbondb.toml')
 //   carbon.services.add('chat', chat)
-//   const room = carbon.ref('identity:brandon').ref('personal:brandon').ref('space:lobby')
+//   const room = carbon.ref('identity:alice').ref('personal:alice').ref('space:lobby')
 //   await room.call('POST [chat]/messages', {text: 'hello'})
 
 import {resolve} from 'node:path'

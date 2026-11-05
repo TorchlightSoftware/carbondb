@@ -1,50 +1,38 @@
-//! `[@carbon]`, the core's local service, and the system database it keeps.
-//!
-//! The system database is this device's root: the identities on it, with their
-//! device keys. Every other space is a file beside it, named by space id.
-//! `Carbon` opens spaces and routes `[@carbon]` calls; what a new identity or
-//! space is made of lives in `create`.
+//! This device's CarbonDB: its config, the system database and its clock. It
+//! opens spaces, stamps ops, and routes every call it answers by service name:
+//! `[@carbon]` to the device's local service, and the replicated builtins to
+//! theirs. App services are routed by the runtime that hosts them.
 //!
 //! This is the single-node core: no p2panda, no network and no op log. Calls
 //! that need peers are refused.
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::builtins;
 use crate::call::{Actor, Call, Outcome};
 use crate::clock::Clock;
 use crate::config::{Config, SyncMode};
-use crate::create;
-use crate::error::{Result, bad_request, not_built, not_found, single_node};
+use crate::error::{Result, bad_request, not_built, not_found};
 use crate::hash::hash;
+use crate::identity::{self, Identity};
 use crate::space;
-use crate::store::{Side, Store};
-
-const SYSTEM_SCHEMA: &str = "
-  CREATE TABLE IF NOT EXISTS carbon_system_identity (
-    slug TEXT PRIMARY KEY, id TEXT NOT NULL UNIQUE, space TEXT NOT NULL, personal TEXT NOT NULL,
-    device TEXT NOT NULL, secret TEXT NOT NULL
-  );
-";
-
-// An identity on this device, as anyone on it may see it: everything but the secret key.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Identity {
-  pub slug: String,
-  pub id: String,
-  pub space: String,
-  pub personal: String,
-  pub device: String,
-}
+use crate::store::Store;
 
 // When an op happened, and its hash over the envelope and that time.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Stamp {
   pub time: u64,
   pub hash: String,
+}
+
+// Where a call is made: on the system handle, or in a space.
+#[derive(Clone, Copy)]
+pub enum Context<'a> {
+  System,
+  Space(&'a Store),
 }
 
 pub struct Carbon {
@@ -60,8 +48,7 @@ impl Carbon {
       return Err(not_built("Replicated mode"));
     }
     std::fs::create_dir_all(config.directory()).map_err(|error| bad_request(format!("Cannot create {}: {error}", config.directory().display())))?;
-    let system = Store::open(&config.system)?;
-    system.run_batch(SYSTEM_SCHEMA)?;
+    let system = identity::open_system(&config.system)?;
     Ok(Carbon { config, system, clock: Clock::default() })
   }
 
@@ -69,6 +56,10 @@ impl Carbon {
   pub fn stamp(&self, envelope: &Value) -> Stamp {
     let time = self.clock.now();
     Stamp { time, hash: hash(&json!({"envelope": envelope, "time": time})) }
+  }
+
+  pub(crate) fn system(&self) -> &Store {
+    &self.system
   }
 
   // Where a space's database sits: beside the system database, named by space id.
@@ -81,84 +72,28 @@ impl Carbon {
     if !path.exists() {
       return Err(not_found(format!("No space {id} on this device")));
     }
-    Store::open(&path)
+    space::open(&path)
   }
 
   pub fn identity(&self, slug: &str) -> Result<Identity> {
-    let row = self.system.get(Side::Reader, "SELECT slug, id, space, personal, device FROM carbon_system_identity WHERE slug = ?", &[json!(slug)])?;
-    if row.is_null() {
-      return Err(not_found(format!("No identity '{slug}' on this device")));
-    }
-    Ok(serde_json::from_value(row)?)
+    identity::find(&self.system, slug)
   }
 
-  // A call on the system handle.
-  pub fn call_system(&self, call: &Call, input: Value) -> Result<Outcome> {
-    match (call.confined, call.service.as_str(), call.method(), call.resource.as_str()) {
-      (true, "carbon", "POST", "/identity") => {
-        let (identity, secret) = create::identity(self, serde_json::from_value(input)?)?;
-        self.keep_identity(&identity, &secret)
-      }
-      (true, "carbon", "GET", "/identities") => Outcome::read(&self.system, |system| {
-        Ok(json!(system.all(Side::Reader, "SELECT slug, id, space, personal, device FROM carbon_system_identity ORDER BY slug", &[])?))
-      }),
-      (true, "carbon", "POST", "/devices") => Err(single_node("Adding a device")),
-      _ => Err(call.unknown()),
+  // A call this core answers, routed by its service name.
+  pub fn call(&self, context: Context, actor: &Actor, call: &Call, input: Value) -> Result<Outcome> {
+    match (call.confined, context) {
+      (true, _) if call.service == "carbon" => builtins::carbon::handle(self, context, actor, call, input),
+      (true, _) => Err(not_found(format!("No local service [@{}] on this device", call.service))),
+      (false, Context::Space(store)) => builtins::handle(store, actor, call, input),
+      (false, Context::System) => Err(not_found(format!("The system handle answers only [@carbon], not {}", call.key()))),
     }
   }
-
-  // A call on a space's handle, to `[@carbon]` or a replicated builtin.
-  pub fn call_space(&self, store: &Store, actor: &Actor, call: &Call, input: Value) -> Result<Outcome> {
-    if !call.confined {
-      return builtins::call(store, actor, call, input);
-    }
-    match (call.service.as_str(), call.method(), call.resource.as_str()) {
-      ("carbon", "GET", "/status") => Outcome::read(store, |store| status(store, actor)),
-      ("carbon", "POST", "/space") => create::nested_space(self, store, actor, call, input),
-      ("carbon", "GET", "/manage") => Outcome::read(store, |store| Ok(json!(space::managers(store, Side::Reader)?))),
-      ("carbon", _, "/members" | "/join" | "/sync/start" | "/sync/stop") => Err(single_node(&call.key())),
-      ("carbon", "POST", "/manage") => Err(not_built("Changing a manage list")),
-      ("carbon", "DELETE", "/data") => Err(not_built("Deleting a space's data")),
-      _ => Err(call.unknown()),
-    }
-  }
-
-  // Record a new identity, with its device's secret key, in the system database.
-  fn keep_identity(&self, identity: &Identity, secret: &str) -> Result<Outcome> {
-    Outcome::write(&self.system, |system| {
-      system.run(
-        Side::Writer,
-        "INSERT INTO carbon_system_identity (slug, id, space, personal, device, secret) VALUES (?, ?, ?, ?, ?, ?)",
-        &[json!(identity.slug), json!(identity.id), json!(identity.space), json!(identity.personal), json!(identity.device), json!(secret)],
-      )?;
-      Ok(json!(identity))
-    })
-  }
-}
-
-// What a space is, and its state on this device. Single-node: sync is off, there
-// are no peers, and every identity here has full access.
-fn status(store: &Store, actor: &Actor) -> Result<Value> {
-  let origin = space::origin(store, Side::Reader)?;
-  let managers = space::managers(store, Side::Reader)?;
-  let manages = actor.identity.as_ref().is_some_and(|identity| managers.contains(identity));
-  let id = store.path().file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
-  Ok(json!({
-    "space": id,
-    "kind": origin.kind,
-    "name": origin.name,
-    "services": origin.services,
-    "manage": origin.manage,
-    "access": if manages { vec!["manage"] } else { vec!["write"] },
-    "sync": "off",
-    "peers": [],
-  }))
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::testing::{actor, brandon, call, carbon};
+  use crate::testing::{actor, alice, call, carbon};
 
   #[test]
   fn refuses_replicated_mode_for_now() {
@@ -169,24 +104,19 @@ mod tests {
   }
 
   #[test]
-  fn keeps_the_secret_key_in_the_system_database_only() {
+  fn routes_by_service_name_and_refuses_services_it_does_not_run() {
     let (_directory, carbon) = carbon();
-    let identity = brandon(&carbon);
-    let row = carbon.system.get(Side::Reader, "SELECT device, secret FROM carbon_system_identity", &[]).unwrap();
-    assert_eq!(row["device"], json!(identity.device));
-    assert_eq!(row["secret"].as_str().map(str::len), Some(64));
-    assert!(carbon.call_system(&call("GET [@carbon]/identities"), Value::Null).unwrap().value[0].get("secret").is_none());
-  }
-
-  #[test]
-  fn refuses_calls_that_need_peers() {
-    let (_directory, carbon) = carbon();
-    let identity = brandon(&carbon);
+    let identity = alice(&carbon);
     let personal = carbon.open_space(&identity.personal).unwrap();
-    for key in ["POST [@carbon]/members", "POST [@carbon]/join", "POST [@carbon]/sync/start"] {
-      let error = carbon.call_space(&personal, &actor(&identity), &call(key), json!({})).unwrap_err();
-      assert_eq!((error.status, error.code.as_str()), (501, "SINGLE_NODE"), "{key}");
+    assert_eq!(carbon.call(Context::Space(&personal), &actor(&identity), &call("GET [device]/refs"), Value::Null).unwrap().value[0]["name"], json!("Pixel9"));
+    assert_eq!(carbon.call(Context::System, &Actor::default(), &call("GET [@carbon]/identities"), Value::Null).unwrap().value[0]["slug"], json!("alice"));
+    let refused = [
+      (Context::Space(&personal), "GET [@elsewhere]/x"),
+      (Context::System, "GET [space]/refs"),
+      (Context::System, "GET [@carbon]/status"),
+    ];
+    for (context, key) in refused {
+      assert_eq!(carbon.call(context, &actor(&identity), &call(key), Value::Null).unwrap_err().status, 404, "{key}");
     }
-    assert_eq!(carbon.call_system(&call("POST [@carbon]/devices"), json!({})).unwrap_err().code, "SINGLE_NODE");
   }
 }

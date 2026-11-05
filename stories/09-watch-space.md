@@ -19,5 +19,5 @@ personal.watch('GET [device]/refs', renderDevices)
 
 ## Acceptance
 
-- A watched `GET [chat]/messages` on Sally's device re-runs when Brandon's message syncs, and not when an unrelated table changes.
+- A watched `GET [chat]/messages` on Sally's device re-runs when Alice's message syncs, and not when an unrelated table changes.
 - Syncing many ops at once re-runs the watch once.
