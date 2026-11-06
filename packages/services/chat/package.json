@@ -5,6 +5,9 @@
   "description": "[chat]: post, edit, delete and list messages in a space",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "dependencies": {
     "@tlsft/carbondb": "^0.1.0",
     "@tlsft/service-error": "^0.1.0",

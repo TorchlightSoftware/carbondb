@@ -11,5 +11,5 @@ Already agreed (see [implementation](../implementation.md)): the paper key is an
 ## To decide
 
 - Whether to generate and return it now as an identity log entry, or wait until recovery is designed.
-- Whether it is a full-powered device, as in Keybase (see [device constellation](../../components/device-constellation.md)).
+- Whether it is a full-powered device, as in Keybase (see [device constellation](../../perspectives/brandon/components/device-constellation.md)).
 - Whether a paper key must authorize device changes, such as revoking a device (see [revoke a device](revoke-device.md) and the [security review](security-review.md)).

@@ -2,12 +2,11 @@
   "name": "carbondb-workspace",
   "version": "0.1.0",
   "private": true,
-  "description": "CarbonDB: the core, its JS runtime, the [chat] service and examples",
+  "description": "CarbonDB: the core, its JS runtime and the [chat] service",
   "type": "module",
   "workspaces": [
     "packages/*",
-    "services/*",
-    "examples/*"
+    "packages/services/*"
   ],
   "scripts": {
     "build": "npm run build --workspace @tlsft/carbondb",

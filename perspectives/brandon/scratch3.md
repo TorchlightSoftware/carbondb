@@ -1061,3 +1061,52 @@ Add to agenda.
 Add to agenda.
 
 Talk to me about the extra crate you created, and push the rest into the agenda.  Get rid of the implemented items from the agenda.  Put "createIdentity returns a paper key" in the backlog and get it out of the agenda.  Drop the 403 testing and get it out.
+
+---
+
+    I found one more variance and added it as a topic, "A local service op inside another op bypasses the OpWriter".
+
+Get rid of that topic, we know about that and it's not a problem.
+
+---
+
+    A local call to a service this device hasn't registered can't be stamped with a version, so the op can never apply
+
+Ok.  That makes sense to me.
+
+But I still think you'd be better off allowing it into the log and recording a failure, and then not replicating.  Otherwise, how do you report?  How do you audit?  How do you see a history of these failures?  If you're going to take it out of band of the normal application approach, then you're going to end up reimplementing all of that in a poorer, more janky way.
+
+What if you loosen up the schema and allow the call without the version to exist there?  Or maybe create an explicit placeholder version for this purpose?
+
+---
+
+    Placeholder: a reserved string such as "unregistered". That leaves the API unchanged, but it's a magic value that every reader has to know about
+
+"service missing"
+
+I don't think that every reader needs to know about it, because core is going to prevent it from replicating, and core can't delegate it to any local services, and core is going to mark its result as failed so it doesn't run again.
+
+---
+
+    2. Can the caller wait until the service is registered before it hears the refusal?
+    - If the space names the service, the space isn't ready, so this op waits behind the readiness gate like every other pending op.
+
+Yes, if we're still in the middle of initializing it's not "service missing".  You know the service is registered, and you should also know that it's in process initializing.  Do you have some kind of state machine to track the status of the service?  The RunState we just worked on seems appropriate for that.  You previously proposed these states:
+
+    Idle, Applying or Stopped
+
+Why don't we add Initializing?
+
+---
+
+    Proposal: a space's RunState becomes Initializing, carrying the named services not set up here yet, until every one of them is set up. Then it becomes Idle.
+
+Yes.
+
+---
+
+Can you move "services" under "packages"?
+
+Get rid of "examples".
+
+Move "components" and "platforms" under "perspectives/brandon".

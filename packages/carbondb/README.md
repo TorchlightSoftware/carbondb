@@ -40,7 +40,7 @@ mode = "none"               # single-node
 - **Handlers** receive `{path, input, db, call}`, and `op` when the call writes. A write runs in one transaction, committed when the handler resolves and rolled back when it throws. `call(key, input)` makes a call inside it: it sees the handler's writes so far, and when it fails only its own writes roll back and the error rejects the `call`. A GET reads committed state, never waits for a write, and cannot call one. `op` carries the author, device and time, with `id()` and `random()` derived from the op, so take ids, time and randomness from it, never from `Date.now()` or `Math.random()`. Validating input is the service's own business: throw `validationError`.
 - **Builtin calls:** `GET [@carbon]/status`, `GET [space]/refs`, `GET [device]/refs`, and the helpers `createIdentity`, `resumeIdentity`, `listIdentities`, `createSpace`, `listSpaces` and `status`. Calls that need peers, such as `POST [@carbon]/members`, reject with `501 SINGLE_NODE`.
 
-CarbonDB binds no protocol. To serve a space over HTTP, write an adapter that turns a request into `space.call(key, input)` and a service error into a response; `examples/chat-server` in this repository is one.
+CarbonDB binds no protocol. To serve a space over HTTP, write an adapter that turns a request into `space.call(key, input)` and a service error into a response.
 
 ## Building
 
