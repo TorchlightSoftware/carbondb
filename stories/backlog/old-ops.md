@@ -12,15 +12,29 @@ A rewind re-runs later ops with the handler code a replica has now. If that code
 
 CarbonDB's side of the contract stays simple:
 
-- CarbonDB hashes each handler, and the op records the hash of the handler that applied it.
-- If the handler for that hash no longer exists on a replica, CarbonDB refuses the rewind, or the offline op, for that version.
-- The handler call receives the hash, so a service can choose to refuse an op from another version, or migrate its input to the current version.
+- A device runs one version of each service at a time. It never keeps an old version around to apply old ops, or to re-run them in a rewind.
+- Every op records the version it was written under: the package's hash, and the version the package declares.
+- The handler receives that version and decides: it supports the op, migrating its input to the current shape when needed, or refuses it. The same holds for an offline op arriving late and for ops a rewind re-runs across an upgrade.
+- A package declares its version in its `service.toml`, semver canonically. CarbonDB records it but does not trust it: a breaking change labelled as a patch shows up as ops the handler refuses, not through its label.
+- Service code and schema only move forward. CarbonDB never reverts a schema to replay old ops under old code, since any gap in a service's migrations would turn into data loss.
 
 Services may grow richer on their side, for example a package that ships several versions sharing a tree of call and model implementations. CarbonDB does not need to know.
 
+For example, peers A, B and C run version 0.2.0 of a service, and C goes offline with ops it has not yet published. A upgrades to 0.2.1, whose schema renames a column, and writes an op; B upgrades and applies it. C comes back, upgrades, and applies A's op without trouble. A and B now receive C's ops, written under 0.2.0. Version 0.2.1 decides for each one whether to migrate its input to the new column or refuse it.
+
+### Established practice
+
+Handling old writes after a schema change is a solved problem in neighbouring fields, and services can follow the same patterns:
+
+- **Upcasting.** Event-sourced systems keep old events exactly as they were and translate them into the current shape when they are read (Greg Young, *Versioning in an Event Sourced System*). A handler migrating an old op's input is the same move.
+- **Lenses.** Ink & Switch's Cambria project translates data between schema versions with small two-way lenses, so local-first peers on different versions keep working together.
+- **Expand, then contract** (also called parallel change). A breaking change is split in two: first add the new shape and keep the old one working, so writers on the previous version still succeed; remove the old shape only once no writer uses it. In a space, that is once no member still runs the old version.
+
+One caution is particular to CarbonDB: an op is a call re-run through current code, not a recorded fact, so a migrated input has to lead to the same writes on every replica (see below).
+
 ### Cutoffs
 
-- App releases form a natural cutoff for old offline ops: ops from a version the app no longer ships are refused.
+- App releases form a natural cutoff for old offline ops: a version may refuse ops from versions it no longer supports.
 - A time window is supported as well: a device offline beyond it starts over rather than merging. The window also bounds how far back a rewind can reach.
 - The window cannot be measured by each receiver's clock, because clocks differ between replicas and they would disagree about which ops to refuse.
 

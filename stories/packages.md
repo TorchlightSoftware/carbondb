@@ -1,6 +1,6 @@
 # Services ship as hashed packages that declare their bindings
 
-Status: agreed — the builtins are packages with their own service.toml and migrations, linked natively; the WASM host and package hashes are not built
+Status: agreed — the builtins are packages with their own service.toml, migrations and package hash, linked natively; every service table is namespaced by service and binding; the WASM host is not built
 
 ## Why
 
@@ -22,8 +22,9 @@ The fix is one package form for every replicated service, builtins included: a s
 CarbonDB's own manifest, baked into the package and covered by its hash: a service asking for different bindings is a different version. It holds:
 
 - the service's name;
+- `version`: the version the package declares, semver canonically. It is advisory: CarbonDB records it beside the hash and never trusts it, since only the hash says which code ran;
 - `vars`: constants the handlers read;
-- `sql` bindings: a binding name and its migrations. The count of a binding's migrations is its schema version.
+- `sql` bindings: a binding name and its migrations, which the service's own `init` applies and tracks.
 
 The runtime refuses a `service.toml` with any field it does not know. There are no environments: each space and service is isolated already, so one config serves every device.
 
@@ -33,12 +34,13 @@ A generator writes `service.toml` from a `wrangler.toml` for services ported fro
 
 - A handler sees only bindings to storage that already exists, as a Worker sees `env.DB`. It never creates storage, generates keys or touches the system database.
 - A space keeps every service's tables in its one database file, namespaced per service, so an op touching several services commits atomically: SQLite commits across attached files atomically per file only in WAL mode. For now a service declares at most one `sql` binding.
-- A device sets up a space's bindings when it applies the op that creates the space or changes its services: it creates each binding's file and runs its migrations. This is internal to the core; nothing calls it directly. Every replica does it locally on receiving the op.
+- A device sets up a space's services when it applies the op that creates the space or changes its services, and again on every open: it calls each service's `init` in a transaction of its own, outside any op, then checks its tables' keys. This is internal to the core; nothing calls it directly. Every replica does it locally on receiving the op.
+- Each statement a service runs is rewritten by the core into its namespace, `service/binding/name`, and SQLite's authorizer refuses anything outside it.
 - A WASM module reaches its bindings through host functions linked into its instance: `run`, `get` and `all` on a named `sql` binding, plus `call` for calls on other services, such as `[space]`. The host resolves a binding name to that service's own file, so a module can never name another service's storage. npm packages receive the same shape as JS objects.
 
 ## The op
 
-Every op carries the hash of the package that handled its call, and one migration count per `sql` binding. This replaces the single schema version.
+Every op carries the hash of the package that handled its call. This replaces the schema version, the count of migrations.
 
 ## Builtins
 
@@ -60,7 +62,7 @@ carbon.services.add_wasm('chat', './chat.wasm')
 
 ## Build order
 
-1. `service.toml`, table namespacing per service, and the package hash and migration counts in the op, with npm packages. The [chat] service becomes an npm package with a `service.toml`. The builtins already carry a `service.toml`, read by their build scripts.
+1. `service.toml`, table namespacing per service, and the package hash in the op, with npm packages. Built: namespacing, `init`, and the package hash, which a Rust package's build script computes over its service.toml, migrations and source, and the JS runtime over an npm service's handlers, `init` and migrations. Open: [chat] as an npm package with a `service.toml`, and [an npm package's version from its lockfile integrity](backlog/npm-package-integrity.md).
 2. The WASM host: wasmtime, the host functions, and `add_wasm`.
 3. `[space]`, `[identity]` and `[device]` as committed WASM packages embedded in the library.
 4. The `wrangler.toml` generator and the integrity lookup utility.
@@ -70,8 +72,7 @@ carbon.services.add_wasm('chat', './chat.wasm')
 - Unit tests in the core:
   - `service.toml` parsing, including refusing unknown fields;
   - two services' tables are namespaced apart in one file;
-  - migrations are counted per binding;
-  - the op envelope carries the package hash and the counts;
+  - the op envelope carries the package hash;
   - a builtin's committed `.wasm` matches its source.
 - Runtime tests:
   - `add_npm` refuses a missing hash;

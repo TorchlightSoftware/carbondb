@@ -9,7 +9,8 @@ use std::rc::Rc;
 use serde_json::Value;
 
 use crate::error::Result;
-use crate::frame::Frame;
+use crate::service_call::ServiceCall;
+use crate::space::Space;
 use crate::{Actor, Call};
 
 // Where a step's call runs: the space `[@carbon]` was called in, or another by id.
@@ -25,44 +26,55 @@ pub enum Step {
   Create(String),
   // A call, as an op of its own in its space.
   Call { target: Target, actor: Actor, key: &'static str, input: Value },
-  // Provision the services a space's origin named, once that origin applies.
-  Provision(String, Vec<String>),
+  // Set up the services a space's origin named, once that origin applies.
+  SetUp(String, Vec<String>),
 }
 
 // What the steps' calls returned, in order, or the first error.
 pub type Done = Box<dyn FnOnce(Result<Vec<Value>>)>;
 
-pub fn run(frame: Rc<Frame>, steps: VecDeque<Step>, done: Done) {
-  next(frame, steps, vec![], done)
+pub fn run(call: Rc<ServiceCall>, steps: VecDeque<Step>, done: Done) {
+  next(call, steps, vec![], done)
 }
 
-fn next(frame: Rc<Frame>, mut steps: VecDeque<Step>, mut returned: Vec<Value>, done: Done) {
+fn next(call: Rc<ServiceCall>, mut steps: VecDeque<Step>, mut returned: Vec<Value>, done: Done) {
   let Some(step) = steps.pop_front() else { return done(Ok(returned)) };
-  let carbon = Rc::clone(frame.carbon());
-  let host = match step {
-    Step::Create(id) => carbon.create_space(&id).map(|_| ()),
-    Step::Provision(id, services) => carbon.space(&id).and_then(|space| carbon.provision(&space, &services)),
-    Step::Call { target, actor, key, input } => {
-      let space = match target {
-        Target::Here => Ok(Rc::clone(frame.space())),
-        Target::Space(id) => carbon.space(&id),
-      };
-      let (space, call) = match space.and_then(|space| Ok((space, Call::from_key(key)?))) {
-        Ok(found) => found,
-        Err(error) => return done(Err(error)),
-      };
-      let then = Rc::clone(&frame);
-      return frame.call_in(&space, actor, call, input, Box::new(move |result| match result {
-        Ok(value) => {
-          returned.push(value);
-          next(then, steps, returned, done)
-        }
+  let carbon = Rc::clone(call.carbon());
+  match step {
+    Step::Create(id) => match carbon.create_space(&id) {
+      Ok(_) => next(call, steps, returned, done),
+      Err(error) => done(Err(error)),
+    },
+    Step::SetUp(id, services) => {
+      let then = Rc::clone(&call);
+      carbon.clone().with_space(&id, Box::new(move |space| match space.and_then(|space| carbon.set_up(&space, &services)) {
+        Ok(()) => next(then, steps, returned, done),
         Err(error) => done(Err(error)),
-      }));
+      }))
     }
-  };
-  match host {
-    Ok(()) => next(frame, steps, returned, done),
-    Err(error) => done(Err(error)),
+    Step::Call { target, actor, key, input } => {
+      let made = Rc::clone(&call);
+      in_space(&call, target, Box::new(move |space| {
+        let (space, key) = match space.and_then(|space| Ok((space, Call::from_key(key)?))) {
+          Ok(found) => found,
+          Err(error) => return done(Err(error)),
+        };
+        let then = Rc::clone(&made);
+        made.call_in(&space, actor, key, input, Box::new(move |result| match result {
+          Ok(value) => {
+            returned.push(value);
+            next(then, steps, returned, done)
+          }
+          Err(error) => done(Err(error)),
+        }))
+      }))
+    }
+  }
+}
+
+fn in_space(call: &Rc<ServiceCall>, target: Target, then: Box<dyn FnOnce(Result<Rc<Space>>)>) {
+  match target {
+    Target::Here => then(Ok(Rc::clone(call.space()))),
+    Target::Space(id) => Rc::clone(call.carbon()).with_space(&id, then),
   }
 }

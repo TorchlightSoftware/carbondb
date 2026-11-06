@@ -1,86 +1,138 @@
-//! One SQLite file, the store behind a space or the system database.
+//! One SQLite file, the store behind a space or the system database: its
+//! connections, its transactions, the changeset each op's transaction records,
+//! and the first system failure met on it.
 //!
 //! A store keeps one writer connection, on which one op's transaction runs at a
-//! time; while it is open, the authorizer records every table it writes, the
-//! write set a commit notice carries. A call made inside an op runs under a
-//! savepoint, so its writes roll back alone when it fails.
+//! time. A session records the transaction's changes as a changeset: what a
+//! rewind will undo, and the write set a commit notice carries, since it holds
+//! only rows whose values changed. A call made inside an op runs under a
+//! savepoint, so its writes roll back alone when it fails, and leave nothing in
+//! the changeset. The op log and results are left out of it.
 //!
 //! Each top-level GET opens its own read-only `Reader`, which in WAL mode sees
 //! only committed state and records every table it reads, the read set `watch`
 //! re-runs on. Reads therefore never wait for a write, nor for each other.
 //!
-//! Statements are prepared fresh each time, never from a cache, because the
-//! authorizer only runs when a statement is prepared.
+//! A service's statements run inside a call window (`call_window`); the core's
+//! own run outside one. Statements are prepared fresh each time, never from a
+//! cache, because the authorizer only runs when a statement is prepared.
+//!
+//! No statement waits for a lock: another process holding the file is a system
+//! failure, like an I/O error or corruption, and it is recorded here so the
+//! space stops whatever the statement's caller does with the error.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::time::Duration;
 
-use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::fallible_streaming_iterator::FallibleStreamingIterator;
+use rusqlite::session::{ChangesetIter, Session};
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
+use self_cell::self_cell;
 use serde_json::{Map, Value};
 
-pub use carbondb_service_api::Db;
+pub use carbondb_service_bindings::Db;
 
-use crate::error::{Result, sqlite};
+use crate::call_window::{CallWindow, Scoped, Shared, guard, start_reading, stop_reading};
+use crate::error::{Result, ServiceError, is_system_failure, sqlite};
 
-// The tables a transaction or read has touched. SQLite's authorizer must be Send.
-type TableSet = Arc<Mutex<BTreeSet<String>>>;
+// The core's own record of a space, which no rewind undoes.
+const UNRECORDED: [&str; 2] = ["carbon_oplog", "carbon_result"];
 
-// Which way a connection's touched tables are recorded: writes on the writer, reads on a reader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Touch {
-  Write,
-  Read,
-}
+// The first system failure met on a store's connections, shared with its readers.
+pub(crate) type Failure = Rc<RefCell<Option<ServiceError>>>;
+
+type Recording<'a> = RefCell<Option<Session<'a>>>;
+
+self_cell!(
+  // The writer connection, and the session recording the open write transaction.
+  struct Writer {
+    owner: Connection,
+    #[not_covariant]
+    dependent: Recording,
+  }
+);
 
 pub struct Store {
   path: PathBuf,
-  writer: Connection,
-  written: TableSet,
+  writer: Writer,
+  access: Shared,
+  failure: Failure,
 }
 
 impl Store {
   pub fn open(path: &Path) -> Result<Store> {
-    let writer = Connection::open(path).map_err(sqlite)?;
-    writer.pragma_update(None, "journal_mode", "wal").map_err(sqlite)?;
-    writer.pragma_update(None, "foreign_keys", "on").map_err(sqlite)?;
-    Ok(Store { path: path.to_path_buf(), writer, written: TableSet::default() })
+    let connection = Connection::open(path).map_err(sqlite)?;
+    connection.busy_timeout(Duration::ZERO).map_err(sqlite)?;
+    connection.pragma_update(None, "journal_mode", "wal").map_err(sqlite)?;
+    connection.pragma_update(None, "foreign_keys", "on").map_err(sqlite)?;
+    let access = guard(&connection)?;
+    Ok(Store { path: path.to_path_buf(), writer: Writer::new(connection, |_| RefCell::default()), access, failure: Failure::default() })
   }
 
   pub fn path(&self) -> &Path {
     &self.path
   }
 
-  // Open a write transaction and start recording the tables it writes.
-  pub fn begin_write(&self) -> Result<()> {
-    self.writer.execute_batch("BEGIN IMMEDIATE").map_err(sqlite)?;
-    record(&self.writer, Touch::Write, &self.written)
+  fn connection(&self) -> &Connection {
+    self.writer.borrow_owner()
   }
 
-  // End the write transaction, committing or rolling back, and return the tables it wrote.
-  pub fn end_write(&self, commit: bool) -> Result<Vec<String>> {
-    let ended = self.writer.execute_batch(if commit { "COMMIT" } else { "ROLLBACK" });
-    let tables = stop_recording(&self.writer, &self.written)?;
-    ended.map_err(sqlite)?;
-    Ok(tables)
+  // The system failure met on this store, if any: the space must stop.
+  pub fn failure(&self) -> Option<ServiceError> {
+    self.failure.borrow().clone()
+  }
+
+  // Forget the failure once it is fixed by hand, as the space resumes.
+  pub fn clear_failure(&self) {
+    self.failure.borrow_mut().take();
+  }
+
+  // Open a write transaction and start recording its changes.
+  pub fn begin_write(&self) -> Result<()> {
+    batch(self.connection(), &self.failure, "BEGIN IMMEDIATE")?;
+    self.writer.with_dependent(|connection, recording| {
+      let mut session = Session::new(connection).map_err(sqlite)?;
+      session.table_filter(Some(|table: &str| !UNRECORDED.contains(&table)));
+      session.attach(None::<&str>).map_err(sqlite)?;
+      *recording.borrow_mut() = Some(session);
+      Ok(())
+    })
+  }
+
+  // End the write transaction, committing or rolling back, and return the
+  // changeset it committed: empty when it rolled back.
+  pub fn end_write(&self, commit: bool) -> Result<Vec<u8>> {
+    let changeset = self.writer.with_dependent(|_, recording| {
+      let session = recording.borrow_mut().take();
+      match session {
+        Some(mut session) if commit => {
+          let mut bytes = vec![];
+          session.changeset_strm(&mut bytes).map_err(sqlite).map(|_| bytes)
+        }
+        _ => Ok(vec![]),
+      }
+    });
+    batch(self.connection(), &self.failure, if commit { "COMMIT" } else { "ROLLBACK" })?;
+    changeset
   }
 
   // A call inside the open transaction starts here; its writes keep or roll back on their own.
   // Savepoints share one name: the innermost is always the one released or rolled back to.
   pub fn savepoint(&self) -> Result<()> {
-    self.writer.execute_batch("SAVEPOINT carbon_call").map_err(sqlite)
+    batch(self.connection(), &self.failure, "SAVEPOINT carbon_call")
   }
 
   // End the innermost savepoint, keeping its writes or undoing them.
   pub fn end_savepoint(&self, keep: bool) -> Result<()> {
-    let sql = if keep { "RELEASE carbon_call" } else { "ROLLBACK TO carbon_call; RELEASE carbon_call" };
-    self.writer.execute_batch(sql).map_err(sqlite)
+    batch(self.connection(), &self.failure, if keep { "RELEASE carbon_call" } else { "ROLLBACK TO carbon_call; RELEASE carbon_call" })
   }
 
-  // Run a synchronous write in one transaction: commit on success, roll back on error.
-  pub fn write<T>(&self, work: impl FnOnce(&Store) -> Result<T>) -> Result<(T, Vec<String>)> {
+  // Run a synchronous write in one transaction: commit on success, roll back
+  // on error. Returns its value and changeset.
+  pub fn write<T>(&self, work: impl FnOnce(&Store) -> Result<T>) -> Result<(T, Vec<u8>)> {
     self.begin_write()?;
     match work(self) {
       Ok(value) => Ok((value, self.end_write(true)?)),
@@ -94,77 +146,102 @@ impl Store {
   // A read on its own connection, over a snapshot of committed state.
   pub fn reader(&self) -> Result<Reader> {
     let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(sqlite)?;
-    connection.execute_batch("BEGIN").map_err(sqlite)?;
-    let read = TableSet::default();
-    record(&connection, Touch::Read, &read)?;
-    Ok(Reader { connection, read })
+    connection.busy_timeout(Duration::ZERO).map_err(sqlite)?;
+    let access = guard(&connection)?;
+    batch(&connection, &self.failure, "BEGIN")?;
+    start_reading(&access);
+    Ok(Reader { connection, access, failure: Rc::clone(&self.failure) })
   }
 
-  // Several statements with no parameters, such as a migration.
+  // Several statements with no parameters, such as the core's own schema.
   pub fn run_batch(&self, sql: &str) -> Result<()> {
-    self.writer.execute_batch(sql).map_err(sqlite)
+    batch(self.connection(), &self.failure, sql)
+  }
+
+  // The writer inside a service's call window.
+  pub fn scoped(&self, window: CallWindow) -> Scoped<'_> {
+    Scoped { connection: self.connection(), access: &self.access, failure: &self.failure, window }
+  }
+
+  #[cfg(test)]
+  pub(crate) fn access(&self) -> &Shared {
+    &self.access
   }
 }
 
 impl Db for Store {
   fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
-    run(&self.writer, sql, params)
+    run(self.connection(), &self.failure, sql, params)
   }
 
   fn all(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
-    all(&self.writer, sql, params)
+    all(self.connection(), &self.failure, sql, params)
   }
 }
 
 // A GET's snapshot of committed state, recording the tables it reads.
 pub struct Reader {
   connection: Connection,
-  read: TableSet,
+  access: Shared,
+  failure: Failure,
 }
 
 impl Reader {
   // End the read and return the tables it read.
   pub fn end(&self) -> Result<Vec<String>> {
-    let ended = self.connection.execute_batch("COMMIT");
-    let tables = stop_recording(&self.connection, &self.read)?;
-    ended.map_err(sqlite)?;
-    Ok(tables)
+    let ended = batch(&self.connection, &self.failure, "COMMIT");
+    let tables = stop_reading(&self.access);
+    ended.map(|_| tables)
+  }
+
+  pub fn scoped(&self, window: CallWindow) -> Scoped<'_> {
+    Scoped { connection: &self.connection, access: &self.access, failure: &self.failure, window }
   }
 }
 
 impl Db for Reader {
   fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
-    run(&self.connection, sql, params)
+    run(&self.connection, &self.failure, sql, params)
   }
 
   fn all(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
-    all(&self.connection, sql, params)
+    all(&self.connection, &self.failure, sql, params)
   }
 }
 
-// Record the tables a connection writes, or reads, until recording stops.
-fn record(connection: &Connection, touch: Touch, tables: &TableSet) -> Result<()> {
-  tables.lock().expect("table set").clear();
-  let touched = Arc::clone(tables);
-  connection.authorizer(Some(move |context: AuthContext<'_>| {
-    if let Some(table) = touched_table(touch, &context.action) {
-      touched.lock().expect("table set").insert(table.to_string());
+// The tables a changeset changes, in name order.
+pub fn tables(changeset: &[u8]) -> Result<Vec<String>> {
+  let input: &mut dyn std::io::Read = &mut &changeset[..];
+  let mut items = ChangesetIter::start_strm(&input).map_err(sqlite)?;
+  let mut tables = std::collections::BTreeSet::new();
+  while let Some(item) = items.next().map_err(sqlite)? {
+    tables.insert(item.op().map_err(sqlite)?.table_name().to_string());
+  }
+  Ok(tables.into_iter().collect())
+}
+
+// A SQLite result as the core's, noting a system failure on the store.
+fn checked<T>(failure: &Failure, result: rusqlite::Result<T>) -> Result<T> {
+  result.map_err(|error| {
+    let system = is_system_failure(&error);
+    let error = sqlite(error);
+    if system {
+      failure.borrow_mut().get_or_insert_with(|| error.clone());
     }
-    Authorization::Allow
-  })).map_err(sqlite)
+    error
+  })
 }
 
-fn stop_recording(connection: &Connection, tables: &TableSet) -> Result<Vec<String>> {
-  connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>).map_err(sqlite)?;
-  Ok(std::mem::take(&mut *tables.lock().expect("table set")).into_iter().collect())
+pub(crate) fn batch(connection: &Connection, failure: &Failure, sql: &str) -> Result<()> {
+  checked(failure, connection.execute_batch(sql))
 }
 
-fn run(connection: &Connection, sql: &str, params: &[Value]) -> Result<u64> {
-  Ok(connection.execute(sql, params_from_iter(params.iter().map(to_sql))).map_err(sqlite)? as u64)
+pub(crate) fn run(connection: &Connection, failure: &Failure, sql: &str, params: &[Value]) -> Result<u64> {
+  checked(failure, connection.execute(sql, params_from_iter(params.iter().map(to_sql)))).map(|changed| changed as u64)
 }
 
-fn all(connection: &Connection, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
-  let mut statement = connection.prepare(sql).map_err(sqlite)?;
+pub(crate) fn all(connection: &Connection, failure: &Failure, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
+  let mut statement = checked(failure, connection.prepare(sql))?;
   let columns: Vec<String> = statement.column_names().iter().map(|name| name.to_string()).collect();
   let rows = statement.query_map(params_from_iter(params.iter().map(to_sql)), |row| {
     let mut object = Map::new();
@@ -172,19 +249,8 @@ fn all(connection: &Connection, sql: &str, params: &[Value]) -> Result<Vec<Value
       object.insert(column.clone(), from_sql(row.get(index)?));
     }
     Ok(Value::Object(object))
-  }).map_err(sqlite)?;
-  rows.collect::<rusqlite::Result<Vec<Value>>>().map_err(sqlite)
-}
-
-// The table an authorizer action writes, on the writer, or reads, on a reader.
-// SQLite's own tables are left out.
-fn touched_table<'a>(touch: Touch, action: &AuthAction<'a>) -> Option<&'a str> {
-  let table = match (touch, action) {
-    (Touch::Write, AuthAction::Insert { table_name } | AuthAction::Delete { table_name } | AuthAction::Update { table_name, .. }) => table_name,
-    (Touch::Read, AuthAction::Read { table_name, .. }) => table_name,
-    _ => return None,
-  };
-  (!table.starts_with("sqlite_")).then_some(table)
+  });
+  checked(failure, rows.and_then(|rows| rows.collect::<rusqlite::Result<Vec<Value>>>()))
 }
 
 // A JSON value as a SQLite value: strings and numbers bind directly, and only
@@ -209,6 +275,14 @@ fn from_sql(value: Sql) -> Value {
   }
 }
 
+// Hold a store's file from another connection, as another process would.
+#[cfg(test)]
+pub(crate) fn hold_lock(path: &Path) -> Connection {
+  let holder = Connection::open(path).unwrap();
+  holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+  holder
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -217,7 +291,9 @@ mod tests {
   fn store() -> (tempfile::TempDir, Store) {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(&directory.path().join("space.db")).unwrap();
-    store.run_batch("CREATE TABLE message (id TEXT PRIMARY KEY, text TEXT); CREATE TABLE member (id TEXT PRIMARY KEY)").unwrap();
+    store
+      .run_batch("CREATE TABLE message (id TEXT PRIMARY KEY, text TEXT) WITHOUT ROWID; CREATE TABLE member (id TEXT PRIMARY KEY) WITHOUT ROWID; CREATE TABLE carbon_result (hash TEXT PRIMARY KEY) WITHOUT ROWID")
+      .unwrap();
     (directory, store)
   }
 
@@ -226,15 +302,30 @@ mod tests {
   }
 
   #[test]
-  fn a_write_reports_the_tables_it_wrote() {
+  fn a_write_reports_the_tables_whose_rows_it_changed_leaving_out_the_cores_own() {
     let (_directory, store) = store();
-    let (_, tables) = store
+    store.run("INSERT INTO member (id) VALUES ('same')", &[]).unwrap();
+    let (_, changeset) = store
       .write(|store| {
         store.run("INSERT INTO message (id, text) VALUES (?, ?)", &[json!("m1"), json!("hi")])?;
+        store.run("UPDATE member SET id = 'same' WHERE id = 'same'", &[])?;
+        store.run("DELETE FROM member WHERE id = 'nobody'", &[])?;
+        store.run("INSERT INTO carbon_result (hash) VALUES ('h')", &[])?;
         store.all("SELECT * FROM member", &[])
       })
       .unwrap();
-    assert_eq!(tables, vec!["message"]);
+    assert_eq!(tables(&changeset).unwrap(), vec!["message"]);
+  }
+
+  #[test]
+  fn a_savepoint_rolled_back_leaves_nothing_in_the_changeset() {
+    let (_directory, store) = store();
+    store.begin_write().unwrap();
+    store.run("INSERT INTO message (id) VALUES ('kept')", &[]).unwrap();
+    store.savepoint().unwrap();
+    store.run("INSERT INTO member (id) VALUES ('undone')", &[]).unwrap();
+    store.end_savepoint(false).unwrap();
+    assert_eq!(tables(&store.end_write(true).unwrap()).unwrap(), vec!["message"]);
   }
 
   #[test]
@@ -258,6 +349,7 @@ mod tests {
     });
     assert_eq!(result.unwrap_err().status, 500);
     assert_eq!(texts(&store.reader().unwrap()), Vec::<Value>::new());
+    assert_eq!(store.failure(), None);
   }
 
   #[test]
@@ -292,5 +384,21 @@ mod tests {
     }
     let values: Vec<Value> = store.reader().unwrap().all("SELECT value FROM cell ORDER BY id", &[]).unwrap().into_iter().map(|row| row["value"].clone()).collect();
     assert_eq!(values, vec![json!("hello"), json!(42), json!(1.5), json!(null), json!("{\"nested\":[1]}")]);
+  }
+
+  // Another process holding the file fails at once, and the store keeps the
+  // failure whichever statement met it, a service's included.
+  #[test]
+  fn records_the_first_system_failure_met_on_any_statement() {
+    let (directory, store) = store();
+    let holder = hold_lock(&directory.path().join("space.db"));
+    let window = CallWindow { prefix: Some("chat/db/".into()), op: None };
+    let error = store.scoped(window).run("CREATE TABLE note (id TEXT PRIMARY KEY) WITHOUT ROWID", &[]).unwrap_err();
+    assert_eq!((error.status, error.code.as_str()), (503, "SYSTEM_FAILURE"));
+    assert_eq!(store.begin_write().unwrap_err().status, 503);
+    drop(holder);
+    assert_eq!(store.failure(), Some(error));
+    assert!(store.run("INSERT INTO message (id) VALUES ('m1')", &[]).is_ok());
+    assert!(store.failure().is_some_and(|failure| failure.status == 503));
   }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "carbondb-service-bindings"
+description = "ServiceBindings: the toolkit a Rust CarbonDB service builds with, its API footprint at runtime and its packaging at build time"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[features]
+# Packaging, for a service's build script: list the crate under
+# [build-dependencies] with this feature, so toml stays out of its runtime.
+build = ["dep:toml"]
+
+[dependencies]
+blake3 = "1.8.7"
+serde.workspace = true
+serde_json.workspace = true
+toml = { version = "1.1.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -4,14 +4,18 @@
 
 use std::rc::Rc;
 
-use carbondb_service_api::error::{Result, bad_request, forbidden, single_node};
-use carbondb_service_api::{Db, Invocation, Package, answer, ask};
+use carbondb_service_bindings::error::{Result, bad_request, forbidden, single_node, unknown};
+use carbondb_service_bindings::{Db, HandlerContext, Package, migrations};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 include!(concat!(env!("OUT_DIR"), "/package.rs"));
 
-pub const PACKAGE: Package = Package { name: NAME, migrations: MIGRATIONS, entry };
+pub const PACKAGE: Package = Package { name: NAME, version: VERSION, binding: BINDING, init, entry };
+
+fn init(db: &dyn Db) -> Result<()> {
+  migrations::apply(db, MIGRATIONS)
+}
 
 // A device's private description, kept in the personal space.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,41 +33,58 @@ struct OriginInput {
   pubkey: String,
 }
 
-fn entry(invocation: Rc<dyn Invocation>) {
-  answer(invocation, handle)
+type Context = Rc<dyn HandlerContext>;
+
+fn entry(context: Context) {
+  match (context.method(), context.resource()) {
+    ("POST", "/origin") => {
+      let caller = Rc::clone(&context);
+      require_manage(&context, Box::new(move |allowed| match allowed {
+        Ok(()) => in_identity_space(caller),
+        Err(error) => settle(&caller, Err(error)),
+      }))
+    }
+    ("GET", "/devices") => settle(&context, devices(context.as_ref()).map(|devices| json!(devices))),
+    ("POST", "/ref") => {
+      let caller = Rc::clone(&context);
+      require_manage(&context, Box::new(move |allowed| {
+        let put = allowed.and_then(|_| Ok(serde_json::from_value(caller.input().clone())?)).and_then(|device| put_device_ref(caller.as_ref(), device));
+        settle(&caller, put)
+      }))
+    }
+    ("GET", "/refs") => settle(&context, device_refs(context.as_ref()).map(|refs| json!(refs))),
+    (method, resource) => settle(&context, Err(unknown(method, resource))),
+  }
 }
 
-fn handle(invocation: &Rc<dyn Invocation>) -> Result<Value> {
-  let input = || invocation.input().clone();
-  match (invocation.call().method(), invocation.call().resource.as_str()) {
-    ("POST", "/origin") => {
-      require_manage(invocation)?;
-      if ask(invocation, "GET [space]/origin", Value::Null)?["kind"] != json!("identity") {
+fn settle(context: &Context, result: Result<Value>) {
+  let _ = context.settle(result);
+}
+
+// Authorize a device key, which only an identity space does.
+fn in_identity_space(context: Context) {
+  let caller = Rc::clone(&context);
+  context.call("GET [space]/origin", Value::Null, Box::new(move |origin| {
+    let added = origin.and_then(|origin| {
+      if origin["kind"] != json!("identity") {
         return Err(bad_request("A device's origin is written in its identity space"));
       }
-      let OriginInput { pubkey } = serde_json::from_value(input())?;
-      add_device(invocation.as_ref(), &pubkey)
-    }
-    ("GET", "/devices") => Ok(json!(devices(invocation.as_ref())?)),
-    ("POST", "/ref") => {
-      require_manage(invocation)?;
-      let device: DeviceRef = serde_json::from_value(input())?;
-      put_device_ref(invocation.as_ref(), &device)?;
-      Ok(json!(device))
-    }
-    ("GET", "/refs") => Ok(json!(device_refs(invocation.as_ref())?)),
-    _ => Err(invocation.call().unknown()),
-  }
+      let OriginInput { pubkey } = serde_json::from_value(caller.input().clone())?;
+      add_device(caller.as_ref(), &pubkey)
+    });
+    settle(&caller, added)
+  }))
 }
 
-fn require_manage(invocation: &Rc<dyn Invocation>) -> Result<()> {
-  let managers = ask(invocation, "GET [space]/manage", Value::Null)?;
-  let actor = invocation.actor().identity.clone().ok_or_else(|| forbidden("Managing a space needs an acting identity"))?;
-  if managers.as_array().is_some_and(|managers| managers.contains(&json!(actor))) {
-    Ok(())
-  } else {
-    Err(forbidden("Only a manager of this space may change its devices"))
-  }
+fn require_manage(context: &Context, answer: Box<dyn FnOnce(Result<()>)>) {
+  let Some(actor) = context.actor().identity.clone() else {
+    return answer(Err(forbidden("Managing a space needs an acting identity")));
+  };
+  Rc::clone(context).call("GET [space]/manage", Value::Null, Box::new(move |managers| {
+    answer(managers.and_then(|managers| {
+      if managers.as_array().is_some_and(|managers| managers.contains(&json!(actor))) { Ok(()) } else { Err(forbidden("Only a manager of this space may change its devices")) }
+    }))
+  }))
 }
 
 // Authorize the first device's key. A second device is authorized by an
@@ -72,27 +93,27 @@ fn add_device(db: &dyn Db, pubkey: &str) -> Result<Value> {
   if !devices(db)?.is_empty() {
     return Err(single_node("Adding a device"));
   }
-  db.run("INSERT INTO carbon_device (pubkey) VALUES (?)", &[json!(pubkey)])?;
+  db.run("INSERT INTO device (pubkey) VALUES (?)", &[json!(pubkey)])?;
   Ok(json!({"pubkey": pubkey}))
 }
 
 fn devices(db: &dyn Db) -> Result<Vec<String>> {
-  let rows = db.all("SELECT pubkey FROM carbon_device ORDER BY pubkey", &[])?;
+  let rows = db.all("SELECT pubkey FROM device ORDER BY pubkey", &[])?;
   Ok(rows.iter().filter_map(|row| row["pubkey"].as_str().map(str::to_string)).collect())
 }
 
 // A second ref for the same device replaces the first.
-fn put_device_ref(db: &dyn Db, device: &DeviceRef) -> Result<()> {
+fn put_device_ref(db: &dyn Db, device: DeviceRef) -> Result<Value> {
   db.run(
-    "INSERT INTO carbon_device_ref (pubkey, name, tags) VALUES (?, ?, ?)
+    "INSERT INTO device_ref (pubkey, name, tags) VALUES (?, ?, ?)
        ON CONFLICT (pubkey) DO UPDATE SET name = excluded.name, tags = excluded.tags",
     &[json!(device.pubkey), json!(device.name), json!(device.tags)],
   )?;
-  Ok(())
+  Ok(json!(device))
 }
 
 fn device_refs(db: &dyn Db) -> Result<Vec<DeviceRef>> {
-  db.all("SELECT pubkey, name, tags FROM carbon_device_ref ORDER BY name", &[])?
+  db.all("SELECT pubkey, name, tags FROM device_ref ORDER BY name", &[])?
     .iter()
     .map(|row| {
       Ok(DeviceRef {

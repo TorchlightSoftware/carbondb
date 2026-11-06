@@ -553,4 +553,511 @@ I think you should implement the namespacing now.  And also why don't you just i
 
 ---
 
+    - Rename it for what it is: the Rust bindings to the host functions.
 
+"ServiceBindings"?  What you said about host functions is weird to me.  Services shouldn't be calling host functions.  They should be getting invoked by the CarbonDB runtime...
+
+    An npm service imports nothing from CarbonDB;
+
+Yes, that's ideal.  "service" is the lego block that receives Service Calls and performs SQLite transactions.  It doesn't know about its runtime.  That's what makes it flexible to run on different runtimes, like Cloudflare workers, Node.js, and CarbonDB.
+
+    neither should a WASM one, beyond the host functions
+
+I recommend that you make this a simple layer that establishes the API footprint that services must expose in Rust.  No less and no more.
+
+    For npm, the equivalent is the object every handler receives, {path, input, db, call, op}
+
+Yes.  Some sense of a call() function and its signature.
+
+    Proposal: use the terms we already have.
+    - The core's struct is a service call in progress: ServiceCall.
+    - What a service sees is the handler context, the term stories/implementation.md:310 already uses.
+
+Yes. Can you please store a memory to use existing domain terminology instead of inventing new terms?
+
+    [@carbon] needs the id before writing the identity space's ops
+
+Why are you not just returning it from the `POST [identity]/origin` call?  It feels like you're reaching for a lot of hokey solutions to avoid doing the obvious.
+
+    ask() makes a call from inside a handler and fails if the answer doesn't come back immediately
+    for a WASM handler to wait on an async npm service, wasmtime has to pause it and resume it when the answer arrives
+
+You cannot simply violate the intentions of the design and force everything to be synchronous simply because you found it convenient to do so.
+
+Again, it feels like you just implemented something new and weird without talking to me about what you're doing.  Why do we have a synchronous only variation of a call?  Why does it have weird semantics attached to it?  I think you're overcomplicating this, and generating confusion in the way that people will interact with the API.  Should I .call() or .ask()?  I don't understand what problem you were trying to solve.
+
+    Proposal: make the Rust builtins callback-style too, and drop ask().
+
+Yes.
+
+You still have migrations under core.  I asked you to put them inside the services they belong with, and you didn't do that.  You also don't have any naming convention, any order of operations, any system for how they should be run.  That needs attention.
+
+Let's focus on one thing at a time.
+
+---
+
+    The runtime invokes services, handing each call a handler context: `db` and `call`
+
+Ah, that's what you mean.  That makes sense.  Yes, the bindings that were requested need to make their way through somehow.
+
+I'm fine with your proposals.  I think this should be called ServiceBindings.
+
+---
+
+    - A. The host rewrites each statement (recommended)
+
+I like it, and I know how we would implement it in Otto with the QueryRunner.  You're saying we can implement it in rust with sqlparse-rs.  I'm ok with that.  Seems like it should be part of the general ServiceBindings layer.
+
+---
+
+Regarding migrations: I agree with your proposals in general.  But I wonder: should we be implementing this in core?  Or should the service simply expose an init() function that gets called at a prescribed time in the lifecycle?  It feels like migrations are something that might be better left up to the service.  And most frameworks implement migrations in such a way that they utilize the SQL state itself to track them.  We don't really need to duplicate functionality that is already in various frameworks...  And we're probably not doing ourselves a favor by forcing implementors to fit into a shape on this.  What do you think?  Can we leave this state management up to an internal implementation detail of the service?
+
+---
+
+    The core counts migrations today only to version ops, and the package hash does that better
+
+Yes.  100%
+
+    Every table has a primary key
+
+Why do we care about that?
+
+    Each service stays in its own tables. The rewrite we just agreed covers init()'s statements too
+
+Yes.
+
+    Cloudflare D1 migrations are applied by the wrangler CLI, not by the Worker at runtime. A ported Worker has migration files but no code that runs them.
+
+Yes.  As part of the port we need to make init() functional.
+
+3. Does CarbonDB offer an opt-in helper that applies a directory of D1-style migrations from init()?  The helper would live in the npm runtime and in ServiceBindings, as a convenience services may use, not as part of the footprint.
+
+Sure.
+
+    Every replica reaches the same schema. The op carries the package hash. A replica without that version holds the space until it has it, then runs init() on open
+
+Yeah... we can just fail for the current implementation.  But we could get smarter about "download on demand".  I think there's a bit of a snag in terms of breaking schema changes... anything that's not backwards compatible.  E.g. if you rename a column, you can't simply run the old service code on the current schema.  And you can't be reverting the schema changes, applying old ops, reapplying the schema changes, hoping the implementor provided a data migration...  That's going to amplify any migration gaps and turn them into major data loss.
+
+So I think we only go forward with service software updates and with sql migrations... But let's say we have this scenario:
+
+- Peers A, B, and C
+- all version 0.2.0
+- C is offline, with pending changes
+- A is upgraded to 0.2.1, and sends an op
+- B syncs the WASM service implementation, runs init(), and applies the op
+- C comes back online.  Receives and applies the new op no problem.
+- A and B are unable to apply C's op
+
+A) Do we need a service call migration?
+    - does this violate best practices?
+    - I feel like there's probably established wisdom on why we don't do this
+B) Do we follow semver rules?  Only major version is a breaking change?
+    - Do we warn the user before upgrade, and then drop any outstanding transactions?
+    - What if the service labels a breaking change as minor or patch?
+C) Is there other wisdom/best practice on how to handle this?
+
+---
+
+    - stories/backlog/old-ops.md: the handler receives the op's version, and can refuse the op or migrate its input.
+
+Ah.  I forgot that we had established that.  It's actually elegant: let the service decide how it will handle it.  But I think we should always have one version of the service running, and the service version itself decides whether it supports the op.
+
+I also think that in addition to the hash, we should support a declared version (semver, canonically).
+
+    A) Migrating old service calls is established practice, not a violation of it.
+
+    C) The usual practice is "expand, then contract".
+
+Great, add the context you're mentioning here to old-ops.md.  This should make it into our final documentation.
+
+    - Semver stays advisory. CarbonDB doesn't trust it.
+
+Sure.
+
+---
+
+    where does a refused old op go?
+
+Gets dropped.  We need a table for such things.  There's a backlog story for an error table.
+
+    stories/backlog/rejected-after-merge.md
+
+But I think per the other decisions we've made, maybe this should be a per-space error table.
+
+---
+
+    My proposals:
+    1. Each device only.
+
+Yes.  So it should be @error
+
+    2. The oplog keeps applied ops; the error table keeps refused ones.
+
+Agreed.
+
+    3. Through a GET on [@carbon]. An app reads refused ops with a GET such as GET [@carbon]/rejected in the space, and watches it like any other GET. No notification API.
+
+GET [@error]/all
+GET [@error]/service/:name
+GET [@error]/search
+
+What's interesting here though: normally you can't POST to a local service from a replicated call.  In this case the runtime wires it up, but it means services can't directly POST.  I think that's fine.  They just `throw` if they want to.
+
+    4.  The re-run moves the op to whichever table its new outcome belongs in.
+
+Interesting.  So, I've been feeling as we talk about this that putting the inputs and outputs both in the oplog is awkward.  So far we're saying:
+
+1) Ops store both the inputs, and the local output
+2) Ops only go in the oplog once they succeed
+3) They only get replicated once they succeed
+4) If they don't succeed they go in errors
+
+This doesn't feel correct to me.  As I've mentioned, fundamentally what we're doing is CQRS.  And you've put the command and the query results in the same place.  Instead I would say:
+
+replication messages --> oplog
+local changes        --> oplog
+                         oplog   --> Services --> SQLite
+                         results <-- Services <-- SQLite
+oplog response       <-- results
+nested GET ops       <--                        tx state
+GET ops              <--                        SQLite
+
+E.g., keep the results, potentially with errors, or nested calls, separate from the oplog.
+
+The oplog records "what I received" and the results records "what I did", and "what happened".
+
+State synchronization becomes "find the ops that don't have calls and run them", with some potential rewind/rerun semantics.
+
+Does that make sense?  I'm arguing for separating them, but tell me if I'm solving a problem, or if we'd be better off keeping the two condensed into one.
+
+Just discuss this last item.  Put everything else back in the agenda.
+
+---
+
+    You're solving a real problem: one row holding both the op and its result breaks once ops re-run
+
+The other problem is that most queueing systems record immediately to disk upon receiving new input.  This way if anything crashes they're maximizing their chance that no messages are lost.  I think the oplog should have a similar quality.
+
+    The costs:
+    - Two rows per op instead of one.
+    - The outbox needs one more filter: publish a local op only once it has an applied result.
+
+I wonder if you could mint a new "result" in memory and save the ID in the oplog op as "result_id".  So that way you have a built-in reference to check what the result was, and you don't have to break your immediate persistence to do it.
+
+    Open questions:
+    1. Does the oplog hold only what was received
+
+Yes.
+
+    2. Are the ops still waiting to apply exactly those in the oplog without a result, so the RunQueue is derived from the log?
+
+Yes.  The RunQueue is a running diff between log and results.
+
+    3. Does a local call refused on its own device leave no trace in either table?
+
+I think local calls should always be recorded in results.  Never in oplog.
+
+But: I think what we have discussed and implemented thusfar is that `system` is where all local ops end up.  I would be fine with continuing that direction.  So @carbon -> `system` + `results`
+
+---
+
+    If results are keyed by op hash, the op row can be written immediately and its result added later, with no extra column
+
+Great, do that.
+
+    Only calls on the system handle go to the system log
+
+Ah.  A more recent change.  I had forgotten and you are right.
+
+Um.  So... I'm just trying to remember.  I think we said: Put the device ID on the local ops, which are also marked with @.  So when devices see local ops, they say "Is that for me?" and if not they don't run it.  And that way they can be replicated and visible without causing duplication.  So because you already have them in the oplog consistently, and you also record their results... nothing changes for them, they're treated entirely consistently at the level of op and result recording.
+
+Is that right?
+
+Your third point seems to be rambling on the same subject, I think it's irrelevant if we are straight on the above.
+
+
+---
+
+    When another device sees a [@carbon] op that isn't its own, it should record a "skipped" result rather than nothing.
+
+Great.  That's perfectly clear.
+
+---
+
+    but I haven't verified it or checked whether rusqlite exposes it.
+
+Can you do that?
+
+---
+
+    The actual rule is that a row's key must come from the op that creates it, never from the rows already in the table.
+
+Ah.  That's more clear, and also makes sense in a distributed system.
+
+    requiring every service table to be WITHOUT ROWID?
+
+What does that mean?  That's different from primary key, right?
+
+    The core would check every table after init()
+
+I like the idea of doing integrity checks after init().
+
+So it sounds like:
+
+1) we enforce compliant schemas
+2) we provide op.id()
+3) but it's still up to implementors to close the gap
+
+Is there anything else we can do to make the transition easier or more automatic?
+
+
+---
+
+Hmm... you make a good point about this being an API facet that people will start to build around.  We can't retract it without breaking code in the wild.  Let's drop it and just give the integrity check with a robust error containing guidance on what to change and why.
+
+    Still open:
+    1. Should integer ids stay below 2^53 so JavaScript reads them exactly?
+
+Yes.
+
+    3. Is the SQL function named op_id() and registered by every runtime? That's my proposal.
+
+That's fine.
+
+    5. Should the D1 compatibility layer report the drawn key as meta.last_row_id? That's my proposal; it keeps D1 code that reads last_row_id working.
+
+I think this relates to op_id()?  Also fine.
+
+---
+
+    My proposal:
+    1. [@carbon] creates carbon_system_identity through its own init(), like any service, so the core no longer creates any service's table.
+
+We agreed that @carbon runs in every space, and puts ops into that space's oplog.  So does carbon_system_identity go into each space?
+
+    2. The core keeps only the op log and results tables, because the RunQueue that reads them is the core's.
+
+Oplog and results are definitely set up per space.  I don't know how it would make any sense for them not to be.
+
+    3. carbon_migration is deleted, since services now track their own migrations.
+
+Sure.
+
+---
+
+    My proposal:
+    1. Move system.sql into [@carbon]'s folder, crates/core/src/services/carbon/. [@carbon] keeps applying it when the system database opens, not through init().
+
+Ok.
+
+    2. Give oplog.sql the results table, since the core creates both in every space and in the system database.
+
+I'd rather see a separate results.sql.
+
+    3. Delete space.sql along with carbon_migration.
+
+Why?
+
+---
+
+    we agreed the core reads no service's table
+
+Can't it just GET whatever it wants through a normal op?  What that rule means is to not violate encapsulation.  It doesn't mean you can't talk to the service.
+
+---
+
+    Open question: once the id comes back from POST [identity]/origin, who authors the two ops that run before it answers: [space]/origin and [identity]/origin itself?
+
+Isn't this all running inside a `POST [@carbon]/identity`?  Shouldn't that command be responsibile for wiring everything up?
+
+---
+
+    My proposal: the new device alone. That's honest, because no identity exists yet, and the author's identity field is already optional. Once [identity]/origin returns the id, every later op carries identity id + device.
+
+Uh... yeah you're asking what ID to use when creating an ID.  Are there consequences to this question or is it just window dressing on null?
+
+---
+
+    It will matter once replication exists.
+
+Then you didn't need to say anything in the previous paragraph.
+
+    Another device receiving an op with no identity must check it against its device key alone, and accept that only for origin ops. I've added that as a topic off the critical path.
+
+You're not doing me any favors by suggesting something that's going to screw us over in a minute.
+
+But I also don't see what the problem is here, you're going to need to explain it more.  What's the problem with accepting the device key alone for [identity]/origin ops?  And I think this is true only for identity, not for any other kind of /origin...
+
+---
+
+    nothing has watched the identity space yet, so its refs aren't in memory
+
+I don't understand.
+
+    My proposal: a call that writes refs resolves only after the watch has refreshed.
+
+This feels backwards.  Did you mean to say "Watch should refresh immediately after a call that writes refs?"
+
+---
+
+    start(), createSpace and createIdentity start the refs watch for each space and wait for its first answer.
+
+Does that mean we're blocking while waiting?
+
+    Should every call resolve only after all the watches its commit triggered have refreshed
+
+I lean towards all watches.  Feels like it just gives more consistent behavior.
+
+---
+
+    1. Should this round include splitting the op log from results?
+
+Yes.
+
+    2. Should I build it in three stages with a review between each, as we did before?
+
+No, just build it all at once.  I'm going to bed.
+
+Thanks Claude.
+
+---
+
+    the space keeps a map of replies keyed by op hash, beside the RunQueue
+
+Isn't that the results log that we already agreed you would build?
+
+Or is this a list of "callers" or "receivers" or "waiting"?
+
+  - My proposal: it waits outside the RunQueue, and enters the RunQueue once it's logged at the end of the turn. Then logged goes away, and the RunQueue can hold plain Ops and stop being generic.
+
+This sounds bizarre to have this in RunQueue.  Can you decouple these things, so you have an OpWriter responsible for writing incoming or locally sourced Ops?  And the RunQueue doesn't concern itself with receiving incoming things, it just reads the Oplog, reads the Results, diffs, and determines what it will run?  Single responsibility.
+
+---
+
+    The replies map is not the results
+
+Call it waiting_ops.
+
+    Yes, the OpWriter split works, and the RunQueue gets simpler than you might expect.
+
+Do you still need it at all?  It shouldn't be called a queue if it only has one item in it.
+
+    - RunQueue: the next op is the first one in the op log with no result that isn't already running, and ops apply one at a time.
+
+Is there only one op ever running at a time?  Does that mean this is a serially processed system?  Is that an appropriate design?  At what level do you actually need to serialize application?
+
+    - service
+    - space
+    - device
+
+Space definitely seems like the safe boundary.  Service, maybe?
+
+    If writing an op's result fails
+
+Why would it fail?
+
+---
+
+    keep "RunQueue" as the name of that query, which is how stories/implementation.md:141 already defines it
+
+Please stop clinging to a story that was written before our current realizations.
+
+I don't like you calling this RunQueue when it's not a queue.
+
+    When a result write fails, should that space stop applying and surface the error?
+
+I mean, is part of the purpose why it's a queue right now so that it can provide this logic safely?
+
+Add to agenda topics: why do service-build and hash exist as separate crates?
+
+---
+
+    The ops with no result yet are the pending ops, which is already the function's name, oplog::pending
+
+Is oplog::pending just calculated directly off SQLite state?  Yes, I'm fine with you dumping RunQueue and leaving that as a calculated value.
+
+    2. When a result write fails, should that space stop applying and surface the error, instead of recording a refusal?
+
+Yes?  It seems like disk errors and such are a pretty critical system failure, they're not related to the op itself failing.
+
+---
+
+    The only thing the space keeps in memory is which op is applying
+
+Can you call it RunState?
+
+     - My proposal: the store classifies SQLite's own failure codes as system failures when they happen, on any statement. These are I/O errors, a full disk, a database that's busy or locked, and corruption.
+
+Yes.
+
+     - My proposal: new calls to that space reject with the stored error until the space reopens. The OpWriter keeps logging ops that arrive,
+
+I would stop even logging ops.  This node is out in this circumstance.  Requires manual resolution of the problem and `resume()` of the space, which will probably need to be surfaced as a UI button.
+
+---
+
+    1. Should RunState be one of three states: Idle, Applying (with the op's hash) or Stopped (with the error)?
+
+Sure.  That's elegant.
+
+    2. Should a system failure stop only the space it hit, with each space resumed on its own?
+
+Yes.
+
+    3. How does the app learn a space has stopped, so it can show the resume button?
+       - My proposal: calls to a stopped space reject with 503 (service unavailable), carrying the original error, and the space's watches receive the same error.
+
+Yes.  The app will also want some way of querying or watching the RunState.  Use your discretion.
+
+---
+
+    Open questions:
+    1. Should store.rs capture each op's changeset as part of its write transaction, replacing the authorizer's write set?
+
+I'm open to it, but not fully aware of the consequences.  What are the advantages, and what are we giving up?
+
+    2. Should rewind live in its own module, rewind.rs
+
+I agree.
+
+    3. Should the authorizer, scoped statements and op_id() move out of store.rs into a module of their own?
+
+What would you call it?
+
+---
+
+    Using the changeset as the write set
+
+Let's do that.  But can you document the tradeoffs you've mentioned here within implementation.md?
+
+    I'd call it caller.rs
+
+What about CallWindow or CallContext?  That feels more specific and descriptive.  "Caller" is easily confused with the op itself, or could mean a variety of other things.
+
+---
+
+    - An op on a space whose named services aren't all registered is refused at submit, with a 404 naming the missing service, and isn't logged.
+
+That's bizarre and contradictory with the direction and flow of our conversation.  Why wouldn't you log it?
+
+    Stopping a space answers every waiting caller with the 503, not just the caller of the failing op
+
+That's fine.
+
+    - The authorizer now allows PRAGMA table_xinfo on a service's own tables.
+
+What does this jargon mean?
+
+    Holding a session alongside its connection needed a new crate, self_cell
+
+I am trying to get you to eliminate extra crates, not create more.  Don't play whackamole with me Claude.
+
+    When setting up a service has to wait until the applying op finishes, an error from that set-up is still dropped
+
+Add to agenda.
+
+    - The core still has two different Reply types.
+
+Add to agenda.
+
+Talk to me about the extra crate you created, and push the rest into the agenda.  Get rid of the implemented items from the agenda.  Put "createIdentity returns a paper key" in the backlog and get it out of the agenda.  Drop the 403 testing and get it out.

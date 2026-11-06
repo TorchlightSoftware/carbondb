@@ -49,6 +49,11 @@ pub fn internal(message: impl Into<String>) -> ServiceError {
   ServiceError::new(500, "INTERNAL_ERROR", message)
 }
 
+// The refusal for a method and resource a service does not answer.
+pub fn unknown(method: &str, resource: &str) -> ServiceError {
+  not_found(format!("{method} {resource} is not a call this service answers"))
+}
+
 // A call that needs peers, refused because this CarbonDB runs single-node.
 pub fn single_node(what: &str) -> ServiceError {
   ServiceError::new(501, "SINGLE_NODE", format!("{what} needs peers, and this CarbonDB runs single-node"))

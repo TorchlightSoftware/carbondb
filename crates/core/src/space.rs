@@ -1,46 +1,69 @@
 //! A space on this device, as the host keeps it: its database, the services
-//! provisioned there, its RunQueue, and who listens for its commits. The system
-//! database is the root space: local, never replicated, and answering only
-//! local services.
+//! its origin names and the ones set up here, its OpWriter, the callers
+//! waiting on its ops, and its RunState. The system database is the root
+//! space: local, never replicated, and answering only local services.
 //!
-//! What a space is (its origin, its refs) is `[space]`'s business; the host
-//! keeps only which services it has provisioned here, and how far.
+//! Its ops apply one at a time: one store, one writer. Different spaces apply
+//! side by side.
+//!
+//! What a space is (its origin, its refs) is `[space]`'s business. The host
+//! keeps no record of its own: it learns which services a space runs by asking
+//! `[space]`, and each service keeps its own schema through its `init`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use serde_json::json;
+use serde::Serialize;
+use serde_json::Value;
 
-use crate::dispatch::Job;
-use crate::error::{Result, bad_request, conflict, not_found};
-use crate::oplog;
-use crate::run_queue::RunQueue;
+use crate::call_window::CallWindow;
+use crate::dispatch::{Reply, Settled};
+use crate::error::{Result, ServiceError, conflict, internal, not_found};
+use crate::op_writer::OpWriter;
+use crate::schema::check_keys;
 use crate::services::Service;
 use crate::store::Store;
-use crate::Db;
+use crate::{Db, oplog, results};
 
-// What the core keeps in every space for itself, beside the op log.
-const HOST_SCHEMA: &str = include_str!("../migrations/space.sql");
-
-// Called with the tables each commit wrote.
-pub type Listener = Rc<dyn Fn(&[String])>;
+// Where a space is in applying its ops: initializing until every service its
+// origin names is set up here, then idle, or applying one; or stopped by a
+// system failure until it is fixed by hand and resumed. Its ops wait in every
+// state but idle.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum RunState {
+  Initializing { services: Vec<String> },
+  Idle,
+  Applying { op: String },
+  Stopped { error: ServiceError },
+}
 
 pub struct Space {
   pub id: String,
   root: bool,
   store: Store,
-  // The replicated services provisioned here, which are the ones it runs.
-  provisioned: RefCell<Vec<String>>,
-  pub(crate) queue: RefCell<RunQueue<Job>>,
-  listeners: RefCell<Vec<Listener>>,
+  // The services its origin names, which a device must run to answer them here.
+  named: RefCell<Vec<String>>,
+  // The services set up here, which are the ones it answers.
+  running: RefCell<Vec<String>>,
+  // Services waiting to be set up until the op now applying is done.
+  awaiting: RefCell<Vec<Rc<Service>>>,
+  pub(crate) op_writer: OpWriter,
+  // The callers waiting on an op's result, by op hash. An op resumed from the
+  // log has none.
+  waiting_ops: RefCell<HashMap<String, Reply>>,
+  run_state: RefCell<RunState>,
+  // Whether pending ops are being applied further up the stack, since an op
+  // can settle while it is being started.
+  pub(crate) draining: Cell<bool>,
 }
 
 impl Space {
   // The root space over the system database.
   pub fn root(store: Store) -> Result<Space> {
-    store.run_batch(oplog::SCHEMA)?;
-    Ok(Space::over("system", true, store))
+    Space::over("system", true, store)
   }
 
   // A new, empty space's database, ready for its origin op.
@@ -52,14 +75,24 @@ impl Space {
   }
 
   pub fn open(path: &Path, id: &str) -> Result<Space> {
-    let store = Store::open(path)?;
-    store.run_batch(HOST_SCHEMA)?;
-    store.run_batch(oplog::SCHEMA)?;
-    Ok(Space::over(id, false, store))
+    Space::over(id, false, Store::open(path)?)
   }
 
-  fn over(id: &str, root: bool, store: Store) -> Space {
-    Space { id: id.to_string(), root, store, provisioned: RefCell::default(), queue: RefCell::default(), listeners: RefCell::default() }
+  fn over(id: &str, root: bool, store: Store) -> Result<Space> {
+    store.run_batch(oplog::SCHEMA)?;
+    store.run_batch(results::SCHEMA)?;
+    Ok(Space {
+      id: id.to_string(),
+      root,
+      store,
+      named: RefCell::default(),
+      running: RefCell::default(),
+      awaiting: RefCell::default(),
+      op_writer: OpWriter::default(),
+      waiting_ops: RefCell::default(),
+      run_state: RefCell::new(RunState::Idle),
+      draining: Cell::new(false),
+    })
   }
 
   pub fn is_root(&self) -> bool {
@@ -70,71 +103,111 @@ impl Space {
     &self.store
   }
 
-  // Whether a replicated service runs here: one this space has provisioned.
+  // Whether a replicated service answers here: one set up here.
   pub fn runs(&self, service: &str) -> bool {
-    self.provisioned.borrow().iter().any(|name| name == service)
+    self.running.borrow().iter().any(|name| name == service)
   }
 
-  // The services provisioned here, as the host recorded them, to provision
-  // again on open.
-  pub fn provisioned(&self) -> Result<Vec<String>> {
-    let rows = self.store.all("SELECT service FROM carbon_migration ORDER BY service", &[])?;
-    Ok(rows.iter().filter_map(|row| row["service"].as_str().map(str::to_string)).collect())
+  pub fn names(&self, service: &str) -> bool {
+    self.named.borrow().iter().any(|name| name == service)
   }
 
-  // Provision a service: run the migrations it has not run here yet. Done when
-  // the op that names it applies, and again on every open, before any call.
-  pub fn provision(&self, service: &Service) -> Result<()> {
-    migrate(&self.store, &service.name, &service.migrations)?;
+  // The services its origin names, once the host has learned them.
+  pub fn name(&self, services: &[String]) {
+    *self.named.borrow_mut() = services.to_vec();
+  }
+
+  // The services its origin names that are not set up here yet, which hold its ops back.
+  pub fn not_set_up(&self) -> Vec<String> {
+    self.named.borrow().iter().filter(|name| !self.runs(name)).cloned().collect()
+  }
+
+  pub fn run_state(&self) -> RunState {
+    self.run_state.borrow().clone()
+  }
+
+  pub(crate) fn set_run_state(&self, state: RunState) {
+    *self.run_state.borrow_mut() = state;
+  }
+
+  pub fn is_applying(&self) -> bool {
+    matches!(*self.run_state.borrow(), RunState::Applying { .. })
+  }
+
+  pub(crate) fn wait_for(&self, op: &str, reply: Reply) {
+    self.waiting_ops.borrow_mut().insert(op.to_string(), reply);
+  }
+
+  // Answer whoever waits on an op's result.
+  pub(crate) fn answer(&self, op: &str, settled: Result<Settled>) {
+    let waiting = self.waiting_ops.borrow_mut().remove(op);
+    if let Some(reply) = waiting {
+      reply(settled)
+    }
+  }
+
+  // Answer everyone waiting on this space's ops with the same failure.
+  pub(crate) fn answer_all(&self, error: &ServiceError) {
+    let waiting = std::mem::take(&mut *self.waiting_ops.borrow_mut());
+    for reply in waiting.into_values() {
+      reply(Err(error.clone()))
+    }
+  }
+
+  // Set up a service here: its `init` in a transaction of its own, outside any
+  // op, then the check every table's keys must pass. While an op is applying,
+  // it waits until that op is done.
+  pub fn set_up(self: &Rc<Self>, service: &Rc<Service>) -> Result<()> {
+    if self.is_applying() {
+      self.awaiting.borrow_mut().push(Rc::clone(service));
+      return Ok(());
+    }
+    let prefix = service.prefix()?;
+    self.store.write(|store| {
+      let binding = Rc::new(DbBinding { space: Rc::clone(self), window: CallWindow { prefix: prefix.clone(), op: None }, open: Cell::new(true) });
+      let initialized = (service.init)(Rc::clone(&binding) as Rc<dyn Db>);
+      binding.open.set(false);
+      initialized?;
+      prefix.map_or(Ok(()), |prefix| check_keys(store, &prefix))
+    })?;
     if !self.runs(&service.name) {
-      self.provisioned.borrow_mut().push(service.name.clone());
+      self.running.borrow_mut().push(service.name.clone());
     }
     Ok(())
   }
 
-  pub fn listen(&self, listener: Listener) {
-    self.listeners.borrow_mut().push(listener);
-  }
-
-  // Tell every listener what a commit wrote.
-  pub(crate) fn committed(&self, tables: &[String]) {
-    let listeners = self.listeners.borrow().clone();
-    for listener in listeners {
-      listener(tables);
-    }
+  // Set up the services that waited for the op that was applying.
+  pub(crate) fn set_up_awaiting(self: &Rc<Self>) -> Result<()> {
+    let awaiting = std::mem::take(&mut *self.awaiting.borrow_mut());
+    awaiting.iter().try_for_each(|service| self.set_up(service))
   }
 }
 
-// Run a service's migrations that this space has not run yet. Every table must
-// keep a primary key: sessions record no changes to a table without one, so
-// undo would silently miss it.
-pub fn migrate(store: &Store, service: &str, migrations: &[impl AsRef<str>]) -> Result<()> {
-  store.write(|store| {
-    let done = store.get("SELECT count FROM carbon_migration WHERE service = ?", &[json!(service)])?["count"].as_u64().unwrap_or(0) as usize;
-    if done > migrations.len() {
-      return Err(conflict(format!("Service '{service}' has run {done} migrations here, more than the {} it declares", migrations.len())));
-    }
-    for migration in &migrations[done..] {
-      store.run_batch(migration.as_ref())?;
-    }
-    require_primary_keys(store)?;
-    store.run(
-      "INSERT INTO carbon_migration (service, count) VALUES (?, ?) ON CONFLICT (service) DO UPDATE SET count = excluded.count",
-      &[json!(service), json!(migrations.len())],
-    )?;
-    Ok(())
-  })?;
-  Ok(())
+// The `db` binding a service's `init` receives: its namespace in this space,
+// open only while `init` runs.
+struct DbBinding {
+  space: Rc<Space>,
+  window: CallWindow,
+  open: Cell<bool>,
 }
 
-fn require_primary_keys(store: &Store) -> Result<()> {
-  let tables = store.all("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'", &[])?;
-  for table in tables.iter().filter_map(|row| row["name"].as_str()) {
-    if store.get("SELECT 1 AS keyed FROM pragma_table_info(?) WHERE pk > 0", &[json!(table)])?.is_null() {
-      return Err(bad_request(format!("Table '{table}' has no primary key; every table needs one")));
+impl DbBinding {
+  fn scoped(&self) -> Result<crate::call_window::Scoped<'_>> {
+    if !self.open.get() {
+      return Err(internal("A service's init has returned, so its db binding is closed"));
     }
+    Ok(self.space.store.scoped(self.window.clone()))
   }
-  Ok(())
+}
+
+impl Db for DbBinding {
+  fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
+    self.scoped()?.run(sql, params)
+  }
+
+  fn all(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
+    self.scoped()?.all(sql, params)
+  }
 }
 
 // Where a space id leads when this device does not hold it.
@@ -145,15 +218,16 @@ pub fn missing(id: &str) -> crate::error::ServiceError {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use serde_json::json;
 
-  fn space() -> (tempfile::TempDir, Space) {
+  fn space() -> (tempfile::TempDir, Rc<Space>) {
     let directory = tempfile::tempdir().unwrap();
-    let space = Space::create(&directory.path().join("s.db"), "s").unwrap();
+    let space = Rc::new(Space::create(&directory.path().join("s.db"), "s").unwrap());
     (directory, space)
   }
 
-  fn service(name: &str, migrations: &[&str]) -> Service {
-    Service::replicated(name, migrations.iter().map(|sql| sql.to_string()).collect(), Rc::new(|_| {}))
+  fn service(name: &str, schema: &'static str) -> Rc<Service> {
+    Rc::new(Service::replicated(name, "v1", Some("db"), Rc::new(move |db: Rc<dyn Db>| db.run(schema, &[]).map(|_| ())), Rc::new(|_| {})))
   }
 
   #[test]
@@ -163,23 +237,23 @@ mod tests {
   }
 
   #[test]
-  fn runs_only_what_it_has_provisioned_and_migrates_once() {
+  fn sets_up_a_service_through_its_init_in_its_own_namespace() {
     let (_directory, space) = space();
-    assert!(!space.runs("chat"));
-    let first = service("chat", &["CREATE TABLE message (id TEXT PRIMARY KEY, text TEXT)"]);
-    space.provision(&first).unwrap();
-    space.provision(&first).unwrap();
-    assert!(space.runs("chat"));
-    assert_eq!(space.provisioned().unwrap(), vec!["chat"]);
-    let second = service("chat", &["CREATE TABLE message (id TEXT PRIMARY KEY, text TEXT)", "ALTER TABLE message ADD COLUMN edited_at INTEGER"]);
-    space.provision(&second).unwrap();
-    assert_eq!(space.store().all("SELECT id, text, edited_at FROM message", &[]).unwrap(), Vec::<serde_json::Value>::new());
+    space.name(&["chat".into()]);
+    assert_eq!(space.not_set_up(), ["chat"]);
+    let chat = service("chat", "CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, text TEXT) WITHOUT ROWID");
+    space.set_up(&chat).unwrap();
+    space.set_up(&chat).unwrap();
+    assert!(space.runs("chat") && space.not_set_up().is_empty());
+    assert_eq!(space.store().all("SELECT id, text FROM \"chat/db/message\"", &[]).unwrap(), Vec::<Value>::new());
   }
 
   #[test]
-  fn refuses_a_table_without_a_primary_key() {
+  fn refuses_a_service_whose_keys_sqlite_assigns_and_keeps_none_of_its_schema() {
     let (_directory, space) = space();
-    assert_eq!(space.provision(&service("notes", &["CREATE TABLE note (text TEXT)"])).unwrap_err().status, 400);
-    assert!(space.store().get("SELECT name FROM sqlite_schema WHERE name = 'note'", &[]).unwrap().is_null());
+    let error = space.set_up(&service("notes", "CREATE TABLE note (id INTEGER PRIMARY KEY, text TEXT)")).unwrap_err();
+    assert_eq!((error.status, error.details), (400, Some(json!({"table": "note"}))));
+    assert!(space.store().get("SELECT name FROM sqlite_schema WHERE name LIKE 'notes/%'", &[]).unwrap().is_null());
+    assert!(!space.runs("notes"));
   }
 }

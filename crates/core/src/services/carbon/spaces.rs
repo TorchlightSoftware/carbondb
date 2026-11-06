@@ -11,8 +11,8 @@ use serde_json::json;
 
 use super::steps::{self, Step, Target};
 use crate::error::{Result, bad_request};
-use crate::frame::Frame;
-use crate::Invocation;
+use crate::service_call::ServiceCall;
+use crate::HandlerContext;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,11 +33,11 @@ fn default_kind() -> String {
 }
 
 // Settle with the ref the calling space accepted.
-pub fn create(frame: Rc<Frame>) {
-  let planned = plan(&frame);
-  let caller = Rc::clone(&frame);
+pub fn create(call: Rc<ServiceCall>) {
+  let planned = plan(&call);
+  let caller = Rc::clone(&call);
   match planned {
-    Ok(planned) => steps::run(frame, planned, Box::new(move |result| {
+    Ok(planned) => steps::run(call, planned, Box::new(move |result| {
       let _ = caller.settle(result.map(|mut returned| returned.swap_remove(0)));
     })),
     Err(error) => {
@@ -46,12 +46,12 @@ pub fn create(frame: Rc<Frame>) {
   }
 }
 
-fn plan(frame: &Frame) -> Result<VecDeque<Step>> {
-  let actor = frame.actor.clone();
+fn plan(call: &ServiceCall) -> Result<VecDeque<Step>> {
+  let actor = call.actor.clone();
   let author = actor.identity.clone().ok_or_else(|| bad_request("Creating a space needs an acting identity"))?;
-  let request: SpaceInput = serde_json::from_value(frame.input.clone())?;
-  frame.carbon().services().require_registered(&request.services)?;
-  let id = frame.op().map(|op| op.hash.clone()).expect("a POST is an op");
+  let request: SpaceInput = serde_json::from_value(call.input.clone())?;
+  call.carbon().services().require_registered(&request.services)?;
+  let id = call.op().map(|op| op.hash.clone()).expect("a POST is an op");
   let origin = json!({
     "kind": request.kind,
     "name": request.name,
@@ -69,6 +69,6 @@ fn plan(frame: &Frame) -> Result<VecDeque<Step>> {
     Step::Call { target: Target::Here, actor: actor.clone(), key: "POST [space]/ref", input: reference },
     Step::Create(id.clone()),
     Step::Call { target: Target::Space(id.clone()), actor, key: "POST [space]/origin", input: origin },
-    Step::Provision(id, request.services),
+    Step::SetUp(id, request.services),
   ]))
 }

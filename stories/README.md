@@ -83,7 +83,7 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 1. The core picks the next op in the shared order and opens a transaction and a session on the space's database.
 2. It calls the service runtime's `apply` with the op and a database handle, and awaits the Promise it returns. Handlers may be async; the core waits for the Promise to settle before it continues.
 3. The handler reads and writes through the database handle. Those calls are synchronous and run inside the open transaction.
-4. When the Promise resolves, the core commits and keeps the session's changeset with the op. When it rejects or returns an error, the core rolls back and records the op as rejected.
+4. When the Promise resolves, the core commits and keeps the session's changeset with the op. When it rejects or returns an error, the core rolls back and records the op's result as refused, with its error.
 5. One op at a time per space, since the transaction stays open across the handler's awaits.
 
 ## Undo, write sets and read sets
@@ -124,6 +124,10 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 - [A service can store files in a space](backlog/file-bindings.md)
 - [An app developer can install @tlsft/carbondb on any desktop platform](backlog/native-packaging-per-platform.md)
 - [An iOS user runs the app's shipped services at native speed](backlog/ios-ahead-of-time-packages.md)
+- [An app developer's npm service runs at the version npm installed](backlog/npm-package-integrity.md)
+- [An app developer can run a Worker's D1 queries on CarbonDB unchanged](backlog/d1-compatibility.md)
+- [A person's interrupted call finishes when the app restarts after a crash](backlog/resume-after-crash.md)
+- [A person gets a paper key when they create an identity](backlog/paper-key.md)
 
 ## API sketch
 

@@ -1,14 +1,14 @@
-//! A frame: one call running in the core, as its service's entry point sees it
-//! through the `Invocation` interface. It holds the call, its input and the
-//! acting identity; the connection its queries run on, inside the op's
-//! transaction or a GET's snapshot; the op it runs within, if it writes; the
-//! calls it has made; and the way to settle it, once.
+//! A service call: one call running in the core, which its service's entry
+//! point sees as its handler context. It holds the call, its input and the
+//! actor; the connection its queries run on, inside the op's transaction or a
+//! GET's snapshot; the op it runs within, if it writes; the calls it has made;
+//! and the way to settle it, once.
 //!
 //! A call made inside another runs inside the same op, under a savepoint, so
 //! it sees the writes before it, and a failure rolls back only its own writes
 //! and throws to the handler that made it. The one exception is a local
-//! service writing to a replicated one: that is an op of its own, recorded and
-//! replicated by itself, since the local service never replicates.
+//! service writing to a replicated one: that is an op of its own, logged with
+//! its result, since the local service never replicates.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -19,27 +19,24 @@ use serde_json::{Value, json};
 use crate::carbon::Carbon;
 use crate::dispatch::Settled;
 use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal};
-use crate::op::Applying;
-use crate::oplog;
+use crate::results::Outcome;
 use crate::space::Space;
+use crate::call_window::{CallWindow, Scoped};
 use crate::store::Reader;
-use crate::{Actor, Call, Db, Invocation, Op};
+use crate::{Actor, Call, Db, HandlerContext, Op, Reply, oplog, results};
 
-// How a frame ends: what it settled with, and the calls it made.
+// How a service call ends: what it settled with, and the calls it made.
 pub(crate) type Settle = Box<dyn FnOnce(Result<Value>, Vec<CallRecord>)>;
 
-// How a call made inside a frame answers the handler that made it.
-pub type Reply = carbondb_service_api::Reply;
-
-// The connection a frame queries: the space's writer inside an op, or a GET's own reader.
+// The connection a service call queries: the space's writer inside an op, or a GET's own reader.
 #[derive(Clone)]
 pub(crate) enum Conn {
   Writer,
   Reader(Rc<Reader>),
 }
 
-// A call a frame made, kept with the op on this device: what it was asked,
-// what it answered, and the calls it made in turn.
+// A call a service call made, kept with the op's result on this device: what
+// it was asked, what it answered, and the calls it made in turn.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CallRecord {
   pub key: String,
@@ -88,15 +85,15 @@ fn within(caller: &Call, callee: &Call) -> Result<Within> {
   }
 }
 
-pub struct Frame {
+pub struct ServiceCall {
   carbon: Rc<Carbon>,
   space: Rc<Space>,
   pub actor: Actor,
   pub call: Call,
   pub input: Value,
   conn: Conn,
-  // The op it runs within, when it writes.
-  applying: Option<Rc<Applying>>,
+  // The op it runs within, when it writes. Calls within one op share it, and so its draws.
+  op: Option<Op>,
   // Whether the top-level call it belongs to is still open; nothing queries after.
   live: Rc<Cell<bool>>,
   calls: RefCell<Vec<CallRecord>>,
@@ -104,7 +101,7 @@ pub struct Frame {
   settle: RefCell<Option<Settle>>,
 }
 
-impl Frame {
+impl ServiceCall {
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     carbon: &Rc<Carbon>,
@@ -113,18 +110,18 @@ impl Frame {
     call: Call,
     input: Value,
     conn: Conn,
-    applying: Option<Rc<Applying>>,
+    op: Option<Op>,
     live: Rc<Cell<bool>>,
     settle: Settle,
-  ) -> Rc<Frame> {
-    Rc::new(Frame {
+  ) -> Rc<ServiceCall> {
+    Rc::new(ServiceCall {
       carbon: Rc::clone(carbon),
       space: Rc::clone(space),
       actor,
       call,
       input,
       conn,
-      applying,
+      op,
       live,
       calls: RefCell::default(),
       pending: Cell::new(0),
@@ -141,12 +138,12 @@ impl Frame {
   }
 
   // The op being applied, when this call writes within it.
-  fn writing(&self) -> Option<&Rc<Applying>> {
-    self.applying.as_ref().filter(|_| self.call.writes())
+  fn writing(&self) -> Option<&Op> {
+    self.op.as_ref().filter(|_| self.call.writes())
   }
 
-  // Make a call in a space, as an identity. Only a local service calls into
-  // another space, or as another identity, as when it sets up a new one.
+  // Make a call in a space, as an actor. Only a local service calls into
+  // another space, or as another actor, as when it sets up a new identity.
   pub fn call_in(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, reply: Reply) {
     if !self.live.get() {
       return reply(Err(self.ended()));
@@ -160,11 +157,11 @@ impl Frame {
     }
   }
 
-  // A local service's call into another space, or as another identity: an op
-  // of that space's own, applied when its turn there comes.
+  // A local service's call into another space, or as another actor: an op of
+  // that space's own, applied when its turn there comes.
   fn elsewhere(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, reply: Reply) {
     if !self.call.confined {
-      return reply(Err(forbidden(format!("Only a local service calls into another space or as another identity, not {}", self.call.key()))));
+      return reply(Err(forbidden(format!("Only a local service calls into another space or as another actor, not {}", self.call.key()))));
     }
     if Rc::ptr_eq(space, &self.space) && call.writes() {
       return self.inside(actor, call, input, Within::OwnOp, reply);
@@ -188,38 +185,32 @@ impl Frame {
     if guarded && let Err(error) = self.space.store().savepoint() {
       return reply(Err(error));
     }
-    let applying = match within {
-      Within::OwnOp => Some(Rc::new(Applying::new(self.carbon.stamp(&actor, &call, &input)))),
-      Within::SameOp => self.applying.clone(),
-    };
-    let own_op = applying.clone().filter(|_| within == Within::OwnOp);
+    let own_op = (within == Within::OwnOp).then(|| self.carbon.stamp(&actor, &call, &input));
+    let op = own_op.clone().or_else(|| self.op.clone());
     self.pending.set(self.pending.get() + 1);
     let caller = Rc::clone(self);
     let (record_call, record_input) = (call.clone(), input.clone());
     let settle: Settle = Box::new(move |result, calls| {
-      let result = if guarded { caller.close(result, own_op.as_ref().map(|applying| &applying.op), &calls) } else { result };
+      let result = if guarded { caller.close(result, own_op.as_ref(), &calls) } else { result };
       let mut record = CallRecord::of(&record_call, record_input, &result, calls);
-      record.op = own_op.map(|applying| applying.op.hash.clone());
+      record.op = own_op.map(|op| op.hash);
       caller.returned(record);
       reply(result)
     });
-    let callee = Frame::new(&self.carbon, &self.space, actor, call, input, self.conn.clone(), applying, Rc::clone(&self.live), settle);
+    let callee = ServiceCall::new(&self.carbon, &self.space, actor, call, input, self.conn.clone(), op, Rc::clone(&self.live), settle);
     self.carbon.route(callee);
   }
 
-  // End a call's savepoint: keep its writes, logging it when it was an op of
-  // its own, or roll them back when it failed.
+  // End a call's savepoint, keeping its writes or rolling them back. An op of
+  // its own goes in the log with its result either way.
   fn close(&self, result: Result<Value>, own_op: Option<&Op>, calls: &[CallRecord]) -> Result<Value> {
     if !self.live.get() {
       return Err(self.ended());
     }
     let store = self.space.store();
-    let result = match (result, own_op) {
-      (Ok(value), Some(op)) => oplog::append(store, op, &value, &json!(calls)).map(|_| value),
-      (result, _) => result,
-    };
     let closed = store.end_savepoint(result.is_ok());
-    result.and_then(|value| closed.map(|_| value))
+    let logged = own_op.map_or(Ok(()), |op| oplog::append(store, op).and_then(|_| results::record(store, &op.hash, &Outcome::of(&result, json!(calls)))));
+    closed.and(logged).and(result)
   }
 
   // A call this one made has answered.
@@ -232,19 +223,22 @@ impl Frame {
     internal(format!("{} has ended; nothing more runs inside it", self.call.key()))
   }
 
-  fn db(&self) -> Result<&dyn Db> {
+  // The `db` binding: the service's namespace on this call's connection, with its op.
+  fn db(&self) -> Result<Scoped<'_>> {
     if !self.live.get() {
       return Err(self.ended());
     }
+    let prefix = self.carbon.services().get(&self.call.service)?.prefix()?;
+    let window = CallWindow { prefix, op: self.writing().cloned() };
     Ok(match &self.conn {
-      Conn::Writer => self.space.store(),
-      Conn::Reader(reader) => reader.as_ref(),
+      Conn::Writer => self.space.store().scoped(window),
+      Conn::Reader(reader) => reader.scoped(window),
     })
   }
 }
 
 // A handler's queries, inside its op's transaction or its GET's snapshot.
-impl Db for Frame {
+impl Db for ServiceCall {
   fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
     if !self.call.writes() {
       return Err(bad_request(format!("{} is a GET, which never writes", self.call.key())));
@@ -257,9 +251,13 @@ impl Db for Frame {
   }
 }
 
-impl Invocation for Frame {
-  fn call(&self) -> &Call {
-    &self.call
+impl HandlerContext for ServiceCall {
+  fn method(&self) -> &str {
+    self.call.method()
+  }
+
+  fn resource(&self) -> &str {
+    &self.call.resource
   }
 
   fn input(&self) -> &Value {
@@ -271,16 +269,17 @@ impl Invocation for Frame {
   }
 
   fn op(&self) -> Option<&Op> {
-    self.writing().map(|applying| &applying.op)
+    self.writing()
   }
 
-  fn draw(&self) -> Result<String> {
-    self.writing().map(|applying| applying.draw()).ok_or_else(|| bad_request(format!("{} is not an op, so it draws nothing", self.call.key())))
-  }
-
-  fn send(self: Rc<Self>, call: Call, input: Value, reply: Reply) {
-    let (space, actor) = (Rc::clone(&self.space), self.actor.clone());
-    self.call_in(&space, actor, call, input, reply)
+  fn call(self: Rc<Self>, key: &str, input: Value, reply: Reply) {
+    match Call::from_key(key) {
+      Ok(call) => {
+        let (space, actor) = (Rc::clone(&self.space), self.actor.clone());
+        self.call_in(&space, actor, call, input, reply)
+      }
+      Err(error) => reply(Err(error)),
+    }
   }
 
   // A handler that finishes before the calls it made fails, since their writes

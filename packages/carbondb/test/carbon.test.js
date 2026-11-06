@@ -2,18 +2,22 @@ import {describe, it, beforeEach} from 'node:test'
 import assert from 'node:assert'
 import {mkdtempSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
-import {join} from 'node:path'
+import {spawn} from 'node:child_process'
+import {once} from 'node:events'
+import {dirname, join} from 'node:path'
 import {conflict} from '@tlsft/service-error'
 import {configure} from '../src/index.js'
+import {applyMigrations} from '../src/migrations.js'
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 2))
 
 // A small service exercising what the runtime offers a handler.
 const notes = {
   migrations: [
-    'CREATE TABLE note (id TEXT PRIMARY KEY, author TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL)',
-    'CREATE TABLE tag (name TEXT PRIMARY KEY)'
+    {name: '0001_note', sql: 'CREATE TABLE note (id TEXT PRIMARY KEY, author TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID'},
+    {name: '0002_tag', sql: 'CREATE TABLE tag (name TEXT PRIMARY KEY) WITHOUT ROWID'}
   ],
+  init: (db) => applyMigrations(db, notes.migrations),
   calls: {
     'POST [notes]/notes': {
       handler: async ({input, op, db}) => {
@@ -123,6 +127,7 @@ describe('services', () => {
     assert.deepStrictEqual(await texts(restarted), ['kept', 'kept again'])
     const unregistered = (await configure(config)).resumeIdentity('alice').ref('personal:alice')
     await assert.rejects(unregistered.call('GET [notes]/notes'), {status: 404, details: {service: 'notes'}})
+    assert.deepStrictEqual(unregistered.runState(), {state: 'initializing', services: ['notes']})
   })
 })
 
@@ -266,9 +271,102 @@ describe('watch', () => {
     assert.deepStrictEqual(results.map((refs) => refs.map((ref) => ref.slug)), [[], ['lobby']])
   })
 
+  it('has run again by the time a call whose commit touched it resolves', async () => {
+    const {results, arrival} = watching(personal, 'GET [notes]/notes')
+    await arrival()
+    await personal.call('POST [notes]/notes', {text: 'seen'})
+    assert.deepStrictEqual(results.at(-1), [{text: 'seen'}, {text: 'seen again'}])
+  })
+
   it('hands a failing GET its error', async () => {
     const {results, arrival} = watching(personal, 'GET [notes]/broken')
     await arrival()
     assert.deepStrictEqual(results, [{error: 500}])
+  })
+})
+
+describe('run state', () => {
+  // Hold a space's file from another process, as a second copy of the app
+  // would; resolves with a function that lets go of it.
+  async function holdLock(space) {
+    const path = join(dirname(config), 'data', `${space.space}.db`)
+    const holding = `const db = new (require('node:sqlite').DatabaseSync)(${JSON.stringify(path)}); db.exec('BEGIN IMMEDIATE'); console.log('held'); process.stdin.on('end', () => db.exec('ROLLBACK')); process.stdin.resume()`
+    const holder = spawn(process.execPath, ['--no-warnings', '-e', holding], {stdio: ['pipe', 'pipe', 'inherit']})
+    await once(holder.stdout, 'data')
+    return async () => {
+      holder.stdin.end()
+      await once(holder, 'exit')
+    }
+  }
+
+  it('stops a space on a system failure, failing its calls and watches with a 503, until it is resumed', async () => {
+    const states = []
+    personal.watchRunState((state) => states.push(state.state))
+    const results = []
+    let next
+    personal.watch('GET [notes]/notes', (value, error) => {
+      results.push(error ? {error: error.code} : value)
+      next?.()
+    })
+    const arrival = () => new Promise((resolve) => { next = resolve })
+    await arrival()
+    assert.deepStrictEqual(personal.runState(), {state: 'idle'})
+
+    const release = await holdLock(personal)
+    const stopped = arrival()
+    await assert.rejects(personal.call('POST [notes]/notes', {text: 'lost'}), {status: 503, code: 'SPACE_STOPPED'})
+    await stopped
+    assert.deepStrictEqual(results.at(-1), {error: 'SPACE_STOPPED'})
+    const {state, error} = personal.runState()
+    assert.deepStrictEqual([state, error.code], ['stopped', 'SYSTEM_FAILURE'])
+    await assert.rejects(personal.call('GET [notes]/notes'), {status: 503})
+
+    await release()
+    const resumed = arrival()
+    personal.resume()
+    await resumed
+    assert.deepStrictEqual(results.at(-1), [])
+    await personal.call('POST [notes]/notes', {text: 'kept'})
+    assert.deepStrictEqual(await texts(personal), ['kept', 'kept again'])
+    assert.deepStrictEqual(states, ['stopped', 'idle', 'applying', 'idle'])
+  })
+})
+
+describe('refs', () => {
+  it('reach a space at once, also after a restart', async () => {
+    const room = await personal.createSpace({name: 'Lobby', services: ['notes']})
+    assert.strictEqual(personal.ref('space:lobby').space, room.space)
+    const restarted = await start(config)
+    assert.strictEqual(restarted.ref('identity:alice').ref('personal:alice').ref('space:lobby').space, room.space)
+  })
+})
+
+describe('schema', () => {
+  it("is set up by a service's init, which applies only the migrations not applied yet", async () => {
+    await personal.call('POST [notes]/tags', {name: 'red'})
+    const grown = {
+      ...notes,
+      migrations: [...notes.migrations, {name: '0003_color', sql: "ALTER TABLE tag ADD COLUMN color TEXT NOT NULL DEFAULT 'none'"}],
+      init: (db) => applyMigrations(db, grown.migrations),
+      calls: {...notes.calls, 'GET [notes]/tags': {handler: ({db}) => db.all('SELECT name, color FROM tag')}}
+    }
+    const restarted = await configure(config)
+    restarted.services.add('notes', grown)
+    assert.deepStrictEqual(await restarted.resumeIdentity('alice').ref('personal:alice').call('GET [notes]/tags'), [{name: 'red', color: 'none'}])
+  })
+
+  it('refuses a service whose table takes its keys from SQLite, and says how to fix it', async () => {
+    carbon.services.add('counter', {init: (db) => db.run('CREATE TABLE IF NOT EXISTS hit (id INTEGER PRIMARY KEY AUTOINCREMENT)'), calls: {}})
+    await assert.rejects(personal.createSpace({name: 'Counted', services: ['counter']}), (error) => {
+      assert.deepStrictEqual([error.status, error.details], [400, {table: 'hit'}])
+      assert.match(error.message, /must come from the op that creates it.*op_id\(\)/)
+      return true
+    })
+  })
+
+  it("keeps a service inside its own tables, even when it names another service's", async () => {
+    carbon.services.add('snoop', {calls: {'GET [snoop]/refs': {handler: ({db}) => db.all('SELECT * FROM "space/db/ref"')}}})
+    const room = await personal.createSpace({name: 'Snooped', services: ['snoop']})
+    await assert.rejects(room.call('GET [snoop]/refs'), {status: 500, message: /no such table: snoop\/db\/space\/db\/ref/})
   })
 })

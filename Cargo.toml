@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/node", "crates/service-api", "crates/services/*"]
+members = ["crates/core", "crates/node", "crates/service-bindings", "crates/services/*"]
 # Spikes are standalone experiments with their own lockfiles.
 exclude = ["spikes"]
 
@@ -10,6 +10,6 @@ license = "MIT OR Apache-2.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-rusqlite = { version = "=0.39.0", features = ["bundled", "hooks"] }
+rusqlite = { version = "=0.39.0", features = ["bundled", "hooks", "functions", "session"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

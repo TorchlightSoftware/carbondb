@@ -29,7 +29,7 @@ export class SpaceHandle {
     return this.#carbon.space(this.space)
   }
 
-  // The handle of a space a ref here points to.
+  // The handle of a space a ref here points to, found at once in this space's refs.
   ref(name) {
     const {kind, slug} = parseName(name)
     const found = this.#runtime().findRef(kind, slug)
@@ -45,9 +45,25 @@ export class SpaceHandle {
     return this.#runtime().watch(actorOf(this.identity), key, fn)
   }
 
-  // Create a space nested in this one, and return its handle.
+  // This space's RunState: initializing, idle, applying an op, or stopped by a system failure.
+  runState() {
+    return this.#runtime().runState()
+  }
+
+  // Call `fn` with each change of this space's RunState; returns a function that stops it.
+  watchRunState(fn) {
+    return this.#runtime().watchRunState(fn)
+  }
+
+  // Resume this space once the system failure that stopped it is fixed by hand.
+  resume() {
+    this.#runtime().resume()
+  }
+
+  // Create a space nested in this one, and return its handle once its refs are loaded.
   async createSpace(input) {
     const created = await this.call('POST [@carbon]/space', input)
+    await this.#carbon.space(created.space).load()
     return new SpaceHandle(this.#carbon, created.space, this.identity)
   }
 
@@ -87,9 +103,11 @@ export class SystemHandle {
     return outcome.value
   }
 
-  // An identity, its first device and its personal space, which runs the services named.
+  // An identity, its first device and its personal space, which runs the
+  // services named, with both spaces' refs loaded.
   async createIdentity({slug, device, services = []}) {
     const identity = await this.call('POST [@carbon]/identity', {slug, device, services})
+    await Promise.all([identity.space, identity.personal].map((id) => this.#carbon.space(id).load()))
     return {
       identity: new SpaceHandle(this.#carbon, identity.space, identity),
       personal: new SpaceHandle(this.#carbon, identity.personal, identity)

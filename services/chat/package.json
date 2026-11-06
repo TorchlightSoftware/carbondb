@@ -6,6 +6,7 @@
   "type": "module",
   "main": "index.js",
   "dependencies": {
+    "@tlsft/carbondb": "^0.1.0",
     "@tlsft/service-error": "^0.1.0",
     "zod": "^4.1.12"
   },

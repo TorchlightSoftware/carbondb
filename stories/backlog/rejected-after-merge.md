@@ -4,12 +4,18 @@ Status: backlog
 
 ## Idea
 
-A call that applied on the author's device can be rejected once ops from other devices land ahead of it in the shared order. The op stays in the log as rejected, but the author is not told.
+A call that applied on the author's device can be refused once ops from other devices land ahead of it in the shared order, or once a newer version of its service no longer supports it (see [old ops](old-ops.md)). Its writes are dropped, but the author is not told.
 
-CarbonDB provides notifications and a queue of sync errors, kept in a dedicated `errors` space rather than the personal space. The person works through the queue with the op history interface, where a revert is a compensating op.
+- The op stays in the space's op log, which records what was received. What happened when this device ran it is its result: a refused result carries the service error.
+- Refusals are this device's own record, kept per space and never replicated. Every replica running the same version refuses the same op, including the author's device once its rewind re-runs it, so the author finds the refusal locally.
+- The runtime records refusals. Services never write them: a replicated service cannot call a local one, so it simply throws.
+- `[@error]`, a local service in every space, reads the refused results: `GET [@error]/all`, `GET [@error]/service/:name` and `GET [@error]/search`. An app watches them like any GET, so there is no separate notification API.
+- A rewind re-runs ops and replaces their results, so an op refused once may apply on a re-run, and the reverse.
+
+The person works through the refusals with the op history interface, where a revert is a compensating op.
 
 ## To decide
 
-- Whether the `errors` space replicates among the identity's devices, so every device sees the queue, or stays local to the device that found the rejection.
-- What an entry holds: the rejected op, the space, the service error, and the op that caused it.
-- How an entry is cleared, and how an app subscribes to notifications.
+- Whether a refusal names the op that caused it.
+- How a refusal is cleared once the person has dealt with it.
+- What `GET [@error]/search` searches.

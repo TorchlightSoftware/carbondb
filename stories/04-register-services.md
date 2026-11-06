@@ -10,13 +10,13 @@ import * as chat from './services/chat.js'
 carbon.services.add('chat', chat)   // in main(), on every start
 ```
 
-A service is its exported object: its migrations and its calls keyed by service key, each with a handler and optional tags (such as `append`). The name it runs under is the one passed to `services.add`.
+A service is its exported object: its calls keyed by service key, each with a handler and optional tags (such as `append`), and an optional `init`, which sets up its schema through its `db` binding on every open; `@tlsft/carbondb/migrations` applies a directory of D1-style migrations from it. The name it runs under is the one passed to `services.add`.
 
 ## Rules
 
 - The app registers its services in `main()` on every start. Nothing is stored in the database, and the handler code is never copied into it.
 - Nothing is loaded from hard-coded lists or the TOML file.
-- A service's schema version is the number of its migrations, carried in every op.
+- A service's version is the hash of its code, carried in every op.
 - A space naming a service this device has not registered is refused.
 - Installing, updating and removing services at runtime is out of scope for the demo.
 

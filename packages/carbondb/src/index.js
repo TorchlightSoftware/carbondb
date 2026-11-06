@@ -27,8 +27,11 @@ class Carbon {
   }
 }
 
-// Load CarbonDB from its TOML file, and return the system handle.
+// Load CarbonDB from its TOML file, load the refs of every space on this
+// device, so a handle reaches any of them at once, and return the system handle.
 export async function configure(path) {
   const native = core(() => NativeCarbon.open(resolve(path)))
-  return new SystemHandle(new Carbon(native))
+  const carbon = new Carbon(native)
+  await Promise.all(core(() => native.spaces()).map((id) => carbon.space(id).load()))
+  return new SystemHandle(carbon)
 }

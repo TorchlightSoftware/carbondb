@@ -1,5 +1,5 @@
-// [chat]: messages in a space. A service is its tables and the handlers that
-// read and write them; the app names it when it registers it:
+// [chat]: messages in a space. A service is its schema, set up by its `init`,
+// and the handlers that read and write it; the app names it when it registers it:
 //
 //   carbon.services.add('chat', chat)
 //
@@ -8,17 +8,14 @@
 
 import {z} from 'zod'
 import {forbidden, notFound, validationError} from '@tlsft/service-error'
+import {applyMigrations, readMigrations} from '@tlsft/carbondb/migrations'
 
-export const migrations = [
-  `CREATE TABLE message (
-     id TEXT PRIMARY KEY,
-     author TEXT NOT NULL,
-     text TEXT NOT NULL,
-     sent_at INTEGER NOT NULL,
-     edited_at INTEGER,
-     deleted_at INTEGER
-   )`
-]
+// Its migrations, D1-style files in migrations/, applied by `init` on every open.
+export const migrations = readMigrations(new URL('./migrations/', import.meta.url))
+
+export function init(db) {
+  applyMigrations(db, migrations)
+}
 
 // What a message call takes. Validating input is the service's own business.
 const MessageInput = z.object({text: z.string().trim().min(1).max(4000)}).strict()

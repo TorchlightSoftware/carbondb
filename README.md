@@ -35,14 +35,14 @@ Early prototyping. p2panda (on iroh) is the base for replication. The single-nod
 - [components/](components/README.md): one file per architectural component (identity, device constellation, contacts, private communication, blind relay nodes, state synchronization, storage, wallet, client platform, service calls), with what is agreed and what is open.
 - [platforms/](platforms/README.md): evaluations of the candidate platforms and the feature matrix.
 - [stories/](stories/README.md): what a person can do with CarbonDB, and the agreed design underneath.
-- [crates/core/](crates/core/): the Rust core: spaces on SQLite, the RunQueue and op log, routing every call by service name, and `[@carbon]`, the one service the core implements itself.
-- [crates/service-api/](crates/service-api/): what every service is written against: the invocation it answers, its queries, calls and ops, and packaging a Rust service's `service.toml` and migrations.
+- [crates/core/](crates/core/): the Rust core: spaces on SQLite, the op log and results, applying each space's pending ops in turn, routing every call by service name, namespacing each service's tables, and `[@carbon]`, the part of the core that answers as a local service.
+- [crates/service-bindings/](crates/service-bindings/): ServiceBindings, the toolkit a Rust service builds with. At runtime, the API footprint it exposes: its name, version, `init` and entry point, and the handler context each call receives; an opt-in helper that applies D1-style migrations; and the content hash every replica agrees on. At build time, behind its `build` feature, packaging: the service's `service.toml` name, `sql` binding, migrations and version hash.
 - [crates/services/](crates/services/): the builtin services `[space]`, `[identity]` and `[device]`, each with its own `service.toml`, migrations and source. They link into the core natively for now, and will compile to WASM.
 - [crates/node/](crates/node/): the core's Node bindings, through napi-rs.
 - [packages/carbondb/](packages/carbondb/README.md): `@tlsft/carbondb`, the JS runtime apps use.
 - [services/chat/](services/chat/): the [chat] service.
 - [examples/chat-server/](examples/chat-server/): [chat] behind a small HTTP adapter, with end-to-end tests.
-- [spikes/](spikes/): experiments: the p2panda chat demo, and an async JS handler inside a Rust transaction.
+- [spikes/](spikes/): experiments: the p2panda chat demo, an async JS handler inside a Rust transaction, and SQLite sessions on tables without a primary key.
 - [perspectives/](perspectives/): reviews and position notes from contributors.
 
 Terminology follows the [Vision for Decentralized Web](https://github.com/bitmage/vision-for-decentralized-web) wiki.

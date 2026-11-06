@@ -11,6 +11,6 @@
   ],
   "scripts": {
     "build": "npm run build --workspace @tlsft/carbondb",
-    "test": "cargo test --workspace && npm run build && npm test --workspaces --if-present"
+    "test": "cargo test --workspace --all-features && npm run build && npm test --workspaces --if-present"
   }
 }

@@ -2,17 +2,23 @@
 //! and manage list. It runs in every replicated space. Every POST but the
 //! origin needs manage on the space.
 
+pub mod names;
+
 use std::rc::Rc;
 
-use carbondb_service_api::error::{Result, bad_request, conflict, forbidden, not_built, not_found, single_node};
-use carbondb_service_api::names::{slugify, unique_slug};
-use carbondb_service_api::{Db, Invocation, Package, answer, ask};
+use carbondb_service_bindings::error::{Result, bad_request, conflict, forbidden, not_built, not_found, single_node, unknown};
+use carbondb_service_bindings::{Db, HandlerContext, Package, migrations};
+use names::{slugify, unique_slug};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 include!(concat!(env!("OUT_DIR"), "/package.rs"));
 
-pub const PACKAGE: Package = Package { name: NAME, migrations: MIGRATIONS, entry };
+pub const PACKAGE: Package = Package { name: NAME, version: VERSION, binding: BINDING, init, entry };
+
+fn init(db: &dyn Db) -> Result<()> {
+  migrations::apply(db, MIGRATIONS)
+}
 
 // What a space is, fixed by its first op.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,52 +62,56 @@ struct RefName {
   slug: String,
 }
 
-fn entry(invocation: Rc<dyn Invocation>) {
-  answer(invocation, handle)
+type Context = Rc<dyn HandlerContext>;
+
+fn entry(context: Context) {
+  let input = || context.input().clone();
+  match (context.method(), context.resource()) {
+    ("POST", "/origin") => settle(&context, serde_json::from_value(input()).map_err(Into::into).and_then(|origin| write_origin(context.as_ref(), origin))),
+    ("GET", "/origin") => settle(&context, origin(context.as_ref()).map(|origin| json!(origin))),
+    ("GET", "/manage") => {
+      let caller = Rc::clone(&context);
+      managers(&context, Box::new(move |managers| settle(&caller, managers.map(|managers| json!(managers)))))
+    }
+    ("POST", "/ref") => {
+      let caller = Rc::clone(&context);
+      require_manage(&context, Box::new(move |allowed| {
+        let added = allowed.and_then(|_| Ok(serde_json::from_value(caller.input().clone())?)).and_then(|new| add_ref(caller.as_ref(), new));
+        settle(&caller, added.map(|reference| json!(reference)))
+      }))
+    }
+    ("GET", "/refs") => settle(&context, refs(context.as_ref()).map(|refs| json!(refs))),
+    ("GET", "/ref") => {
+      let found = serde_json::from_value(input()).map_err(Into::into).and_then(|RefName { kind, slug }| find_ref(context.as_ref(), &kind, &slug));
+      settle(&context, found.map(|reference| json!(reference)))
+    }
+    ("POST", "/members") => settle(&context, Err(single_node("Adding a member"))),
+    ("POST", "/manage") => settle(&context, Err(not_built("Changing a manage list"))),
+    (method, resource) => settle(&context, Err(unknown(method, resource))),
+  }
 }
 
-fn handle(invocation: &Rc<dyn Invocation>) -> Result<Value> {
-  let input = || invocation.input().clone();
-  match (invocation.call().method(), invocation.call().resource.as_str()) {
-    ("POST", "/origin") => {
-      let origin: Origin = serde_json::from_value(input())?;
-      write_origin(invocation.as_ref(), &origin)?;
-      Ok(json!(origin))
-    }
-    ("GET", "/origin") => Ok(json!(origin(invocation.as_ref())?)),
-    ("GET", "/manage") => Ok(json!(managers(invocation)?)),
-    ("POST", "/ref") => {
-      require_manage(invocation)?;
-      Ok(json!(add_ref(invocation.as_ref(), serde_json::from_value(input())?)?))
-    }
-    ("GET", "/refs") => Ok(json!(refs(invocation.as_ref())?)),
-    ("GET", "/ref") => {
-      let RefName { kind, slug } = serde_json::from_value(input())?;
-      Ok(json!(find_ref(invocation.as_ref(), &kind, &slug)?))
-    }
-    ("POST", "/members") => Err(single_node("Adding a member")),
-    ("POST", "/manage") => Err(not_built("Changing a manage list")),
-    _ => Err(invocation.call().unknown()),
-  }
+fn settle(context: &Context, result: Result<Value>) {
+  let _ = context.settle(result);
 }
 
 fn json_column(row: &Value, column: &str) -> Result<Vec<String>> {
   Ok(serde_json::from_str(row[column].as_str().unwrap_or("[]"))?)
 }
 
-fn write_origin(db: &dyn Db, origin: &Origin) -> Result<()> {
-  if !db.get("SELECT 1 AS present FROM carbon_origin", &[])?.is_null() {
+fn write_origin(db: &dyn Db, origin: Origin) -> Result<Value> {
+  if !db.get("SELECT 1 AS present FROM origin", &[])?.is_null() {
     return Err(conflict("A space's origin is written once"));
   }
   db.run(
-    "INSERT INTO carbon_origin (one, kind, name, services, manage) VALUES (1, ?, ?, ?, ?)",
+    "INSERT INTO origin (one, kind, name, services, manage) VALUES (1, ?, ?, ?, ?)",
     &[json!(origin.kind), json!(origin.name), json!(origin.services), json!(origin.manage)],
   )?;
-  Ok(())
+  Ok(json!(origin))
 }
 
 fn origin(db: &dyn Db) -> Result<Origin> {
-  let row = db.get("SELECT kind, name, services, manage FROM carbon_origin", &[])?;
+  let row = db.get("SELECT kind, name, services, manage FROM origin", &[])?;
   if row.is_null() {
     return Err(not_found("This space has no origin yet"));
   }
@@ -113,24 +123,34 @@ fn origin(db: &dyn Db) -> Result<Origin> {
   })
 }
 
+type Answer<T> = Box<dyn FnOnce(Result<T>)>;
+
 // The identities that manage this space, with `self` resolved by `[identity]`
 // to the identity whose identity space this is. Only an identity space names `self`.
-fn managers(invocation: &Rc<dyn Invocation>) -> Result<Vec<String>> {
-  let resolve = |entry: String| match entry.as_str() {
-    "self" => Ok(ask(invocation, "GET [identity]/origin", Value::Null)?["id"].as_str().map(str::to_string)),
-    _ => Ok(Some(entry)),
+fn managers(context: &Context, answer: Answer<Vec<String>>) {
+  let manage = match origin(context.as_ref()) {
+    Ok(origin) => origin.manage,
+    Err(error) => return answer(Err(error)),
   };
-  let resolved: Vec<Option<String>> = origin(invocation.as_ref())?.manage.into_iter().map(resolve).collect::<Result<_>>()?;
-  Ok(resolved.into_iter().flatten().collect())
+  if !manage.iter().any(|entry| entry == "self") {
+    return answer(Ok(manage));
+  }
+  Rc::clone(context).call("GET [identity]/origin", Value::Null, Box::new(move |identity| {
+    answer(identity.map(|identity| resolve_self(manage, identity["id"].as_str())))
+  }))
 }
 
-fn require_manage(invocation: &Rc<dyn Invocation>) -> Result<()> {
-  let actor = invocation.actor().identity.clone().ok_or_else(|| forbidden("Managing a space needs an acting identity"))?;
-  if managers(invocation)?.contains(&actor) {
-    Ok(())
-  } else {
-    Err(forbidden("Only a manager of this space may change it"))
-  }
+fn resolve_self(manage: Vec<String>, id: Option<&str>) -> Vec<String> {
+  manage.into_iter().filter_map(|entry| if entry == "self" { id.map(str::to_string) } else { Some(entry) }).collect()
+}
+
+fn require_manage(context: &Context, answer: Answer<()>) {
+  let Some(actor) = context.actor().identity.clone() else {
+    return answer(Err(forbidden("Managing a space needs an acting identity")));
+  };
+  managers(context, Box::new(move |managers| {
+    answer(managers.and_then(|managers| if managers.contains(&actor) { Ok(()) } else { Err(forbidden("Only a manager of this space may change it")) }))
+  }))
 }
 
 // A second ref to the same space replaces the first.
@@ -142,7 +162,7 @@ fn add_ref(db: &dyn Db, new: NewRef) -> Result<Ref> {
   let taken = |slug: &str| find_ref(db, &new.kind, slug).ok().flatten().is_some_and(|found| found.space != new.space);
   let reference = Ref { slug: unique_slug(&base, taken), space: new.space, kind: new.kind, name: new.name, cascade: new.cascade };
   db.run(
-    "INSERT INTO carbon_ref (space, kind, name, slug, cascade) VALUES (?, ?, ?, ?, ?)
+    "INSERT INTO ref (space, kind, name, slug, cascade) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT (space) DO UPDATE SET kind = excluded.kind, name = excluded.name, slug = excluded.slug, cascade = excluded.cascade",
     &[json!(reference.space), json!(reference.kind), json!(reference.name), json!(reference.slug), json!(reference.cascade)],
   )?;
@@ -160,10 +180,22 @@ fn to_ref(row: &Value) -> Result<Ref> {
 }
 
 fn refs(db: &dyn Db) -> Result<Vec<Ref>> {
-  db.all("SELECT space, kind, name, slug, cascade FROM carbon_ref ORDER BY kind, slug", &[])?.iter().map(to_ref).collect()
+  db.all("SELECT space, kind, name, slug, cascade FROM ref ORDER BY kind, slug", &[])?.iter().map(to_ref).collect()
 }
 
 fn find_ref(db: &dyn Db, kind: &str, slug: &str) -> Result<Option<Ref>> {
-  let row = db.get("SELECT space, kind, name, slug, cascade FROM carbon_ref WHERE kind = ? AND slug = ?", &[json!(kind), json!(slug)])?;
+  let row = db.get("SELECT space, kind, name, slug, cascade FROM ref WHERE kind = ? AND slug = ?", &[json!(kind), json!(slug)])?;
   if row.is_null() { Ok(None) } else { to_ref(&row).map(Some) }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn resolves_self_to_the_identity_or_drops_it() {
+    let manage = || vec!["self".to_string(), "bob".to_string()];
+    assert_eq!(resolve_self(manage(), Some("alice")), ["alice", "bob"]);
+    assert_eq!(resolve_self(manage(), None), ["bob"]);
+  }
 }

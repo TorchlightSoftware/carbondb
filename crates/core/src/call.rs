@@ -1,5 +1,5 @@
-//! A call as a service receives it: the service key parsed into parts, and the
-//! identity acting.
+//! A service key parsed into the parts the core routes on: `POST [space]/ref`
+//! is {method: POST, service: space, resource: /ref}.
 
 use serde::{Deserialize, Serialize};
 
@@ -45,13 +45,6 @@ impl Call {
   pub fn unknown(&self) -> ServiceError {
     not_found(format!("{} is not a call CarbonDB answers", self.key()))
   }
-}
-
-// Who is acting: the identity a handle acts for, and this device.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Actor {
-  pub identity: Option<String>,
-  pub device: Option<String>,
 }
 
 #[cfg(test)]

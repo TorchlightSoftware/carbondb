@@ -12,13 +12,14 @@
 //!   {"call": .., "catch": true}                    the same, adding a failure's status instead of failing
 //!   {"fail": "why"}                                fail with a 409
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
 use serde_json::{Value, json};
 
-use crate::error::{Result, conflict};
-use crate::{Actor, Call, Carbon, Db, Identity, Invocation, Service, Settled, Space, now};
+use crate::error::{Result, conflict, internal, unknown};
+use crate::{Actor, Call, Carbon, Db, HandlerContext, Identity, Service, Settled, Space};
 
 // A single-node CarbonDB in a temporary directory, which lives as long as the
 // directory, running `[notes]`.
@@ -31,14 +32,31 @@ pub fn carbon() -> (tempfile::TempDir, Rc<Carbon>) {
   (directory, carbon)
 }
 
-pub fn register_notes(carbon: &Carbon) {
-  let migrations = vec!["CREATE TABLE note (id TEXT PRIMARY KEY, text TEXT NOT NULL)".to_string()];
-  carbon.services().register(Service::replicated("notes", migrations, Rc::new(notes))).unwrap();
+pub fn register_notes(carbon: &Rc<Carbon>) {
+  register_script(carbon, "notes");
 }
 
-// Make a call and return its answer, which every service here gives at once.
+// The scripted test service under a name of its own, with its own notes.
+pub fn register_script(carbon: &Rc<Carbon>, name: &str) {
+  let init = Rc::new(|db: Rc<dyn Db>| db.run("CREATE TABLE IF NOT EXISTS note (id TEXT PRIMARY KEY, text TEXT NOT NULL) WITHOUT ROWID", &[]).map(|_| ()));
+  carbon.register(Service::replicated(name, &format!("{name}-v1"), Some("db"), init, Rc::new(notes))).unwrap();
+}
+
+// Start something that answers through a callback, and return its answer,
+// which every call here gives at once.
+pub fn now<T: 'static>(start: impl FnOnce(Box<dyn FnOnce(Result<T>)>)) -> Result<T> {
+  let answer = Rc::new(RefCell::new(None));
+  let slot = Rc::clone(&answer);
+  start(Box::new(move |result| *slot.borrow_mut() = Some(result)));
+  answer.borrow_mut().take().unwrap_or_else(|| Err(internal("The call answered later")))
+}
+
 pub fn call_now(carbon: &Rc<Carbon>, space: &Rc<Space>, actor: &Actor, key: &str, input: Value) -> Result<Settled> {
   now(|reply| carbon.submit(space, actor.clone(), Call::from_key(key).unwrap(), input, reply))
+}
+
+pub fn space_now(carbon: &Rc<Carbon>, id: &str) -> Result<Rc<Space>> {
+  now(|opened| carbon.with_space(id, opened))
 }
 
 pub fn alice(carbon: &Rc<Carbon>) -> Identity {
@@ -54,49 +72,59 @@ pub fn actor(identity: &Identity) -> Actor {
 
 // A space running `[notes]`, nested in the identity's personal space.
 pub fn room(carbon: &Rc<Carbon>, identity: &Identity) -> Rc<Space> {
-  let personal = carbon.space(&identity.personal).unwrap();
+  let personal = space_now(carbon, &identity.personal).unwrap();
   let created = call_now(carbon, &personal, &actor(identity), "POST [@carbon]/space", json!({"name": "Room", "services": ["notes"]})).unwrap();
-  carbon.space(created.value["space"].as_str().unwrap()).unwrap()
+  space_now(carbon, created.value["space"].as_str().unwrap()).unwrap()
 }
 
 pub fn texts(db: &dyn Db) -> Result<Value> {
-  let rows = db.all("SELECT text FROM note ORDER BY text", &[])?;
+  let rows = db.all("SELECT text FROM \"notes/db/note\" ORDER BY text", &[])?;
   Ok(Value::Array(rows.into_iter().map(|row| row["text"].clone()).collect()))
 }
 
-fn notes(invocation: Rc<dyn Invocation>) {
-  match invocation.call().resource.as_str() {
+type Context = Rc<dyn HandlerContext>;
+
+fn notes(context: Context) {
+  match context.resource() {
     "/run" => {
-      let script = invocation.input()["do"].as_array().cloned().unwrap_or_default();
-      step(invocation, VecDeque::from(script), vec![])
+      let script = context.input()["do"].as_array().cloned().unwrap_or_default();
+      step(context, VecDeque::from(script), vec![])
     }
     "/texts" => {
-      let result = texts(invocation.as_ref());
-      let _ = invocation.settle(result);
+      let result = seen(context.as_ref());
+      let _ = context.settle(result);
     }
-    _ => {
-      let _ = invocation.settle(Err(invocation.call().unknown()));
+    resource => {
+      let _ = context.settle(Err(unknown(context.method(), resource)));
     }
   }
 }
 
+// The texts a handler sees, by the plain name its service gives the table.
+fn seen(db: &dyn Db) -> Result<Value> {
+  let rows = db.all("SELECT text FROM note ORDER BY text", &[])?;
+  Ok(Value::Array(rows.into_iter().map(|row| row["text"].clone()).collect()))
+}
+
 // Run the rest of a script, then settle with what it gathered.
-fn step(invocation: Rc<dyn Invocation>, mut script: VecDeque<Value>, mut output: Vec<Value>) {
+fn step(context: Context, mut script: VecDeque<Value>, mut output: Vec<Value>) {
   let Some(next) = script.pop_front() else {
-    let _ = invocation.settle(Ok(json!(output)));
+    let _ = context.settle(Ok(json!(output)));
     return;
   };
   let done = if let Some(text) = next.get("insert") {
-    invocation.draw().and_then(|id| invocation.run("INSERT INTO note (id, text) VALUES (?, ?)", &[json!(id), text.clone()])).map(|_| ())
+    // A GET has no op to draw an id from, and its `run` refuses before the id matters.
+    let id = context.op().map(|op| op.id()).unwrap_or_default();
+    context.run("INSERT INTO note (id, text) VALUES (?, ?)", &[json!(id), text.clone()]).map(|_| ())
   } else if next.get("read").is_some() {
-    texts(invocation.as_ref()).map(|seen| output.push(seen))
+    seen(context.as_ref()).map(|texts| output.push(texts))
   } else if let Some(why) = next["fail"].as_str() {
     Err(conflict(why))
   } else {
-    let call = Call::from_key(next["call"].as_str().unwrap()).unwrap();
     let catch = next["catch"] == json!(true);
-    let caller = Rc::clone(&invocation);
-    return invocation.send(call, next["input"].clone(), Box::new(move |result| match result {
+    let caller = Rc::clone(&context);
+    let key = next["call"].as_str().unwrap().to_string();
+    return context.call(&key, next["input"].clone(), Box::new(move |result| match result {
       Ok(value) => {
         output.push(value);
         step(caller, script, output)
@@ -111,9 +139,9 @@ fn step(invocation: Rc<dyn Invocation>, mut script: VecDeque<Value>, mut output:
     }));
   };
   match done {
-    Ok(()) => step(invocation, script, output),
+    Ok(()) => step(context, script, output),
     Err(error) => {
-      let _ = invocation.settle(Err(error));
+      let _ = context.settle(Err(error));
     }
   }
 }

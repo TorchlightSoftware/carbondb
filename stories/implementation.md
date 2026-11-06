@@ -1,6 +1,6 @@
 # CarbonDB first draft: implementation notes
 
-Status: agreed — single-node hello world built (build steps 1 to 3); replicated mode not started
+Status: agreed — single-node built (build steps 1 to 3), with the op log and results kept apart, per-service namespacing and init(); replicated mode not started
 
 This is everything we agreed that the code has to honour, gathered in one place for whoever builds the first draft. The nine numbered stories say what a person can do, [services.md](services.md) lists the builtin calls, and [oplog-examples.md](oplog-examples.md) shows them in use. This file covers what happens underneath. Where older notes disagree with it, this file wins.
 
@@ -8,10 +8,10 @@ The spec is the app interface: what an app calls and what CarbonDB guarantees in
 
 ## Build order
 
-1. **Single-node CarbonDB:** the Rust core behind napi-rs, with no p2panda, delivering the whole app interface below. Ops already apply through each space's RunQueue into its op log, the same path synced ops will take.
+1. **Single-node CarbonDB:** the Rust core behind napi-rs, with no p2panda, delivering the whole app interface below. Ops already go through each space's OpWriter, op log, pending ops and results, the same path synced ops will take, and each op already records its session changeset.
 2. **[chat] on it:** `main()` loads CarbonDB, registers [chat] with `carbon.services.add('chat', chat)` and gets a handle. [chat] stays small, resembling an ordinary backend service with minimal dependencies, with plain SQL and no build step.
 3. **A small JS HTTP adapter** in front of [chat]. The tests talk to it over HTTP.
-4. **Replicated mode:** sessions, rewind and p2panda spaces, switched on by config with no change to the app.
+4. **Replicated mode:** rewind and p2panda spaces, switched on by config with no change to the app.
 
 The hello world is create a space, post, edit, delete, list and watch, on single-node CarbonDB. Adding a member and joining (story 7) arrive with replicated mode. Richer service runtimes come later on the same app interface.
 
@@ -81,7 +81,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 - The TOML file names the system database, which holds identities and the system log. `configure` reads it once, and no other call takes a directory.
 - Each space file sits beside the system database, named by space id.
 - Each identity has its own p2panda store file beside it, because a p2panda node takes one set of credentials and one machine may hold several unlinkable identities. That means one p2panda node per identity on a device.
-- A space's op log and changesets live in its own file, so they commit atomically with application writes. The session attaches only service tables, using rusqlite's `table_filter`.
+- A space's op log and changesets live in its own file, so they commit atomically with application writes. The session records every table but the op log and results, using rusqlite's `table_filter`.
 
 ## Spaces and services
 
@@ -93,7 +93,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 - **`[space]`** runs in every replicated space: its origin, refs, members and manage list.
 - **`[identity]`** runs in identity spaces: the identity's origin. An app may run its own service of the same name, such as one holding roles, in other spaces; the two never share a space.
 - **`[device]`** follows `[space]`'s pattern: `POST [device]/origin` in the identity space authorizes a device's public key, and `POST [device]/ref` in the personal space records its name and tags. A second ref for the same key replaces the first.
-- **Local ops:** an op on a local service is kept in the op log of the space it ran in, marked with the device that ran it, and other devices skip it, so the log shows every action behind a space's state. Calls on the system handle, which belong to no space, go in the system log, the system database's op log. Either gives one place to finish interrupted work after a crash.
+- **Local ops:** an op on a local service is kept in the op log of the space it ran in, marked with the device that ran it, and replicated like any other, so the log shows every action behind a space's state. Other devices see it is not theirs and record a skipped result instead of running it. Calls on the system handle, which belong to no space, go in the system log, the system database's op log, with their results there. Either gives one place to finish interrupted work after a crash.
 
 ### Creating a space
 
@@ -123,8 +123,8 @@ Creating a space cannot be undone. If a rewind rejects a parent's ref, the space
 
 ## The op
 
-- An op is a service call: service key plus fields, plus op hash, device (signs and syncs), author (the person, for access control and audit), hybrid logical clock time and schema version. The schema version is the service's number of migrations.
-- An op from a newer schema version holds the space at that position until this device upgrades.
+- An op is a service call: service key plus fields, plus op hash, device (signs and syncs), author (the person, for access control and audit), hybrid logical clock time and version: the hash of the package that handles it.
+- For now, a device that does not run the version an op names refuses that op (see [old ops](backlog/old-ops.md)).
 - The author comes from the signed envelope, never from a field on the call.
 - The op hash is computed over CarbonDB's signed envelope before the handler runs. It is separate from the p2panda operation hash, which does not exist yet at that point and covers ciphertext.
 - Ops relate through the hybrid logical clock, not through lists of other ops. The one exception is the per-device removal cutoff.
@@ -136,44 +136,64 @@ Creating a space cannot be undone. If a rewind rejects a parent's ref, the space
 
 - Every replica sorts ops by (hybrid logical clock, device, op hash), drops duplicates, and re-runs the service's handler in that order, so business rules give the same result everywhere.
 - The core owns the order and the changesets, so it decides when a handler runs or re-runs. It routes every call by service name to the service's entry point, the same for Rust builtins, npm services and WASM packages, and the entry point settles it once.
-- Each space has one RunQueue for local calls and synced ops, and applies one op at a time. A local call takes its clock time when its turn comes, so it follows everything already applied.
-- An op is appended to its space's op log once, when it applies, in the same transaction, with its output and the calls it made, which stay on this device. A call refused on its author's device is never appended.
+- The op log records what this device received, local calls and synced ops alike. A space's OpWriter writes each op as it arrives, before it applies, as a durable queue would, so a crash loses nothing. While an op applies, its transaction holds the file, so an op arriving meanwhile is held by the OpWriter and written as soon as that turn ends, before the next op applies. Rows are never changed.
+- Results record what this device did with each op: applied, refused with its service error, or skipped as another device's local op, with its output and the calls it made. A result is keyed by its op hash and never leaves this device. A rewind replaces results; it never touches the log.
+- The pending ops are the op log minus the results: the ops with no result yet. They are read from the space's file each turn, never kept in memory, and apply one at a time in the shared order, so ops left without a result by a crash simply apply next time the space opens. A local call is stamped when it arrives, since that is when it is written; an op that arrives later but sorts earlier is handled by rewind.
+- Ops apply one at a time per space, and spaces apply side by side. A space is the finest unit: its services share one SQLite file, which has one writer, an op holds its transaction while its handler awaits, and one op's calls span services in the space.
+- Every op takes the same path, local or synced: the OpWriter logs it, it applies in turn, and its result is recorded. Nothing is refused before it is logged, so every failure is reported, audited and kept in the history the same way.
+- Pending ops apply only once every service the space names is set up on this device; until then the space is initializing, and its ops and their callers wait.
+- A call made on this device to a service it does not run carries the version `service missing`. It is logged, and refused when its turn comes, before any handler sees it; that refusal keeps it from running again and from being published.
+- The callers waiting on an op are kept beside it in memory, by op hash, and answered when its result is recorded. An op resumed from the log has none.
+- Each space has a RunState: initializing, with the named services not set up here yet; idle; applying an op; or stopped. The app can read it and watch it.
 - A call a handler makes runs inside the same op, under a savepoint: it sees the writes before it, and when it fails only its own writes roll back and the error reaches the handler that made it. A GET inside an op reads through the op's transaction. The exception is a local service writing to a replicated service: that write is an op of its own, since the local service never replicates. Replicated services never call local ones.
 
 The steps for each op:
 
-1. The core opens a transaction and a session on the space's database.
+1. The core opens a transaction on the space's database, with a session recording its changes.
 2. It hands the call to the service's entry point and waits for it to settle. Handlers may be async.
 3. Database calls from the handler are synchronous and run inside the open transaction.
-4. When the Promise resolves, the core commits and keeps the session's changeset with the op. When it rejects or returns an error, the core rolls back and records the op as rejected.
-5. The core gives the runtime one notice per commit: op, outcome and tables touched. `watch` is built on this, and apps get no separate event API.
+4. When the Promise resolves, the core records the op's result and commits, taking the session's changeset; replicated mode keeps it with the op. When it rejects or returns an error, the core rolls back and records the op's result as refused, with its error.
+5. The core gives the runtime one notice per commit: op, outcome and the tables its changeset changed. `watch` is built on this, and apps get no separate event API.
 
 Timeouts and refusals:
 
 - A call refused on the author's device is not published.
-- A rejection on a later replica stays in the log as rejected.
+- A rejection on a later replica leaves the op in the log; its result records the refusal, on that device only, and `[@error]` reads it (see [rejected after merge](backlog/rejected-after-merge.md)).
 - Every op stays in the log, so no data is lost. Each space gets a standard op history interface for finding a culprit op, such as a destructive offline edit, and reverting it. A revert is a new compensating op.
 - A handler that overruns a timeout rolls back. A local call is then refused and never published. A synced op is not recorded as rejected, because a timeout differs between replicas, so the space pauses, reports the error and retries.
+
+System failures:
+
+- A system failure is SQLite failing in itself, not the op: an I/O error, a full disk, the file busy or locked by another process, corruption, or memory. The store classifies them by SQLite's error code on every statement, a handler's own included, and keeps the first it meets, so a handler that catches the error cannot hide it. No statement waits for a lock.
+- Writing an op to the log or its result is never the op's own failure: when it fails the space stops too.
+- A stopped space neither logs nor applies ops. The op that was applying rolls back and stays pending, every caller waiting on its ops gets a 503 carrying the failure, and so does every new call and every watch. It stays stopped until the problem is fixed by hand and the space is resumed, likely from a button in the app; then its pending ops apply from the first. A failure stops only the space it hit.
 
 The runtime checks access while applying an op, against the space's state at that op's position in the shared order, so a late role change re-runs what read it. Replayed `[space]` handlers check manage from the log, not p2panda, because p2panda's current state differs between replicas.
 
 ### Reads
 
-GETs and watch re-runs use a second read-only connection in WAL mode, so they see committed state and cannot write. They answer from this device's copy, even when it is behind other members. SQLite's authorizer reports what a GET reads, and a watch re-runs when a committed op writes a table it read. A batch of synced ops re-runs a watch once.
+GETs and watch re-runs use a second read-only connection in WAL mode, so they see committed state and cannot write. They answer from this device's copy, even when it is behind other members. SQLite's authorizer reports what a GET reads, and a watch re-runs when a committed op's changeset changes a table it read. A batch of synced ops re-runs a watch once.
 
 ## Late ops and rewind
 
 - Each op's writes are recorded as a SQLite session changeset, which is both its undo record and its write set. The authorizer gives its read set, by table and column.
+- Rewind lives in its own module beside dispatch: it chooses the re-run set, inverts changesets newest first and re-runs. Inverting one changeset is a store primitive.
+- Taking the write set from the changeset, in single-node mode too, was chosen over the authorizer's record of written tables:
+  - It is exact. The authorizer counts a table as written when a statement naming it is prepared, even one that changes no rows; a changeset holds only net row changes, so a no-op update or an insert deleted again re-runs no watch.
+  - It is one record. What a watch treats as written is exactly what rewind undoes and checks for overlap, so they cannot disagree.
+  - It costs a session on every op in single-node mode too, recording old values and reading each changed table's columns once per op. This is to be measured, not estimated.
+  - The core's own tables, the op log and results, leave the write set, since the session leaves them out. No watch reads them.
+  - A savepoint rolled back inside the transaction leaves nothing in the changeset, as the [session spike](../spikes/session-rowid/README.md) shows, so a failed nested call neither re-runs watches nor reaches rewind.
 - A late op whose reads and writes do not overlap later ops applies in place, with no rewind.
 - Otherwise the re-run set is the transitive closure: every later op that read or wrote what the late op, or an op already in the set, wrote. Those changesets are inverted newest first, the late op applies, and the set re-runs in order.
 - The `append` tag is an author's promise that no handler depends on the row being absent. A late tagged op applies in place and re-runs nothing.
 - The core treats tags as opaque flags. A tagged op whose changeset holds anything but inserts is rejected on every replica. A wrong promise about reads is not detected at runtime; the test harness catches it.
-- The core refuses a migration that leaves a service table without a primary key, read from `sqlite_schema`, since sessions do not record such tables and undo would silently miss them. Sessions do not record schema changes either.
+- A row's key comes from the op that creates it, never from the rows already in the table: a key SQLite assigns, a rowid or an AUTOINCREMENT id, depends on those rows, so after a rewind it can move under the row's author. After a service's `init`, the core checks every table it owns has a primary key that is not SQLite's rowid, and refuses the service with an error naming the table, what to change and why. Handlers take keys from `op.id()`, or an integer key from `DEFAULT (op_id())`, a SQL function every runtime registers that draws below 2^53. Sessions do not record schema changes, so schema changes only in `init`, outside any op.
 - A later refinement can narrow read sets to rows through QueryRunner predicates.
 
 ## Publishing
 
-- The op log row is the outbox. It commits with the application writes, and a publisher drains unpublished rows, also after a crash. Duplicates drop by op hash.
+- The op log is the outbox. A publisher drains this device's ops whose result applied, also after a crash; a call refused on its own device stays in the log unpublished, its result saying why. Duplicates drop by op hash.
 - p2panda streams replay unacknowledged operations after a restart, so the core acknowledges after commit to cover a crash on the receiving side.
 - A call resolves once this device has applied it, without waiting for other members.
 
@@ -191,7 +211,7 @@ Every state change belongs to one class, as in the table in [README.md](README.m
 - SQLite state is a pure fold of valid ops, and can be thrown away and rebuilt.
 - Handlers take time, ids and randomness from the op context, never from `Date.now`, `randomUUID` or `Math.random`. The author picks ids and timestamps, and they travel in the op.
 - Rules needing global knowledge, such as uniqueness or a non-negative balance, are modelled as visible conflicts or resolved deterministically.
-- Every table has a primary key.
+- A row's key comes from the op that creates it: `op.id()`, or `DEFAULT (op_id())` in a WITHOUT ROWID table.
 - All implementations of one service in a space must behave identically, or replicas drift silently. This is a documented rule, not a mechanism.
 - Traditional models work with last-writer-wins from the shared order; better mergeable data structures come from schema design.
 

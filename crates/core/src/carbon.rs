@@ -1,6 +1,7 @@
 //! This device's CarbonDB: its config, its clock, the services it runs, the
-//! system database as its root space, and the spaces opened so far. Every call
-//! goes through `submit`, in `dispatch`.
+//! system database as its root space, the spaces opened so far, and who
+//! listens for their commits and RunStates. Every call goes through `submit`,
+//! in `dispatch`.
 //!
 //! This is the single-node core: no p2panda and no network. Calls that need
 //! peers are refused.
@@ -14,12 +15,21 @@ use serde_json::Value;
 
 use crate::clock::Clock;
 use crate::config::{Config, SyncMode};
-use crate::error::{Result, bad_request, not_built};
+use crate::error::{Result, bad_request, internal, not_built};
 use crate::op::stamp;
 use crate::services::carbon::{self as local, Identity};
-use crate::services::Services;
-use crate::space::{self, Space};
-use crate::{Actor, Call, Op, now};
+use crate::services::{Service, Services};
+use crate::space::{self, RunState, Space};
+use crate::{Actor, Call, Op};
+
+// Called with the tables each commit to a space wrote.
+pub type Listener = Rc<dyn Fn(&[String])>;
+
+// Called with a space's RunState each time it changes.
+pub type RunStateListener = Rc<dyn Fn(&RunState)>;
+
+// How an opened space reaches whoever asked for it.
+pub type Opened = Box<dyn FnOnce(Result<Rc<Space>>)>;
 
 pub struct Carbon {
   config: Config,
@@ -27,6 +37,8 @@ pub struct Carbon {
   services: Services,
   system: Rc<Space>,
   spaces: RefCell<HashMap<String, Rc<Space>>>,
+  listeners: RefCell<HashMap<String, Vec<Listener>>>,
+  run_state_listeners: RefCell<HashMap<String, Vec<RunStateListener>>>,
 }
 
 impl Carbon {
@@ -37,7 +49,17 @@ impl Carbon {
     }
     std::fs::create_dir_all(config.directory()).map_err(|error| bad_request(format!("Cannot create {}: {error}", config.directory().display())))?;
     let system = Rc::new(Space::root(local::open_system(&config.system)?)?);
-    Ok(Rc::new(Carbon { config, clock: Clock::default(), services: Services::builtin(), system, spaces: RefCell::default() }))
+    let carbon = Rc::new(Carbon {
+      config,
+      clock: Clock::default(),
+      services: Services::builtin(),
+      system,
+      spaces: RefCell::default(),
+      listeners: RefCell::default(),
+      run_state_listeners: RefCell::default(),
+    });
+    carbon.drain(&carbon.system);
+    Ok(carbon)
   }
 
   pub fn services(&self) -> &Services {
@@ -49,9 +71,20 @@ impl Carbon {
     &self.system
   }
 
+  // Register an app's service, and set it up in every open space that names it.
+  pub fn register(self: &Rc<Self>, service: Service) -> Result<()> {
+    let service = self.services.register(service)?;
+    let naming: Vec<Rc<Space>> = self.spaces.borrow().values().filter(|space| space.names(&service.name)).cloned().collect();
+    for space in naming {
+      space.set_up(&service)?;
+      self.drain(&space);
+    }
+    Ok(())
+  }
+
   // Stamp a call as an op, now.
   pub(crate) fn stamp(&self, actor: &Actor, call: &Call, input: &Value) -> Op {
-    stamp(actor, call, input, self.services.version(&call.service), self.clock.now())
+    stamp(actor, call, input, &self.services.version(&call.service), self.clock.now())
   }
 
   // Where a space's database sits: beside the system database, named by space id.
@@ -59,55 +92,121 @@ impl Carbon {
     self.config.directory().join(format!("{id}.db"))
   }
 
-  // A space on this device, opened on first use with every service it has
-  // provisioned provisioned again. A space running a service this device does
-  // not run is refused.
-  pub fn space(&self, id: &str) -> Result<Rc<Space>> {
-    if let Some(space) = self.spaces.borrow().get(id) {
-      return Ok(Rc::clone(space));
+  // The ids of every space on this device.
+  pub fn space_ids(&self) -> Result<Vec<String>> {
+    let entries = std::fs::read_dir(self.config.directory()).map_err(|error| internal(format!("Cannot list spaces: {error}")))?;
+    let mut ids: Vec<String> = entries
+      .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+      .filter(|path| path.extension().is_some_and(|extension| extension == "db") && *path != self.config.system)
+      .filter_map(|path| path.file_stem().map(|stem| stem.to_string_lossy().to_string()))
+      .collect();
+    ids.sort();
+    Ok(ids)
+  }
+
+  // A space on this device, opened on first use: `[space]` is set up first,
+  // then `GET [space]/origin` names the services it runs, and each registered
+  // there is set up too. A service this device does not run is refused when it
+  // is called.
+  pub fn with_space(self: &Rc<Self>, id: &str, opened: Opened) {
+    let cached = self.spaces.borrow().get(id).cloned();
+    if let Some(space) = cached {
+      return opened(Ok(space));
     }
     let path = self.space_path(id);
     if !path.exists() {
-      return Err(space::missing(id));
+      return opened(Err(space::missing(id)));
     }
-    let opened = Rc::new(Space::open(&path, id)?);
-    self.provision(&opened, &opened.provisioned()?)?;
-    self.spaces.borrow_mut().insert(id.to_string(), Rc::clone(&opened));
-    Ok(opened)
+    let space = match Space::open(&path, id).map(Rc::new).and_then(|space| space.set_up(&self.services.get("space")?).map(|_| space)) {
+      Ok(space) => space,
+      Err(error) => return opened(Err(error)),
+    };
+    let carbon = Rc::clone(self);
+    let origin = Call::from_key("GET [space]/origin").expect("a builtin key parses");
+    self.submit(&Rc::clone(&space), Actor::default(), origin, Value::Null, Box::new(move |origin| {
+      let named = match origin {
+        Ok(origin) => serde_json::from_value(origin.value["services"].clone()).unwrap_or_default(),
+        Err(error) if error.status == 404 => vec![],
+        Err(error) => return opened(Err(error)),
+      };
+      opened(carbon.keep_open(space, &named))
+    }));
+  }
+
+  // Name a space's services, set up those this device runs, and keep it open.
+  fn keep_open(self: &Rc<Self>, space: Rc<Space>, named: &[String]) -> Result<Rc<Space>> {
+    space.name(named);
+    for service in named.iter().filter_map(|name| self.services.find(name)) {
+      space.set_up(&service)?;
+    }
+    self.spaces.borrow_mut().insert(space.id.clone(), Rc::clone(&space));
+    self.drain(&space);
+    Ok(space)
   }
 
   // A new space, running only `[space]` until its origin op names the rest.
-  pub(crate) fn create_space(&self, id: &str) -> Result<Rc<Space>> {
+  pub(crate) fn create_space(self: &Rc<Self>, id: &str) -> Result<Rc<Space>> {
     let created = Rc::new(Space::create(&self.space_path(id), id)?);
-    self.provision(&created, &["space".to_string()])?;
-    self.spaces.borrow_mut().insert(id.to_string(), Rc::clone(&created));
-    Ok(created)
+    created.set_up(&self.services.get("space")?)?;
+    self.keep_open(created, &[])
   }
 
-  // Provision the services a space names: every one must run on this device.
-  pub(crate) fn provision(&self, space: &Space, names: &[String]) -> Result<()> {
-    for name in names {
-      space.provision(self.services.get(name)?.as_ref())?;
-    }
-    Ok(())
+  // Set up the services a new space's origin names, once that origin applies:
+  // every one must run on this device.
+  pub(crate) fn set_up(self: &Rc<Self>, space: &Rc<Space>, names: &[String]) -> Result<()> {
+    self.services.require_registered(names)?;
+    self.keep_open(Rc::clone(space), names).map(|_| ())
   }
 
   pub fn identity(&self, slug: &str) -> Result<Identity> {
     local::find(&self.system.store().reader()?, slug)
   }
 
-  // Ask a space's services something on the host's own behalf, as a call
-  // answered at once, as CarbonDB's own services answer.
-  pub fn ask(self: &Rc<Self>, space: &Rc<Space>, key: &str, input: Value) -> Result<Value> {
-    let call = Call::from_key(key)?;
-    now(|reply| self.submit(space, Actor::default(), call, input, Box::new(move |settled| reply(settled.map(|settled| settled.value)))))
+  // Hear every commit to a space, with the tables it wrote, whether or not it is open yet.
+  pub fn listen(&self, space: &str, listener: Listener) {
+    self.listeners.borrow_mut().entry(space.to_string()).or_default().push(listener);
+  }
+
+  // Tell every listener what a commit to a space wrote.
+  pub(crate) fn committed(&self, space: &str, tables: &[String]) {
+    let listeners = self.listeners.borrow().get(space).cloned().unwrap_or_default();
+    for listener in listeners {
+      listener(tables);
+    }
+  }
+
+  // A space's RunState: idle until it is opened.
+  pub fn run_state(&self, space: &str) -> RunState {
+    self.opened(space).map_or(RunState::Idle, |space| space.run_state())
+  }
+
+  // Hear every change of a space's RunState, whether or not it is open yet.
+  pub fn listen_run_state(&self, space: &str, listener: RunStateListener) {
+    self.run_state_listeners.borrow_mut().entry(space.to_string()).or_default().push(listener);
+  }
+
+  // Move a space to a RunState, and tell whoever listens.
+  pub(crate) fn set_run_state(&self, space: &Space, state: RunState) {
+    space.set_run_state(state.clone());
+    let listeners = self.run_state_listeners.borrow().get(&space.id).cloned().unwrap_or_default();
+    for listener in listeners {
+      listener(&state);
+    }
+  }
+
+  // A space already open on this device, the root space included.
+  fn opened(&self, id: &str) -> Option<Rc<Space>> {
+    if id == self.system.id {
+      return Some(Rc::clone(&self.system));
+    }
+    self.spaces.borrow().get(id).cloned()
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::testing::{actor, alice, call_now, carbon};
+  use crate::testing::{actor, alice, call_now, carbon, space_now};
   use serde_json::json;
 
   #[test]
@@ -122,7 +221,7 @@ mod tests {
   fn routes_by_service_name_and_refuses_services_it_does_not_run() {
     let (_directory, carbon) = carbon();
     let identity = alice(&carbon);
-    let personal = carbon.space(&identity.personal).unwrap();
+    let personal = space_now(&carbon, &identity.personal).unwrap();
     let system = Rc::clone(carbon.system());
     assert_eq!(call_now(&carbon, &personal, &actor(&identity), "GET [device]/refs", Value::Null).unwrap().value[0]["name"], json!("Pixel9"));
     assert_eq!(call_now(&carbon, &system, &Actor::default(), "GET [@carbon]/identities", Value::Null).unwrap().value[0]["slug"], json!("alice"));
@@ -140,13 +239,20 @@ mod tests {
   }
 
   #[test]
-  fn refuses_a_space_naming_a_service_it_does_not_run() {
+  fn opens_a_space_naming_a_service_it_does_not_run_and_refuses_calls_to_it_until_registered() {
     let (directory, carbon) = carbon();
     let identity = alice(&carbon);
     drop(carbon);
-    let config = directory.path().join("carbondb.toml");
-    let restarted = Carbon::open(&config).unwrap();
-    let error = restarted.space(&identity.personal).err().unwrap();
+    let restarted = Carbon::open(&directory.path().join("carbondb.toml")).unwrap();
+    assert_eq!(restarted.space_ids().unwrap(), {
+      let mut ids = vec![identity.space.clone(), identity.personal.clone()];
+      ids.sort();
+      ids
+    });
+    let personal = space_now(&restarted, &identity.personal).unwrap();
+    let error = call_now(&restarted, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap_err();
     assert_eq!((error.status, error.details), (404, Some(json!({"service": "notes"}))));
+    crate::testing::register_notes(&restarted);
+    assert_eq!(call_now(&restarted, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap().value, json!([]));
   }
 }
