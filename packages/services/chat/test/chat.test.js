@@ -101,13 +101,7 @@ describe('status', () => {
 describe('watch', () => {
   it('lists the messages again after each message is posted', async () => {
     const seen = []
-    let first
-    const listed = new Promise((resolve) => { first = resolve })
-    const stop = lobby.watch('GET [chat]/messages', (value) => {
-      seen.push(value.map((message) => message.text))
-      first()
-    })
-    await listed
+    const stop = lobby.watch('GET [chat]/messages', (value) => seen.push(value.map((message) => message.text)))
     await lobby.call('POST [chat]/messages', {text: 'live'})
     stop()
     assert.deepStrictEqual(seen, [[], ['live']])

@@ -1110,3 +1110,18 @@ Can you move "services" under "packages"?
 Get rid of "examples".
 
 Move "components" and "platforms" under "perspectives/brandon".
+
+---
+
+    - [chat] now has no tests at all. The 16 end-to-end tests in examples/chat-server were the only ones exercising it, and packages/services/chat has none of its own.
+
+Huh?  Ok, can you explain this?  Is there a better way of structuring so that we retain the tests, but group them with the service where they belong?
+
+---
+
+    - The authorizer
+    - The session extension
+
+Right.
+
+

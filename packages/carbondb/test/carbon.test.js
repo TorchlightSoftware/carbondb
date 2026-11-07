@@ -11,6 +11,15 @@ import {applyMigrations} from '../src/migrations.js'
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 2))
 
+// A GET that reads at once but answers only when the test opens the gate, so a
+// commit can land while it is in flight.
+let gate = Promise.resolve()
+function closeGate() {
+  let open
+  gate = new Promise((resolve) => { open = resolve })
+  return open
+}
+
 // A small service exercising what the runtime offers a handler.
 const notes = {
   migrations: [
@@ -54,7 +63,23 @@ const notes = {
     'GET [notes]/notes': {handler: ({db}) => db.all('SELECT text FROM note ORDER BY at, text')},
     'GET [notes]/writes': {handler: ({call}) => call('POST [notes]/tags', {name: 'red'})},
     'POST [notes]/tags': {handler: ({input, db}) => db.run('INSERT INTO tag (name) VALUES (?)', [input.name])},
-    'GET [notes]/broken': {handler: ({db}) => db.all('SELECT * FROM nowhere')}
+    'GET [notes]/broken': {handler: ({db}) => db.all('SELECT * FROM nowhere')},
+    'GET [notes]/gated': {
+      handler: async ({db}) => {
+        const notes = db.all('SELECT text FROM note ORDER BY at, text')
+        await gate
+        return notes
+      }
+    },
+    // Reads the notes only once a tag exists, so its read set grows.
+    'GET [notes]/tagged': {
+      handler: async ({db}) => {
+        const tags = db.all('SELECT name FROM tag')
+        const notes = tags.length ? db.all('SELECT text FROM note ORDER BY at, text') : []
+        await gate
+        return {tags: tags.map((tag) => tag.name), notes: notes.map((note) => note.text)}
+      }
+    }
   }
 }
 
@@ -276,6 +301,39 @@ describe('watch', () => {
     await arrival()
     await personal.call('POST [notes]/notes', {text: 'seen'})
     assert.deepStrictEqual(results.at(-1), [{text: 'seen'}, {text: 'seen again'}])
+  })
+
+  it('has run again by the time a call resolves when watched and called at once', async () => {
+    const {results} = watching(personal, 'GET [notes]/notes')
+    await personal.call('POST [notes]/notes', {text: 'at once'})
+    assert.deepStrictEqual(results.at(-1), await personal.call('GET [notes]/notes'))
+    assert.deepStrictEqual(results.at(-1), [{text: 'at once'}, {text: 'at once again'}])
+  })
+
+  it('runs again after a commit lands while its GET is in flight', async () => {
+    const open = closeGate()
+    const {results} = watching(personal, 'GET [notes]/gated')
+    const posted = personal.call('POST [notes]/notes', {text: 'during'})
+    await tick()
+    await tick()
+    open()
+    await posted
+    assert.deepStrictEqual(results, [[], [{text: 'during'}, {text: 'during again'}]])
+    assert.deepStrictEqual(results.at(-1), await personal.call('GET [notes]/gated'))
+  })
+
+  it('judges a commit in flight by what the run read, even when its read set grew', async () => {
+    const {results, arrival} = watching(personal, 'GET [notes]/tagged')
+    await arrival()
+    const open = closeGate()
+    const tagged = personal.call('POST [notes]/tags', {name: 'red'})
+    const posted = personal.call('POST [notes]/notes', {text: 'seen'})
+    await tick()
+    await tick()
+    open()
+    await Promise.all([tagged, posted])
+    assert.deepStrictEqual(results.at(-1), {tags: ['red'], notes: ['seen', 'seen again']})
+    assert.deepStrictEqual(results.at(-1), await personal.call('GET [notes]/tagged'))
   })
 
   it('hands a failing GET its error', async () => {

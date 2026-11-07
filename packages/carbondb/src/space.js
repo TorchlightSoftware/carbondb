@@ -16,6 +16,7 @@
 import {internalError} from '@tlsft/service-error'
 import {answered, core} from './native.js'
 import {parseKey} from './routes.js'
+import {committed, finished, outdated, started, unseen} from './watch.js'
 
 // The actor the runtime reads refs as: none, since refs are open to anyone here.
 const RUNTIME = {identity: null, device: null}
@@ -97,7 +98,7 @@ export class Space {
     const stopped = state.state === 'stopped'
     if (stopped === this.#stopped) return
     this.#stopped = stopped
-    for (const watch of this.#watches) watch.dirty = true
+    for (const watch of this.#watches) watch.state = outdated(watch.state)
     this.#refreshing = Promise.all([...this.#watches].map((watch) => this.#rerun(watch)))
   }
 
@@ -105,7 +106,7 @@ export class Space {
   // `fn` receives each result, or undefined and the error when the GET fails.
   watch(actor, key, fn) {
     this.#listen()
-    const watch = {actor, key, fn, tables: new Set(), dirty: true, settling: null, stopped: false}
+    const watch = {actor, key, fn, state: unseen(), settling: null, stopped: false}
     this.#watches.add(watch)
     this.#rerun(watch)
     return () => {
@@ -124,10 +125,7 @@ export class Space {
 
   // A commit: re-run the watches it touched, and hold calls until they have.
   #changed(tables) {
-    const written = new Set(tables)
-    for (const watch of this.#watches) {
-      if ([...watch.tables].some((table) => written.has(table))) watch.dirty = true
-    }
+    for (const watch of this.#watches) watch.state = committed(watch.state, tables)
     this.#refreshing = Promise.all([...this.#watches].map((watch) => this.#rerun(watch)))
   }
 
@@ -135,17 +133,17 @@ export class Space {
   #rerun(watch) {
     watch.settling ??= this.#settle(watch).then(() => {
       watch.settling = null
-      return watch.dirty && !watch.stopped ? this.#rerun(watch) : undefined
+      return watch.state.stale && !watch.stopped ? this.#rerun(watch) : undefined
     })
     return watch.settling
   }
 
   async #settle(watch) {
-    while (watch.dirty && !watch.stopped) {
-      watch.dirty = false
+    while (watch.state.stale && !watch.stopped) {
+      watch.state = started(watch.state)
       const {value, tables, error} = await this.#request(watch.actor, watch.key).catch((thrown) => ({error: thrown}))
       if (watch.stopped) return
-      if (tables) watch.tables = new Set(tables)
+      watch.state = finished(watch.state, tables)
       deliver(watch.fn, value, error)
     }
   }
