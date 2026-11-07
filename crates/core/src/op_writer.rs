@@ -58,7 +58,7 @@ mod tests {
   fn writes_an_op_at_once_unless_another_applies_then_when_its_turn_ends() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(&directory.path().join("s.db")).unwrap();
-    store.run_batch(oplog::SCHEMA).unwrap();
+    store.migrate(crate::space::MIGRATIONS).unwrap();
     let writer = OpWriter::default();
     writer.write(&store, false, op("a", 1)).unwrap();
     writer.write(&store, true, op("b", 2)).unwrap();

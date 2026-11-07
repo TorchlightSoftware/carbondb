@@ -7,7 +7,9 @@
 //! rewind will undo, and the write set a commit notice carries, since it holds
 //! only rows whose values changed. A call made inside an op runs under a
 //! savepoint, so its writes roll back alone when it fails, and leave nothing in
-//! the changeset. The op log and results are left out of it.
+//! the changeset. The op log, results and the core's migrations are left out of
+//! it. The core's own tables move forward by migrations, applied when the file
+//! opens and tracked in `carbon_migrations`.
 //!
 //! Each top-level GET opens its own read-only `Reader`, which in WAL mode sees
 //! only committed state and records every table it reads, the read set `watch`
@@ -29,17 +31,22 @@ use std::time::Duration;
 use rusqlite::fallible_streaming_iterator::FallibleStreamingIterator;
 use rusqlite::session::{ChangesetIter, Session};
 use rusqlite::types::Value as Sql;
-use rusqlite::{Connection, OpenFlags, params_from_iter};
+use rusqlite::fallible_iterator::FallibleIterator;
+use rusqlite::{Batch, Connection, OpenFlags, params_from_iter};
 use self_cell::self_cell;
 use serde_json::{Map, Value};
 
 pub use carbondb_service_bindings::Db;
+use carbondb_service_bindings::migrations::{self, Migration};
 
 use crate::call_window::{CallWindow, Scoped, Shared, guard, start_reading, stop_reading};
-use crate::error::{Result, ServiceError, is_system_failure, sqlite};
+use crate::error::{Result, ServiceError, bad_request, is_system_failure, sqlite};
 
 // The core's own record of a space, which no rewind undoes.
-const UNRECORDED: [&str; 2] = ["carbon_oplog", "carbon_result"];
+const UNRECORDED: [&str; 3] = ["carbon_oplog", "carbon_result", MIGRATED];
+
+// Where a file tracks the migrations of the core's own tables.
+const MIGRATED: &str = "carbon_migrations";
 
 // The first system failure met on a store's connections, shared with its readers.
 pub(crate) type Failure = Rc<RefCell<Option<ServiceError>>>;
@@ -153,7 +160,13 @@ impl Store {
     Ok(Reader { connection, access, failure: Rc::clone(&self.failure) })
   }
 
-  // Several statements with no parameters, such as the core's own schema.
+  // Bring the core's own tables in this file up to date, in one transaction:
+  // forward only, refusing a file that newer code has migrated.
+  pub fn migrate(&self, migrations: &[Migration]) -> Result<()> {
+    self.write(|store| migrations::apply(store, MIGRATED, migrations)).map(|_| ())
+  }
+
+  // Several statements with no parameters.
   pub fn run_batch(&self, sql: &str) -> Result<()> {
     batch(self.connection(), &self.failure, sql)
   }
@@ -236,8 +249,32 @@ pub(crate) fn batch(connection: &Connection, failure: &Failure, sql: &str) -> Re
   checked(failure, connection.execute_batch(sql))
 }
 
+// Run SQL as the `db` binding promises: one statement with its parameters, or
+// several with none, as a migration holds. Returns the rows it changed.
 pub(crate) fn run(connection: &Connection, failure: &Failure, sql: &str, params: &[Value]) -> Result<u64> {
-  checked(failure, connection.execute(sql, params_from_iter(params.iter().map(to_sql)))).map(|changed| changed as u64)
+  match params.is_empty() {
+    true => each(connection, failure, sql),
+    false => one(connection, failure, sql, params),
+  }
+}
+
+// One statement with its parameters; several are refused before any runs.
+fn one(connection: &Connection, failure: &Failure, sql: &str, params: &[Value]) -> Result<u64> {
+  match connection.execute(sql, params_from_iter(params.iter().map(to_sql))) {
+    Err(rusqlite::Error::MultipleStatement) => Err(bad_request("Several statements run only without parameters")),
+    executed => checked(failure, executed).map(|changed| changed as u64),
+  }
+}
+
+// Statements with no parameters, each prepared once the one before it has run,
+// since it may name what that one created.
+fn each(connection: &Connection, failure: &Failure, sql: &str) -> Result<u64> {
+  let mut statements = Batch::new(connection, sql);
+  let mut changed = None;
+  while let Some(mut statement) = checked(failure, statements.next())? {
+    changed = Some(changed.unwrap_or(0) + checked(failure, statement.execute([]))? as u64);
+  }
+  changed.ok_or_else(|| bad_request("No SQL statement to run"))
 }
 
 pub(crate) fn all(connection: &Connection, failure: &Failure, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
@@ -299,6 +336,32 @@ mod tests {
 
   fn texts(db: &dyn Db) -> Vec<Value> {
     db.all("SELECT id FROM message ORDER BY id", &[]).unwrap().into_iter().map(|row| row["id"].clone()).collect()
+  }
+
+  // A case of `run`: its SQL and parameters, the rows it changed or the status
+  // it failed with, and the messages left after it.
+  type RunCase = (&'static str, &'static str, Vec<Value>, std::result::Result<u64, u16>, Vec<Value>);
+
+  #[test]
+  fn runs_one_statement_with_its_parameters_or_several_without_each_in_turn() {
+    let cases: [RunCase; 5] = [
+      ("one statement with its parameters", "INSERT INTO message (id) VALUES (?)", vec![json!("a")], Ok(1), vec![json!("a")]),
+      (
+        "several without, each prepared once the one before it has run",
+        "CREATE TABLE extra (id TEXT PRIMARY KEY) WITHOUT ROWID; INSERT INTO extra (id) VALUES ('x'); INSERT INTO message (id) VALUES ('b'), ('c')",
+        vec![],
+        Ok(3),
+        vec![json!("b"), json!("c")],
+      ),
+      ("several with parameters, refused before any runs", "INSERT INTO message (id) VALUES (?); INSERT INTO message (id) VALUES ('d')", vec![json!("a")], Err(400), vec![]),
+      ("no statement", "", vec![], Err(400), vec![]),
+      ("only a comment", "-- nothing to run", vec![], Err(400), vec![]),
+    ];
+    for (name, sql, params, expected, ids) in cases {
+      let (_directory, store) = store();
+      assert_eq!(store.run(sql, &params).map_err(|error| error.status), expected, "{name}");
+      assert_eq!(texts(&store), ids, "{name}");
+    }
   }
 
   #[test]

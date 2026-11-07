@@ -1124,4 +1124,156 @@ Huh?  Ok, can you explain this?  Is there a better way of structuring so that we
 
 Right.
 
+---
+
+Oh, I see.  Normally ops are replicated, and so we don't need to replicate sub-ops: that would produce exponential expansion.  But local services need to be handled differently, their sub-ops still need to be applied.  So we need a way to replay the replicated ops without replaying the parent op (which contains system calls).
+
+I think the only sensible way to do that is to replicate the sub-ops in this case.  What do you think?
+
+---
+
+    You have it right, and the code already does this.
+
+Ok, so then we can close this topic.
+
+    The two design docs disagree on whether the parent op leaves the device
+
+Then update them.  We've had several conceptions of how this should be implemented: now you know where it landed.
+
+    Should the parent op travel to other devices as an audit entry, or stay local?
+
+Don't mess with it.  It's correct already, and you're attempting to backport an old, wrong notion.
+
+    implementation.md:232 already has a section titled "No secrets in replicated ops"
+
+That's a pedantic and wrong interpretation.
+
+    On this device, a sub-op runs inside the parent's transaction, so it can see whatever the local service wrote before it.
+
+This is the one area where we're screwing ourselves a bit, and might need a second look.  We've broken out of the transactional context by sending out the child logs.
+
+Two possibilities:
+
+A:
+1) Instead of replicating the child logs, store the sub-op calls on the parent, complete with their input arguments so you have perfect replay on the peers
+2) peers interpret the presence of a "local only, already run on another peer" op as "run the subops in a transaction, but don't run the parent op"
+3) this retains our transactional enclosure
+
+B:
+1) Store some kind of "parent" reference on all the subops, or a "tx" field for grouping them all in one transaction
+2) normal ops have either no parent, or no tx, or a tx that doesn't match any other ops
+3) this retains our transactional enclosure
+
+What do you think?
+
+---
+
+    Your "don't replicate until it is done" needs no exception: the publisher already sends only ops whose result applied
+
+Fair.  So we just update local ops with the additional information just before replication.
+
+    - The sub-calls would be filled in within the same transaction that records the op's result, so the log row and the result commit together or not at all.
+
+Good.
+
+    The op hash won't cover the sub-calls.
+
+That's perfectly fine.  We just document that.  The subcalls aren't a part of the call signature, so we don't need them in order to properly key a hash.
+
+    Replay repeats the recorded calls, not the parent's logic.
+
+That's fair...  Do we need to protect these system calls in any way against replays?  Or say that they cannot consume a value that might be subject to rewind/replay?
+
+    The logic at crates/core/src/service_call.rs:212, where a sub-op writes its own log row and result inside the parent's transaction, goes away
+  // End a call's savepoint, keeping its writes or rolling them back. An op of
+  // its own goes in the log with its result either way.
+
+1) "inside the parent's transaction" - By "transaction" do you really mean oplog/results records?  Your statement here seems to muddy several different concepts.
+2) I think what you're saying is that this code was designed for the transactional nesting of sub-calls into the parent context
+3) I'm not sure why that goes away, since all other calls that are not local still need it
+4) does the code we are implementing for local somehow cover both cases?
+5) are you proposing to record sub-calls for all calls, universally, not just local ones?
+6) and was that already happening?
+
+    Still open: does every replay of a local op, including rewind on the device that ran it, run its recorded sub-calls the same way? 
+
+Yes, and the question feels redundant.  If the answer were "no" then we would be abandoning eventual consistency gaurantees that are fundamental to the whole system we're designing.
+
+We've opened up several subthreads.  Record them to the agenda and just speak to me about one item at a time.
+
+---
+
+    5. No. The list of sub-calls that travels with the op is for local ops only.
+
+And to be clear: it should be RECORDED for local ops only, not just INTEPRETED for local ops only, correct?
+
+    6. Recording sub-calls was already happening for every op, but only as an audit trail on this device.
+
+Right, you mean the results log.  That matches my understanding.
+
+1-4: these all use jargon I'm unfamiliar with, from your internal implementation details.  We don't need to get into that right now.
+
+    Is a local op's sub-call list its own record, separate from that audit tree?
+
+    The audit tree (CallRecord, crates/core/src/service_call.rs:41-56) holds a sub-op's hash
+
+It sounds like you're using three different terms - "audit tree", "CallRecord" and "results" - to describe the same thing.  Am I right about that, and could you consolidate to using "results" more consistently, which is our agreed upon domain language?
+
+---
+
+    Open question: should a local op's sub-call list be kept apart from its result?
+
+This feels obvious/redundant considering decisions we have already made.
+
+We're putting the sub-call list in the same record with the op, in the oplog.  I don't think there's anything ambiguous about that, and I don't know why you're asking about it with regards to the results log.
+
+---
+
+    rewind can't re-run a system call, so it needs no protection there
+
+When you say it can't re-run a system call, I think you mean a "local" call, and that's because we were already preventing that from happening.  But now with the new interpretation of local calls: It doesn't rerun it from the root, but it reruns all the replicated sub-calls.  Maybe that's fine, no conflict?
+
+    The one replay that does re-run system calls is a crash in the middle of a local op.
+
+Agreed, backlog, we don't need to talk about that now.
+
+    My proposal: add one rule for service authors to stories/implementation.md. A local op's sub-call inputs should state what it did, like the ids and keys it created
+
+That doesn't make any sense to me.  I don't see any cause for further restraints on local op writers.  And your language "should state what it did" is confusing and vague, and I think duplicates the records that core is already keeping.  And is therefore redundant and useless.
+
+To conclude: is there any evidence or cause for concern about how the new version of local calls (system or not) will run with regards to replication and replay?  Or can we retire this topic?
+
+---
+
+    My proposal: record only the ones that committed. A refused sub-call changed nothing, so replaying it adds nothing.
+
+That's fair.  The results log still shows the exact outcome of calls.
+
+    Second question: build the replay now or later?
+
+Wait for replication.
+
+Proceed.
+
+---
+
+    The helper always names its tracking table d1_migrations
+
+Yeah, don't do that.  You don't need to copy pasta Cloudflare naming into a context where it's not needed at all.  We decided that CarbonDB core doesn't enforce any particular practices around migrations, remember?  So they don't need to be named consistently on a per service basis.  It sounds like they're already prefixed "carbon_" so if you just name the table "migrations" you're good.
+
+    Open question: adopt the helper for the core's tables now, or wait for a first release and delete dev databases until then?
+
+Adopt the helper, but we will probably still from time to time blow away the definitions and consolidate them until we get to a 1.0 release.
+
+Ready to implement?
+
+---
+
+I would like to review with you the `packages/carbondb/src` code.  I want to ensure that:
+
+1) no state of "CarbonDB" is contained within the JS code: all state should be in rust
+2) the JS logic is kept very minimal, it should just proxy to Rust
+
+Update the agenda with any violations of these rules that you find.  Prefix your topics with `JS:`.  For each topic either provide justification for why it needs to be that way, or admission that it should be folded into the core Rust code.
+
 

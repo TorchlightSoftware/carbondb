@@ -1,14 +1,13 @@
 //! The op log of a space, or of the system database: what this device
 //! received, each op written as it arrives, before it applies, and never
-//! changed. What became of each op is its result, in `results`; the ops with
-//! no result yet are pending.
+//! changed, but that a local op gains its sub-calls when it commits. What
+//! became of each op is its result, in `results`; the ops with no result yet
+//! are pending.
 
 use serde_json::{Value, json};
 
 use crate::error::Result;
 use crate::{Db, Op};
-
-pub const SCHEMA: &str = include_str!("../migrations/oplog.sql");
 
 // The shared order every replica applies ops in.
 const ORDER: &str = "ORDER BY time, device, hash";
@@ -19,6 +18,22 @@ pub fn append(db: &dyn Db, op: &Op) -> Result<()> {
     &[json!(op.hash), json!(op.time), json!(op.device), json!(op.author), json!(op.key), json!(op.input.to_string()), json!(op.version)],
   )?;
   Ok(())
+}
+
+// Write a local op's sub-calls onto its row, in the transaction that records
+// its result. An op with none keeps its row as it arrived.
+pub fn record_sub_calls(db: &dyn Db, hash: &str, sub_calls: &[Op]) -> Result<()> {
+  if sub_calls.is_empty() {
+    return Ok(());
+  }
+  db.run("UPDATE carbon_oplog SET sub_calls = ? WHERE hash = ?", &[json!(serde_json::to_string(sub_calls)?), json!(hash)])?;
+  Ok(())
+}
+
+// The sub-calls a local op carries, in the order it made them; none for any other op.
+pub fn sub_calls(db: &dyn Db, hash: &str) -> Result<Vec<Op>> {
+  let row = db.get("SELECT sub_calls FROM carbon_oplog WHERE hash = ?", &[json!(hash)])?;
+  Ok(row["sub_calls"].as_str().map(serde_json::from_str).transpose()?.unwrap_or_default())
 }
 
 // The log in the shared order.

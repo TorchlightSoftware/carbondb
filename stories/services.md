@@ -15,7 +15,7 @@ CarbonDB's `[identity]` is distinct from an app's own service that may share the
 
 ## [@carbon]
 
-The local service for this device's own CarbonDB. Its calls are kept in the op log of the space they ran in, marked with this device, or in the system log for calls on the system handle, so an interrupted call can be finished after a crash (in theory). What it writes in replicated spaces it writes as ops there, through `[space]`, `[identity]` and `[device]`. The acting identity comes from the handle (current space).
+The local service for this device's own CarbonDB. Its calls are kept in the op log of the space they ran in, marked with this device, or in the system log for calls on the system handle, so an interrupted call can be finished after a crash (in theory). What it writes in replicated spaces goes through `[space]`, `[identity]` and `[device]`: in the space it runs in, as sub-calls carried on its own log row, which other devices replay without it; in another space, as ops there. The acting identity comes from the handle (current space).
 
 | Call | Called from | Input | What it does |
 |---|---|---|---|

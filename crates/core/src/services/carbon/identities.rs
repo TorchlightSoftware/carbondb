@@ -17,10 +17,12 @@ use crate::error::{Result, bad_request, conflict, internal, not_found};
 use crate::hash::hash;
 use crate::keys::{self, KeyPair};
 use crate::service_call::ServiceCall;
-use crate::store::Store;
+use carbondb_service_bindings::migrations::Migration;
 use crate::{Actor, Db, HandlerContext};
 
-const SYSTEM_SCHEMA: &str = include_str!("system.sql");
+// The system database's own tables, after a space's: the identities on this
+// device, each with its first device's secret key.
+pub const SYSTEM_MIGRATIONS: &[Migration] = &[("system/0001_identities", include_str!("../../../migrations/system/0001_identities.sql"))];
 
 // An identity on this device, as anyone on it may see it: everything but the secret key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,12 +43,6 @@ struct IdentityInput {
   services: Vec<String>,
 }
 
-// The system database: this device's identities.
-pub fn open_system(path: &std::path::Path) -> Result<Store> {
-  let system = Store::open(path)?;
-  system.run_batch(SYSTEM_SCHEMA)?;
-  Ok(system)
-}
 
 pub fn find(system: &dyn Db, slug: &str) -> Result<Identity> {
   let row = system.get("SELECT slug, id, space, personal, device FROM carbon_system_identity WHERE slug = ?", &[json!(slug)])?;

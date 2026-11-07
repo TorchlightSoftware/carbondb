@@ -1,6 +1,6 @@
 # CarbonDB first draft: implementation notes
 
-Status: agreed — single-node built (build steps 1 to 3), with the op log and results kept apart, per-service namespacing and init(); replicated mode not started
+Status: agreed — single-node built (build steps 1 to 3), with the op log and results kept apart, per-service namespacing and init(), and a local op carrying its sub-calls on its log row; replicated mode not started, so nothing replays sub-calls yet
 
 This is everything we agreed that the code has to honour, gathered in one place for whoever builds the first draft. The nine numbered stories say what a person can do, [services.md](services.md) lists the builtin calls, and [oplog-examples.md](oplog-examples.md) shows them in use. This file covers what happens underneath. Where older notes disagree with it, this file wins.
 
@@ -82,6 +82,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 - Each space file sits beside the system database, named by space id.
 - Each identity has its own p2panda store file beside it, because a p2panda node takes one set of credentials and one machine may hold several unlinkable identities. That means one p2panda node per identity on a device.
 - A space's op log and changesets live in its own file, so they commit atomically with application writes. The session records every table but the op log and results, using rusqlite's `table_filter`.
+- The core's own tables, the op log and results in every space file and the identities in the system database, move forward by migrations, tracked in `carbon_migrations` and applied in one transaction when the file opens. The system database's file applies a space's migrations, then its own. Until 1.0 these migrations may be consolidated, and development databases deleted when they are.
 
 ## Spaces and services
 
@@ -93,7 +94,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 - **`[space]`** runs in every replicated space: its origin, refs, members and manage list.
 - **`[identity]`** runs in identity spaces: the identity's origin. An app may run its own service of the same name, such as one holding roles, in other spaces; the two never share a space.
 - **`[device]`** follows `[space]`'s pattern: `POST [device]/origin` in the identity space authorizes a device's public key, and `POST [device]/ref` in the personal space records its name and tags. A second ref for the same key replaces the first.
-- **Local ops:** an op on a local service is kept in the op log of the space it ran in, marked with the device that ran it, and replicated like any other, so the log shows every action behind a space's state. Other devices see it is not theirs and record a skipped result instead of running it. Calls on the system handle, which belong to no space, go in the system log, the system database's op log, with their results there. Either gives one place to finish interrupted work after a crash.
+- **Local ops:** an op on a local service is kept in the op log of the space it ran in, marked with the device that ran it, and replicated like any other once it has applied, so the log shows every action behind a space's state. Its sub-calls, the calls it made to replicated services in that space whose writes committed, are written onto its log row in the order made, each with its own stamp and input, in the same transaction that records its result. A refused sub-call changed nothing, so it is not carried; its outcome stays in the local op's result. Only local ops carry sub-calls: a replicated op replays by re-running itself, calls included. Every replay of a local op, on other devices and in a rewind on the device that ran it, runs its sub-calls in one transaction and never the local op itself, so a local op stays as atomic everywhere as it was where it ran. Calls on the system handle, which belong to no space, go in the system log, the system database's op log, with their results there. Either gives one place to finish interrupted work after a crash.
 
 ### Creating a space
 
@@ -126,7 +127,7 @@ Creating a space cannot be undone. If a rewind rejects a parent's ref, the space
 - An op is a service call: service key plus fields, plus op hash, device (signs and syncs), author (the person, for access control and audit), hybrid logical clock time and version: the hash of the package that handles it.
 - For now, a device that does not run the version an op names refuses that op (see [old ops](backlog/old-ops.md)).
 - The author comes from the signed envelope, never from a field on the call.
-- The op hash is computed over CarbonDB's signed envelope before the handler runs. It is separate from the p2panda operation hash, which does not exist yet at that point and covers ciphertext.
+- The op hash is computed over CarbonDB's signed envelope before the handler runs. A local op's sub-calls are not part of its call, so the hash does not cover them. It is separate from the p2panda operation hash, which does not exist yet at that point and covers ciphertext.
 - Ops relate through the hybrid logical clock, not through lists of other ops. The one exception is the per-device removal cutoff.
 - CarbonDB treats an op's input as opaque data. A handler error, including the service's own input validation, rejects the op.
 - The op log, aligned with p2panda, is the space's audit log.
@@ -136,8 +137,8 @@ Creating a space cannot be undone. If a rewind rejects a parent's ref, the space
 
 - Every replica sorts ops by (hybrid logical clock, device, op hash), drops duplicates, and re-runs the service's handler in that order, so business rules give the same result everywhere.
 - The core owns the order and the changesets, so it decides when a handler runs or re-runs. It routes every call by service name to the service's entry point, the same for Rust builtins, npm services and WASM packages, and the entry point settles it once.
-- The op log records what this device received, local calls and synced ops alike. A space's OpWriter writes each op as it arrives, before it applies, as a durable queue would, so a crash loses nothing. While an op applies, its transaction holds the file, so an op arriving meanwhile is held by the OpWriter and written as soon as that turn ends, before the next op applies. Rows are never changed.
-- Results record what this device did with each op: applied, refused with its service error, or skipped as another device's local op, with its output and the calls it made. A result is keyed by its op hash and never leaves this device. A rewind replaces results; it never touches the log.
+- The op log records what this device received, local calls and synced ops alike. A space's OpWriter writes each op as it arrives, before it applies, as a durable queue would, so a crash loses nothing. While an op applies, its transaction holds the file, so an op arriving meanwhile is held by the OpWriter and written as soon as that turn ends, before the next op applies. Rows are never changed, except that a local op's sub-calls are written onto its row when it commits (see Local ops).
+- Results record what this device did with each op: applied or refused with its service error, with its output and the calls it made. A device replaying another device's local op works out the same result locally from its sub-calls. Each runs under its own savepoint, so a sub-call refused on replay, as after a rewind, rolls back only its own writes. A result is keyed by its op hash and never leaves this device. A rewind replaces results; it never touches the log.
 - The pending ops are the op log minus the results: the ops with no result yet. They are read from the space's file each turn, never kept in memory, and apply one at a time in the shared order, so ops left without a result by a crash simply apply next time the space opens. A local call is stamped when it arrives, since that is when it is written; an op that arrives later but sorts earlier is handled by rewind.
 - Ops apply one at a time per space, and spaces apply side by side. A space is the finest unit: its services share one SQLite file, which has one writer, an op holds its transaction while its handler awaits, and one op's calls span services in the space.
 - Every op takes the same path, local or synced: the OpWriter logs it, it applies in turn, and its result is recorded. Nothing is refused before it is logged, so every failure is reported, audited and kept in the history the same way.
@@ -145,7 +146,7 @@ Creating a space cannot be undone. If a rewind rejects a parent's ref, the space
 - A call made on this device to a service it does not run carries the version `service missing`. It is logged, and refused when its turn comes, before any handler sees it; that refusal keeps it from running again and from being published.
 - The callers waiting on an op are kept beside it in memory, by op hash, and answered when its result is recorded. An op resumed from the log has none.
 - Each space has a RunState: initializing, with the named services not set up here yet; idle; applying an op; or stopped. The app can read it and watch it.
-- A call a handler makes runs inside the same op, under a savepoint: it sees the writes before it, and when it fails only its own writes roll back and the error reaches the handler that made it. A GET inside an op reads through the op's transaction. The exception is a local service writing to a replicated service: that write is an op of its own, since the local service never replicates. Replicated services never call local ones.
+- A call a handler makes runs inside the same op, under a savepoint: it sees the writes before it, and when it fails only its own writes roll back and the error reaches the handler that made it. A GET inside an op reads through the op's transaction. When a local service calls a replicated service in the same space, the call also takes a stamp of its own and is recorded as a sub-call on the local op's log row, so other devices can replay it without the local op (see Local ops). Replicated services never call local ones.
 
 The steps for each op:
 
@@ -185,7 +186,7 @@ GETs and watch re-runs use a second read-only connection in WAL mode, so they se
   - The core's own tables, the op log and results, leave the write set, since the session leaves them out. No watch reads them.
   - A savepoint rolled back inside the transaction leaves nothing in the changeset, as the [session spike](../spikes/session-rowid/README.md) shows, so a failed nested call neither re-runs watches nor reaches rewind.
 - A late op whose reads and writes do not overlap later ops applies in place, with no rewind.
-- Otherwise the re-run set is the transitive closure: every later op that read or wrote what the late op, or an op already in the set, wrote. Those changesets are inverted newest first, the late op applies, and the set re-runs in order.
+- Otherwise the re-run set is the transitive closure: every later op that read or wrote what the late op, or an op already in the set, wrote. Those changesets are inverted newest first, the late op applies, and the set re-runs in order. A local op in the set re-runs as its sub-calls, in one transaction, never as itself (see Local ops).
 - The `append` tag is an author's promise that no handler depends on the row being absent. A late tagged op applies in place and re-runs nothing.
 - The core treats tags as opaque flags. A tagged op whose changeset holds anything but inserts is rejected on every replica. A wrong promise about reads is not detected at runtime; the test harness catches it.
 - A row's key comes from the op that creates it, never from the rows already in the table: a key SQLite assigns, a rowid or an AUTOINCREMENT id, depends on those rows, so after a rewind it can move under the row's author. After a service's `init`, the core checks every table it owns has a primary key that is not SQLite's rowid, and refuses the service with an error naming the table, what to change and why. Handlers take keys from `op.id()`, or an integer key from `DEFAULT (op_id())`, a SQL function every runtime registers that draws below 2^53. Sessions do not record schema changes, so schema changes only in `init`, outside any op.

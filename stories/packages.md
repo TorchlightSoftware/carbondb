@@ -47,7 +47,7 @@ Every op carries the hash of the package that handled its call. This replaces th
 - `[space]`, `[identity]` and `[device]` become WASM packages with their own `service.toml`. Their table definitions become migrations there; their queries stay inline in the handlers.
 - They are embedded in the CarbonDB library as `.wasm` bytes, each keeping the hash of its own bytes. The CarbonDB version doesn't stand in for them, so devices on different CarbonDB releases still agree whenever a builtin is unchanged.
 - Each builtin's `.wasm` is built once and committed, and the library embeds the committed file. A test fails when a builtin's source changed without a rebuild, since a different compiler may emit different bytes from the same source.
-- `[@carbon]` is not a package. It never replicates, so no peer checks its version, and it drives the device's p2panda node, keys and setup. It stays host code in Rust.
+- `[@carbon]` is not a package. Other devices never run its ops, only the sub-calls they carry, so no peer checks its version, and it drives the device's p2panda node, keys and setup. It stays host code in Rust.
 
 ## Registering
 

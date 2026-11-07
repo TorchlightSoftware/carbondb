@@ -23,7 +23,7 @@ use crate::service_call::ServiceCall;
 use crate::services::Service;
 use crate::{Db, HandlerContext};
 
-pub use identities::{Identity, find, open_system};
+pub use identities::{Identity, SYSTEM_MIGRATIONS, find};
 
 // `[@carbon]` as the core registers it. It is not a package: no peer checks
 // its version, so its version is the core's own.

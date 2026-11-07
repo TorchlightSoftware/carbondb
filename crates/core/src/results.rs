@@ -9,8 +9,6 @@ use serde_json::{Value, json};
 use crate::error::{Result, ServiceError};
 use crate::Db;
 
-pub const SCHEMA: &str = include_str!("../migrations/results.sql");
-
 // What became of an op, with the calls it made.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "lowercase")]

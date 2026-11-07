@@ -28,20 +28,14 @@ pub fn prefix(service: &str, binding: &str) -> String {
   format!("{service}/{binding}/")
 }
 
-// A statement as SQLite should run it: its text with every name the service
-// owns moved into its namespace, and how many statements it holds.
-#[derive(Debug, PartialEq)]
-pub struct Rewritten {
-  pub sql: String,
-  pub statements: usize,
-}
-
-pub fn rewrite(sql: &str, prefix: &str) -> Result<Rewritten> {
+// SQL as SQLite should run it: its text with every name the service owns
+// moved into its namespace.
+pub fn rewrite(sql: &str, prefix: &str) -> Result<String> {
   let statements = Parser::parse_sql(&SQLiteDialect {}, sql).map_err(|error| unparsed(sql, error))?;
   let mut names = Names::default();
   let _ = statements.visit(&mut names);
   let renames = names.renames()?;
-  Ok(Rewritten { sql: splice(sql, &renames, prefix), statements: statements.len() })
+  Ok(splice(sql, &renames, prefix))
 }
 
 fn unparsed(sql: &str, error: impl std::fmt::Display) -> ServiceError {
@@ -193,7 +187,7 @@ mod tests {
   use super::*;
 
   fn rewritten(sql: &str) -> String {
-    rewrite(sql, "chat/db/").unwrap().sql
+    rewrite(sql, "chat/db/").unwrap()
   }
 
   #[test]
@@ -261,12 +255,9 @@ mod tests {
   }
 
   #[test]
-  fn rewrites_every_statement_of_a_migration_and_counts_them() {
+  fn rewrites_every_statement_of_a_migration() {
     let migration = "CREATE TABLE a (id TEXT PRIMARY KEY);\nCREATE TABLE b (id TEXT PRIMARY KEY);";
-    assert_eq!(
-      rewrite(migration, "chat/db/").unwrap(),
-      Rewritten { sql: "CREATE TABLE \"chat/db/a\" (id TEXT PRIMARY KEY);\nCREATE TABLE \"chat/db/b\" (id TEXT PRIMARY KEY);".into(), statements: 2 }
-    );
+    assert_eq!(rewrite(migration, "chat/db/").unwrap(), "CREATE TABLE \"chat/db/a\" (id TEXT PRIMARY KEY);\nCREATE TABLE \"chat/db/b\" (id TEXT PRIMARY KEY);");
   }
 
   #[test]

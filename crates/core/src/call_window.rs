@@ -17,9 +17,9 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use serde_json::Value;
 
-use crate::error::{Result, bad_request, sqlite};
+use crate::error::{Result, sqlite};
 use crate::namespace::rewrite;
-use crate::store::{Failure, all, batch, run};
+use crate::store::{Failure, all, run};
 use crate::{Db, Op};
 
 // The service namespace and op a statement runs within. The core's own
@@ -139,31 +139,25 @@ pub struct Scoped<'a> {
 
 impl Scoped<'_> {
   // Run a statement inside the call window, then restore the window it replaced.
-  fn inside<T>(&self, sql: &str, work: impl FnOnce(&str, usize) -> Result<T>) -> Result<T> {
-    let (sql, statements) = match &self.window.prefix {
-      Some(prefix) => rewrite(sql, prefix).map(|rewritten| (rewritten.sql, rewritten.statements))?,
-      None => (sql.to_string(), 1),
+  fn inside<T>(&self, sql: &str, work: impl FnOnce(&str) -> Result<T>) -> Result<T> {
+    let sql = match &self.window.prefix {
+      Some(prefix) => rewrite(sql, prefix)?,
+      None => sql.to_string(),
     };
     let previous = std::mem::replace(&mut self.access.lock().expect("access").window, self.window.clone());
-    let result = work(&sql, statements);
+    let result = work(&sql);
     self.access.lock().expect("access").window = previous;
     result
   }
 }
 
 impl Db for Scoped<'_> {
-  // Several statements run as a batch, which takes no parameters.
   fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
-    self.inside(sql, |sql, statements| match (statements, params.is_empty()) {
-      (1, _) => run(self.connection, self.failure, sql, params),
-      (0, _) => Err(bad_request("No SQL statement to run")),
-      (_, true) => batch(self.connection, self.failure, sql).map(|_| 0),
-      (_, false) => Err(bad_request("Several statements run only without parameters")),
-    })
+    self.inside(sql, |sql| run(self.connection, self.failure, sql, params))
   }
 
   fn all(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
-    self.inside(sql, |sql, _| all(self.connection, self.failure, sql, params))
+    self.inside(sql, |sql| all(self.connection, self.failure, sql, params))
   }
 }
 

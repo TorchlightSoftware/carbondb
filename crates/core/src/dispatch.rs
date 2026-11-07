@@ -26,7 +26,7 @@ use crate::carbon::Carbon;
 use crate::error::{Result, ServiceError, conflict, not_found, stopped};
 use crate::op::actor;
 use crate::results::Outcome;
-use crate::service_call::{Conn, ServiceCall, Settle};
+use crate::service_call::{CallRecord, Conn, ServiceCall, Settle, sub_calls};
 use crate::services::{self, SERVICE_MISSING, Service};
 use crate::space::{RunState, Space};
 use crate::store::{Store, tables};
@@ -109,7 +109,7 @@ impl Carbon {
     let (carbon, here, ended, applied) = (Rc::clone(self), Rc::clone(space), Rc::clone(&live), op.clone());
     let settle: Settle = Box::new(move |result, calls| {
       ended.set(false);
-      carbon.finish(&here, &applied, result, json!(calls));
+      carbon.finish(&here, &applied, result, calls);
       carbon.drain(&here);
     });
     let service_call = ServiceCall::new(self, space, actor(&op), call, op.input.clone(), Conn::Writer, Some(op.clone()), live, settle);
@@ -117,7 +117,7 @@ impl Carbon {
   }
 
   // An op settled: end its transaction with its result and answer whoever waits on it.
-  fn finish(&self, space: &Space, op: &Op, result: Result<Value>, calls: Value) {
+  fn finish(&self, space: &Space, op: &Op, result: Result<Value>, calls: Vec<CallRecord>) {
     match end(space.store(), op, result, calls) {
       Ok(settled) => {
         self.set_run_state(space, RunState::Idle);
@@ -235,11 +235,11 @@ fn between_turns(space: &Rc<Space>) -> Result<()> {
   space.store().failure().map_or(Ok(()), Err)
 }
 
-// End an op's transaction: commit it with its result when it succeeded, or
-// roll it back and keep only its result, saying why. Fails, leaving the op
-// pending, when the store met a system failure or the result could not be
-// written: then the space stops.
-fn end(store: &Store, op: &Op, result: Result<Value>, calls: Value) -> Result<Result<Settled>> {
+// End an op's transaction: commit it with its result, and a local op with its
+// sub-calls, when it succeeded; or roll it back and keep only its result,
+// saying why. Fails, leaving the op pending, when the store met a system
+// failure or the result could not be written: then the space stops.
+fn end(store: &Store, op: &Op, result: Result<Value>, calls: Vec<CallRecord>) -> Result<Result<Settled>> {
   // Rolling back while stopping: the space stops with the first failure,
   // whatever the rollback meets.
   if let Some(failure) = store.failure() {
@@ -248,8 +248,9 @@ fn end(store: &Store, op: &Op, result: Result<Value>, calls: Value) -> Result<Re
   }
   match result {
     Ok(value) => {
-      let applied = Outcome::Applied { output: value.clone(), calls };
-      if let Err(failure) = results::record(store, &op.hash, &applied) {
+      let applied = Outcome::Applied { output: value.clone(), calls: json!(calls) };
+      let recorded = results::record(store, &op.hash, &applied).and_then(|_| oplog::record_sub_calls(store, &op.hash, &sub_calls(&calls)));
+      if let Err(failure) = recorded {
         let _ = store.end_write(false);
         return Err(failure);
       }
@@ -258,7 +259,7 @@ fn end(store: &Store, op: &Op, result: Result<Value>, calls: Value) -> Result<Re
     }
     Err(error) => {
       store.end_write(false)?;
-      results::record(store, &op.hash, &Outcome::Refused { error: error.clone(), calls })?;
+      results::record(store, &op.hash, &Outcome::Refused { error: error.clone(), calls: json!(calls) })?;
       Ok(Err(error))
     }
   }

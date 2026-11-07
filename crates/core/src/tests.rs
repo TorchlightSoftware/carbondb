@@ -403,11 +403,16 @@ mod spaces {
 
     let entries = oplog::entries(personal.store()).unwrap();
     let keys: Vec<&str> = entries.iter().map(|op| op.key.as_str()).collect();
-    assert_eq!(keys[2..4], ["POST [@carbon]/space", "POST [space]/ref"]);
-    let (local, reference) = (&entries[2], &entries[3]);
+    assert_eq!(keys[2..], ["POST [@carbon]/space", "POST [@carbon]/space"]);
+    let local = &entries[2];
     assert_eq!(local.device, Some(identity.device.clone()));
+    let sub_calls = oplog::sub_calls(personal.store(), &local.hash).unwrap();
+    let reference = &sub_calls[0];
+    assert_eq!((sub_calls.len(), reference.key.as_str()), (1, "POST [space]/ref"));
+    assert_eq!((&reference.author, &reference.device), (&Some(identity.id.clone()), &Some(identity.device.clone())));
     let Some(Outcome::Applied { calls, .. }) = results::of(personal.store(), &local.hash).unwrap() else { panic!("[@carbon]/space applied") };
-    assert_eq!(calls[0]["op"], json!(reference.hash));
+    assert_eq!(calls[0]["op"]["hash"], json!(reference.hash));
+    assert_eq!(oplog::sub_calls(personal.store(), &entries[0].hash).unwrap(), vec![], "a replicated op carries no sub-calls");
     assert_eq!(local.hash, created["space"].as_str().unwrap());
 
     let room = space_now(&carbon, created["space"].as_str().unwrap()).unwrap();

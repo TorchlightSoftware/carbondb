@@ -25,7 +25,16 @@ use crate::op_writer::OpWriter;
 use crate::schema::check_keys;
 use crate::services::Service;
 use crate::store::Store;
-use crate::{Db, oplog, results};
+use crate::Db;
+use carbondb_service_bindings::migrations::Migration;
+
+// The core's own tables in every space's file, the op log and results, as
+// forward-only migrations. Each name carries its set, since the root space's
+// file tracks the system database's migrations beside these.
+pub const MIGRATIONS: &[Migration] = &[
+  ("space/0001_oplog_and_results", include_str!("../migrations/space/0001_oplog_and_results.sql")),
+  ("space/0002_sub_calls", include_str!("../migrations/space/0002_sub_calls.sql")),
+];
 
 // Where a space is in applying its ops: initializing until every service its
 // origin names is set up here, then idle, or applying one; or stopped by a
@@ -61,9 +70,10 @@ pub struct Space {
 }
 
 impl Space {
-  // The root space over the system database.
-  pub fn root(store: Store) -> Result<Space> {
-    Space::over("system", true, store)
+  // The root space over the system database, whose file holds a space's
+  // tables and, after them, the system database's own.
+  pub fn root(store: Store, system: &[Migration]) -> Result<Space> {
+    Space::over("system", true, store, &[MIGRATIONS, system].concat())
   }
 
   // A new, empty space's database, ready for its origin op.
@@ -75,12 +85,11 @@ impl Space {
   }
 
   pub fn open(path: &Path, id: &str) -> Result<Space> {
-    Space::over(id, false, Store::open(path)?)
+    Space::over(id, false, Store::open(path)?, MIGRATIONS)
   }
 
-  fn over(id: &str, root: bool, store: Store) -> Result<Space> {
-    store.run_batch(oplog::SCHEMA)?;
-    store.run_batch(results::SCHEMA)?;
+  fn over(id: &str, root: bool, store: Store, migrations: &[Migration]) -> Result<Space> {
+    store.migrate(migrations)?;
     Ok(Space {
       id: id.to_string(),
       root,
@@ -228,6 +237,45 @@ mod tests {
 
   fn service(name: &str, schema: &'static str) -> Rc<Service> {
     Rc::new(Service::replicated(name, "v1", Some("db"), Rc::new(move |db: Rc<dyn Db>| db.run(schema, &[]).map(|_| ())), Rc::new(|_| {})))
+  }
+
+  // The core migrations a store's file has applied, in order.
+  fn applied(store: &Store) -> Vec<String> {
+    store.all("SELECT name FROM carbon_migrations ORDER BY name", &[]).unwrap().iter().map(|row| row["name"].as_str().unwrap().to_string()).collect()
+  }
+
+  fn names(migrations: &[Migration]) -> Vec<String> {
+    migrations.iter().map(|(name, _)| name.to_string()).collect()
+  }
+
+  #[test]
+  fn brings_a_space_file_from_before_sub_calls_up_to_date_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("s.db");
+    Store::open(&path).unwrap().run_batch(MIGRATIONS[0].1).unwrap();
+    for opening in ["first", "again"] {
+      let space = Space::open(&path, "s").unwrap();
+      assert_eq!(applied(space.store()), names(MIGRATIONS), "{opening}");
+      assert!(space.store().all("SELECT sub_calls FROM carbon_oplog", &[]).is_ok(), "{opening}");
+    }
+  }
+
+  #[test]
+  fn refuses_a_space_file_migrated_by_newer_code() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("s.db");
+    let space = Space::open(&path, "s").unwrap();
+    space.store().run("INSERT INTO carbon_migrations (name) VALUES ('space/9999_from_the_future')", &[]).unwrap();
+    drop(space);
+    assert_eq!(Space::open(&path, "s").err().unwrap().status, 409);
+  }
+
+  #[test]
+  fn the_root_space_holds_the_space_tables_and_the_system_tables_after_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let system: &[Migration] = &[("system/0001_things", "CREATE TABLE carbon_system_thing (id TEXT PRIMARY KEY)")];
+    let root = Space::root(Store::open(&directory.path().join("system.db")).unwrap(), system).unwrap();
+    assert_eq!(applied(root.store()), [names(MIGRATIONS), names(system)].concat());
   }
 
   #[test]

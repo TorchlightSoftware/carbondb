@@ -20,6 +20,7 @@ use crate::op::stamp;
 use crate::services::carbon::{self as local, Identity};
 use crate::services::{Service, Services};
 use crate::space::{self, RunState, Space};
+use crate::store::Store;
 use crate::{Actor, Call, Op};
 
 // Called with the tables each commit to a space wrote.
@@ -48,7 +49,7 @@ impl Carbon {
       return Err(not_built("Replicated mode"));
     }
     std::fs::create_dir_all(config.directory()).map_err(|error| bad_request(format!("Cannot create {}: {error}", config.directory().display())))?;
-    let system = Rc::new(Space::root(local::open_system(&config.system)?)?);
+    let system = Rc::new(Space::root(Store::open(&config.system)?, local::SYSTEM_MIGRATIONS)?);
     let carbon = Rc::new(Carbon {
       config,
       clock: Clock::default(),

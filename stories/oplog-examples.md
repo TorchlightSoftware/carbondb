@@ -1,6 +1,6 @@
 # Oplog examples
 
-Each block is a space with its ops indented under it, in the order they run. `[@carbon]` is local: it runs on this device in the context of that space and never replicates. The ops listed after it in a block are the ones its handler writes, and every op on a replicated service reaches the space's other members.
+Each block is a space with its ops indented under it, in the order they run. `[@carbon]` is local: it runs only on this device, in the context of that space. The calls listed after it in the same block are its sub-calls: they travel on its log row, and the space's other members replay them, never the `[@carbon]` op itself. Every other op on a replicated service reaches the space's other members as itself.
 
 ## Alice creates an identity and a company
 

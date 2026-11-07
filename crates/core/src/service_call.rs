@@ -6,24 +6,24 @@
 //!
 //! A call made inside another runs inside the same op, under a savepoint, so
 //! it sees the writes before it, and a failure rolls back only its own writes
-//! and throws to the handler that made it. The one exception is a local
-//! service writing to a replicated one: that is an op of its own, logged with
-//! its result, since the local service never replicates.
+//! and throws to the handler that made it. A local service writing to a
+//! replicated one also stamps the call as an op of its own: a sub-call, which
+//! the local op carries on its log row so other devices replay it without the
+//! local op.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::carbon::Carbon;
 use crate::dispatch::Settled;
 use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal};
-use crate::results::Outcome;
 use crate::space::Space;
 use crate::call_window::{CallWindow, Scoped};
 use crate::store::Reader;
-use crate::{Actor, Call, Db, HandlerContext, Op, Reply, oplog, results};
+use crate::{Actor, Call, Db, HandlerContext, Op, Reply};
 
 // How a service call ends: what it settled with, and the calls it made.
 pub(crate) type Settle = Box<dyn FnOnce(Result<Value>, Vec<CallRecord>)>;
@@ -44,9 +44,9 @@ pub struct CallRecord {
   // The space it ran in, when not the caller's.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub space: Option<String>,
-  // Its own op's hash, when it ran as an op of its own.
+  // Its own op's stamp, when it ran as a sub-call.
   #[serde(skip_serializing_if = "Option::is_none")]
-  pub op: Option<String>,
+  pub op: Option<Op>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub output: Option<Value>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,12 +65,22 @@ impl CallRecord {
   }
 }
 
+// The sub-calls a local op carries, from the calls it made: each stamped as an
+// op of its own whose writes committed, in the order made. A refused call
+// rolled back its writes, and those of every call inside it.
+pub(crate) fn sub_calls(calls: &[CallRecord]) -> Vec<Op> {
+  calls.iter().filter(|record| record.error.is_none()).flat_map(|record| match &record.op {
+    Some(op) => vec![op.clone()],
+    None => sub_calls(&record.calls),
+  }).collect()
+}
+
 // How a call made inside another runs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Within {
   // Inside the caller's op, re-run with it on every replica.
   SameOp,
-  // As an op of its own: a local service writing to a replicated one.
+  // As a sub-call, stamped as an op of its own: a local service writing to a replicated one.
   OwnOp,
 }
 
@@ -179,7 +189,7 @@ impl ServiceCall {
   }
 
   // A call inside this one's transaction: under a savepoint when it writes, in
-  // the same op or an op of its own.
+  // the same op or as a sub-call stamped as an op of its own.
   fn inside(self: &Rc<Self>, actor: Actor, call: Call, input: Value, within: Within, reply: Reply) {
     let guarded = self.call.writes();
     if guarded && let Err(error) = self.space.store().savepoint() {
@@ -191,9 +201,9 @@ impl ServiceCall {
     let caller = Rc::clone(self);
     let (record_call, record_input) = (call.clone(), input.clone());
     let settle: Settle = Box::new(move |result, calls| {
-      let result = if guarded { caller.close(result, own_op.as_ref(), &calls) } else { result };
+      let result = if guarded { caller.close(result) } else { result };
       let mut record = CallRecord::of(&record_call, record_input, &result, calls);
-      record.op = own_op.map(|op| op.hash);
+      record.op = own_op;
       caller.returned(record);
       reply(result)
     });
@@ -201,16 +211,12 @@ impl ServiceCall {
     self.carbon.route(callee);
   }
 
-  // End a call's savepoint, keeping its writes or rolling them back. An op of
-  // its own goes in the log with its result either way.
-  fn close(&self, result: Result<Value>, own_op: Option<&Op>, calls: &[CallRecord]) -> Result<Value> {
+  // End a call's savepoint, keeping its writes or rolling them back.
+  fn close(&self, result: Result<Value>) -> Result<Value> {
     if !self.live.get() {
       return Err(self.ended());
     }
-    let store = self.space.store();
-    let closed = store.end_savepoint(result.is_ok());
-    let logged = own_op.map_or(Ok(()), |op| oplog::append(store, op).and_then(|_| results::record(store, &op.hash, &Outcome::of(&result, json!(calls)))));
-    closed.and(logged).and(result)
+    self.space.store().end_savepoint(result.is_ok()).and(result)
   }
 
   // A call this one made has answered.
@@ -298,6 +304,7 @@ impl HandlerContext for ServiceCall {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use serde_json::json;
 
   #[test]
   fn decides_how_a_call_inside_another_runs() {
@@ -315,6 +322,31 @@ mod tests {
     ];
     for (caller, callee, expected) in cases {
       assert_eq!(within(&key(caller), &key(callee)).map_err(|error| error.status), expected, "{caller} -> {callee}");
+    }
+  }
+
+  // A call a local op made: an op of its own when `own` names its hash, refused when `refused`.
+  fn made(key: &str, own: Option<&str>, refused: bool, calls: Vec<CallRecord>) -> CallRecord {
+    let op = own.map(|hash| Op::new(key.into(), json!({}), None, None, "v".into(), 1, hash.into()));
+    let (output, error) = if refused { (None, Some(bad_request("no"))) } else { (Some(json!(null)), None) };
+    CallRecord { key: key.into(), input: json!({}), space: None, op, output, error, calls }
+  }
+
+  #[test]
+  fn a_local_op_keeps_the_sub_calls_whose_writes_committed() {
+    let in_another_space = CallRecord { space: Some("other".into()), ..made("POST [space]/origin", None, false, vec![]) };
+    let cases = [
+      ("an op of its own that applied", vec![made("POST [space]/ref", Some("a"), false, vec![])], vec!["a"]),
+      ("an op of its own that was refused", vec![made("POST [space]/ref", Some("a"), true, vec![])], vec![]),
+      ("in the order they were made", vec![made("POST [space]/ref", Some("a"), false, vec![]), made("POST [space]/ref", Some("b"), false, vec![])], vec!["a", "b"]),
+      ("inside a local call that applied", vec![made("POST [@notes]/run", None, false, vec![made("POST [space]/ref", Some("a"), false, vec![])])], vec!["a"]),
+      ("inside a local call that failed, which rolled it back", vec![made("POST [@notes]/run", None, true, vec![made("POST [space]/ref", Some("a"), false, vec![])])], vec![]),
+      ("a read, which writes nothing", vec![made("GET [space]/refs", None, false, vec![])], vec![]),
+      ("a call into another space, an op there", vec![in_another_space], vec![]),
+    ];
+    for (name, calls, expected) in cases {
+      let hashes: Vec<String> = sub_calls(&calls).into_iter().map(|op| op.hash).collect();
+      assert_eq!(hashes, expected, "{name}");
     }
   }
 }

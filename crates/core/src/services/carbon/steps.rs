@@ -1,7 +1,7 @@
 //! Setting something up, as `[@carbon]` does: a list of steps run in order,
 //! each once the one before it has applied, stopping at the first that fails.
-//! A step is a call, made as an op of its own in a space, or host work on this
-//! device.
+//! A step is a call, made in the space `[@carbon]` runs in as a sub-call it
+//! carries, or in another space as an op there; or host work on this device.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -24,7 +24,7 @@ pub enum Target {
 pub enum Step {
   // A new space's database, on this device.
   Create(String),
-  // A call, as an op of its own in its space.
+  // A call: a sub-call here, or an op in another space.
   Call { target: Target, actor: Actor, key: &'static str, input: Value },
   // Set up the services a space's origin named, once that origin applies.
   SetUp(String, Vec<String>),

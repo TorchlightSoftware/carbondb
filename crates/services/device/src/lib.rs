@@ -14,7 +14,7 @@ include!(concat!(env!("OUT_DIR"), "/package.rs"));
 pub const PACKAGE: Package = Package { name: NAME, version: VERSION, binding: BINDING, init, entry };
 
 fn init(db: &dyn Db) -> Result<()> {
-  migrations::apply(db, MIGRATIONS)
+  migrations::apply(db, "d1_migrations", MIGRATIONS)
 }
 
 // A device's private description, kept in the personal space.
