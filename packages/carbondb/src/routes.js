@@ -3,15 +3,7 @@
 // the service when it registers it.
 
 import {parseServiceKey} from '@tlsft/service-key'
-import {badRequest, methodNotAllowed, notFound} from '@tlsft/service-error'
-
-// A service key's parts, as the core takes a call: `POST [chat]/messages` is
-// {method: 'POST', service: 'chat', resource: '/messages', confined: false}.
-export function parseKey(key) {
-  const parts = parseServiceKey(key)
-  if (!parts) throw badRequest(`'${key}' is not a service key`)
-  return parts
-}
+import {methodNotAllowed, notFound} from '@tlsft/service-error'
 
 const segmentsOf = (resource) => resource.split('/').filter(Boolean)
 

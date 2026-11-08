@@ -3,6 +3,7 @@
 //! against ServiceBindings (`carbondb-service-bindings`); bindings for a host
 //! language sit on top.
 
+pub mod app;
 pub mod call;
 pub mod call_window;
 pub mod carbon;
@@ -21,12 +22,13 @@ pub mod service_call;
 pub mod services;
 pub mod space;
 pub mod store;
+pub mod watch;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod tests;
 
-pub use call::Call;
+pub use call::{Call, Routing};
 pub use carbon::Carbon;
 pub use carbondb_service_bindings::hash;
 pub use carbondb_service_bindings::{Actor, Db, HandlerContext, Op, Package, Reply};

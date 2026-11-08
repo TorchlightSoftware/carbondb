@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 
 use crate::hash::hash;
-use crate::{Actor, Call, Op};
+use crate::{Actor, Call, Routing, Op};
 
 // Stamp a call as an op at `time`, for the version of the service that handles it.
 pub fn stamp(actor: &Actor, call: &Call, input: &Value, version: &str, time: u64) -> Op {

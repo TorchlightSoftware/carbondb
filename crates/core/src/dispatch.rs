@@ -30,7 +30,7 @@ use crate::service_call::{CallRecord, Conn, ServiceCall, Settle, sub_calls};
 use crate::services::{self, SERVICE_MISSING, Service};
 use crate::space::{RunState, Space};
 use crate::store::{Store, tables};
-use crate::{Actor, Call, HandlerContext, Op, oplog, results};
+use crate::{Actor, Call, Routing, HandlerContext, Op, oplog, results};
 
 // What a call settled with, and the tables it read or wrote, for watch.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -85,7 +85,7 @@ impl Carbon {
 
   // Move a space between Initializing and Idle: Initializing while a service
   // its origin names is not set up here, with those services.
-  fn initialize(&self, space: &Space) {
+  fn initialize(self: &Rc<Self>, space: &Space) {
     let services = space.not_set_up();
     let state = if services.is_empty() { RunState::Idle } else { RunState::Initializing { services } };
     if space.run_state() != state {
@@ -117,7 +117,7 @@ impl Carbon {
   }
 
   // An op settled: end its transaction with its result and answer whoever waits on it.
-  fn finish(&self, space: &Space, op: &Op, result: Result<Value>, calls: Vec<CallRecord>) {
+  fn finish(self: &Rc<Self>, space: &Space, op: &Op, result: Result<Value>, calls: Vec<CallRecord>) {
     match end(space.store(), op, result, calls) {
       Ok(settled) => {
         self.set_run_state(space, RunState::Idle);
@@ -131,7 +131,7 @@ impl Carbon {
   }
 
   // Refuse an op before it applies, keeping its result.
-  fn refuse(&self, space: &Space, op: &Op, error: ServiceError) {
+  fn refuse(self: &Rc<Self>, space: &Space, op: &Op, error: ServiceError) {
     match results::record(space.store(), &op.hash, &Outcome::Refused { error: error.clone(), calls: json!([]) }) {
       Ok(()) => space.answer(&op.hash, Err(error)),
       Err(failure) => self.stop(space, failure),
@@ -140,7 +140,7 @@ impl Carbon {
 
   // Stop a space after a system failure: hold nothing more for the log, and
   // answer everyone waiting on its ops with the failure.
-  pub(crate) fn stop(&self, space: &Space, failure: ServiceError) {
+  pub(crate) fn stop(self: &Rc<Self>, space: &Space, failure: ServiceError) {
     space.op_writer.discard();
     self.set_run_state(space, RunState::Stopped { error: failure.clone() });
     space.answer_all(&stopped(&space.id, &failure));
@@ -186,7 +186,7 @@ impl Carbon {
     self.route(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, live, settle));
   }
 
-  fn answer_read(&self, space: &Space, reply: Reply, settled: Result<Settled>) {
+  fn answer_read(self: &Rc<Self>, space: &Space, reply: Reply, settled: Result<Settled>) {
     if let Some(failure) = space.store().failure() {
       self.stop(space, failure);
     }

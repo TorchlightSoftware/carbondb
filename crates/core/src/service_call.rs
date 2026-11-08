@@ -23,7 +23,7 @@ use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, inter
 use crate::space::Space;
 use crate::call_window::{CallWindow, Scoped};
 use crate::store::Reader;
-use crate::{Actor, Call, Db, HandlerContext, Op, Reply};
+use crate::{Actor, Call, Routing, Db, HandlerContext, Op, Reply};
 
 // How a service call ends: what it settled with, and the calls it made.
 pub(crate) type Settle = Box<dyn FnOnce(Result<Value>, Vec<CallRecord>)>;

@@ -1,48 +1,47 @@
 //! A service key parsed into the parts the core routes on: `POST [space]/ref`
-//! is {method: POST, service: space, resource: /ref}.
-
-use serde::{Deserialize, Serialize};
+//! is {method: POST, service: space, resource: /ref}. The grammar is the
+//! `service-key` crate's, the same as the JS runtime's, so a key means the
+//! same wherever it is written.
 
 use crate::error::{Result, ServiceError, bad_request, not_found};
 
-// A service key's parts: `POST [space]/ref` is {method: POST, service: space, resource: /ref}.
-// A confined key, `[@carbon]`, names a local service.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Call {
-  pub method: Option<String>,
-  pub service: String,
-  pub resource: String,
-  #[serde(default)]
-  pub confined: bool,
+// A call's parts. A confined key, `[@carbon]`, names a local service.
+pub use service_key::ServiceKey as Call;
+
+// What the core reads from a call's parts.
+pub trait Routing: Sized {
+  // A call from its service key, or a refusal naming what is not one.
+  fn from_key(key: &str) -> Result<Self>;
+
+  fn method(&self) -> &str;
+
+  // A GET reads committed state and is never an op; every other call writes.
+  fn writes(&self) -> bool;
+
+  fn key(&self) -> String;
+
+  // The refusal for a method and resource a service does not answer.
+  fn unknown(&self) -> ServiceError;
 }
 
-impl Call {
-  // A call from its service key, for calls a Rust service makes. Apps' keys are
-  // parsed by their runtime, which knows the full syntax.
-  pub fn from_key(key: &str) -> Result<Call> {
-    let malformed = || bad_request(format!("'{key}' is not a service key"));
-    let (method, rest) = key.split_once(' ').ok_or_else(malformed)?;
-    let (service, resource) = rest.strip_prefix('[').and_then(|rest| rest.split_once(']')).ok_or_else(malformed)?;
-    let confined = service.starts_with('@');
-    Ok(Call { method: Some(method.into()), service: service.trim_start_matches('@').into(), resource: resource.into(), confined })
+impl Routing for Call {
+  fn from_key(key: &str) -> Result<Call> {
+    Call::parse(key).ok_or_else(|| bad_request(format!("'{key}' is not a service key")))
   }
 
-  pub fn method(&self) -> &str {
+  fn method(&self) -> &str {
     self.method.as_deref().unwrap_or("")
   }
 
-  // A GET reads committed state and is never an op; every other call writes.
-  pub fn writes(&self) -> bool {
+  fn writes(&self) -> bool {
     self.method() != "GET"
   }
 
-  pub fn key(&self) -> String {
-    let at = if self.confined { "@" } else { "" };
-    format!("{} [{at}{}]{}", self.method(), self.service, self.resource).trim_start().to_string()
+  fn key(&self) -> String {
+    self.to_string()
   }
 
-  // The refusal for a method and resource a service does not answer.
-  pub fn unknown(&self) -> ServiceError {
+  fn unknown(&self) -> ServiceError {
     not_found(format!("{} is not a call CarbonDB answers", self.key()))
   }
 }
@@ -52,17 +51,12 @@ mod tests {
   use super::*;
 
   #[test]
-  fn formats_and_parses_its_key() {
-    let cases = [
-      (Call { method: Some("POST".into()), service: "space".into(), resource: "/ref".into(), confined: false }, "POST [space]/ref"),
-      (Call { method: Some("GET".into()), service: "carbon".into(), resource: "/status".into(), confined: true }, "GET [@carbon]/status"),
-    ];
-    for (call, key) in cases {
-      assert_eq!(call.key(), key);
-      assert_eq!(Call::from_key(key).unwrap(), call);
+  fn reads_what_it_routes_on_from_a_key() {
+    let cases = [("POST [space]/ref", "POST", true), ("GET [@carbon]/status", "GET", false), ("[device]/refs", "", true)];
+    for (key, method, writes) in cases {
+      let call = Call::from_key(key).unwrap();
+      assert_eq!((call.method(), call.writes(), call.key()), (method, writes, key.to_string()), "{key}");
     }
-    let unmethoded = Call { method: None, service: "device".into(), resource: "/refs".into(), confined: false };
-    assert_eq!(unmethoded.key(), "[device]/refs");
     assert_eq!(Call::from_key("not a key").unwrap_err().status, 400);
   }
 }

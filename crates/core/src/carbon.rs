@@ -1,7 +1,7 @@
 //! This device's CarbonDB: its config, its clock, the services it runs, the
-//! system database as its root space, the spaces opened so far, and who
-//! listens for their commits and RunStates. Every call goes through `submit`,
-//! in `dispatch`.
+//! system database as its root space, the spaces opened so far, and the
+//! watches on them (`watch`). Every call goes through `submit`, in `dispatch`;
+//! a call from the app comes in through `call` (`app`).
 //!
 //! This is the single-node core: no p2panda and no network. Calls that need
 //! peers are refused.
@@ -15,19 +15,14 @@ use serde_json::Value;
 
 use crate::clock::Clock;
 use crate::config::{Config, SyncMode};
-use crate::error::{Result, bad_request, internal, not_built};
+use crate::error::{Result, bad_request, not_built};
 use crate::op::stamp;
 use crate::services::carbon::{self as local, Identity};
 use crate::services::{Service, Services};
 use crate::space::{self, RunState, Space};
 use crate::store::Store;
-use crate::{Actor, Call, Op};
-
-// Called with the tables each commit to a space wrote.
-pub type Listener = Rc<dyn Fn(&[String])>;
-
-// Called with a space's RunState each time it changes.
-pub type RunStateListener = Rc<dyn Fn(&RunState)>;
+use crate::watch::Watches;
+use crate::{Actor, Call, Routing, Op};
 
 // How an opened space reaches whoever asked for it.
 pub type Opened = Box<dyn FnOnce(Result<Rc<Space>>)>;
@@ -38,8 +33,7 @@ pub struct Carbon {
   services: Services,
   system: Rc<Space>,
   spaces: RefCell<HashMap<String, Rc<Space>>>,
-  listeners: RefCell<HashMap<String, Vec<Listener>>>,
-  run_state_listeners: RefCell<HashMap<String, Vec<RunStateListener>>>,
+  pub(crate) watches: Watches,
 }
 
 impl Carbon {
@@ -56,8 +50,7 @@ impl Carbon {
       services: Services::builtin(),
       system,
       spaces: RefCell::default(),
-      listeners: RefCell::default(),
-      run_state_listeners: RefCell::default(),
+      watches: Watches::default(),
     });
     carbon.drain(&carbon.system);
     Ok(carbon)
@@ -89,21 +82,10 @@ impl Carbon {
   }
 
   // Where a space's database sits: beside the system database, named by space id.
-  fn space_path(&self, id: &str) -> PathBuf {
+  pub(crate) fn space_path(&self, id: &str) -> PathBuf {
     self.config.directory().join(format!("{id}.db"))
   }
 
-  // The ids of every space on this device.
-  pub fn space_ids(&self) -> Result<Vec<String>> {
-    let entries = std::fs::read_dir(self.config.directory()).map_err(|error| internal(format!("Cannot list spaces: {error}")))?;
-    let mut ids: Vec<String> = entries
-      .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-      .filter(|path| path.extension().is_some_and(|extension| extension == "db") && *path != self.config.system)
-      .filter_map(|path| path.file_stem().map(|stem| stem.to_string_lossy().to_string()))
-      .collect();
-    ids.sort();
-    Ok(ids)
-  }
 
   // A space on this device, opened on first use: `[space]` is set up first,
   // then `GET [space]/origin` names the services it runs, and each registered
@@ -163,36 +145,9 @@ impl Carbon {
     local::find(&self.system.store().reader()?, slug)
   }
 
-  // Hear every commit to a space, with the tables it wrote, whether or not it is open yet.
-  pub fn listen(&self, space: &str, listener: Listener) {
-    self.listeners.borrow_mut().entry(space.to_string()).or_default().push(listener);
-  }
-
-  // Tell every listener what a commit to a space wrote.
-  pub(crate) fn committed(&self, space: &str, tables: &[String]) {
-    let listeners = self.listeners.borrow().get(space).cloned().unwrap_or_default();
-    for listener in listeners {
-      listener(tables);
-    }
-  }
-
   // A space's RunState: idle until it is opened.
   pub fn run_state(&self, space: &str) -> RunState {
     self.opened(space).map_or(RunState::Idle, |space| space.run_state())
-  }
-
-  // Hear every change of a space's RunState, whether or not it is open yet.
-  pub fn listen_run_state(&self, space: &str, listener: RunStateListener) {
-    self.run_state_listeners.borrow_mut().entry(space.to_string()).or_default().push(listener);
-  }
-
-  // Move a space to a RunState, and tell whoever listens.
-  pub(crate) fn set_run_state(&self, space: &Space, state: RunState) {
-    space.set_run_state(state.clone());
-    let listeners = self.run_state_listeners.borrow().get(&space.id).cloned().unwrap_or_default();
-    for listener in listeners {
-      listener(&state);
-    }
   }
 
   // A space already open on this device, the root space included.
@@ -245,11 +200,6 @@ mod tests {
     let identity = alice(&carbon);
     drop(carbon);
     let restarted = Carbon::open(&directory.path().join("carbondb.toml")).unwrap();
-    assert_eq!(restarted.space_ids().unwrap(), {
-      let mut ids = vec![identity.space.clone(), identity.personal.clone()];
-      ids.sort();
-      ids
-    });
     let personal = space_now(&restarted, &identity.personal).unwrap();
     let error = call_now(&restarted, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap_err();
     assert_eq!((error.status, error.details), (404, Some(json!({"service": "notes"}))));

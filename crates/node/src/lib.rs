@@ -4,8 +4,12 @@
 //! The core routes every call; the binding only translates. Everything runs on
 //! the JS thread, in callback style:
 //!
-//! - JS submits a call with `call`, and the core answers through the callback
-//!   it was given, `(error, outcome)`, now or once the op applies.
+//! - JS makes a call with `call`, by its service key and as an identity, and
+//!   the core answers through the callback it was given, `(error, value)`,
+//!   once the op applies and the watches it touched have run again.
+//! - JS watches a GET or a space's RunState with `watch` and `watchRunState`,
+//!   and the core calls the listener it was given with each answer, until
+//!   `unwatch`. The core keeps every watch; JS only hands answers to the app.
 //! - JS registers an npm service with `register`: its `init`, which the core
 //!   calls with the service's `db` binding to set up its schema, and its entry
 //!   point, which the core calls with a `HandlerContext` for each call to it.
@@ -28,10 +32,6 @@ fn to_napi(error: core::ServiceError) -> Error {
   Error::from_reason(serde_json::to_string(&error).expect("a service error serializes"))
 }
 
-fn from_json<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
-  serde_json::from_value(value).map_err(|error| to_napi(core::error::bad_request(error.to_string())))
-}
-
 fn to_json(value: impl serde::Serialize) -> Result<Value> {
   serde_json::to_value(value).map_err(|error| to_napi(core::error::internal(error.to_string())))
 }
@@ -41,20 +41,20 @@ fn service_error(data: Value) -> core::ServiceError {
   serde_json::from_value(data.clone()).unwrap_or_else(|_| core::error::internal(format!("Malformed service error: {data}")))
 }
 
-// A JS callback, `(error, value)`, as the core's answer to a call: called once,
-// later, on the JS thread whose env it was given on.
-type Answer = Box<dyn FnOnce(core::Result<Value>)>;
+type Callback<'a> = Function<'a, FnArgs<(Value, Value)>, ()>;
 
-fn answer(env: &Env, callback: Function<'_, FnArgs<(Value, Value)>, ()>) -> Result<Answer> {
+// A JS callback, `(error, value)`, as the core's answer to a call or a watch:
+// called on the JS thread whose env it was given on.
+fn answering(env: &Env, callback: Callback<'_>) -> Result<Rc<dyn Fn(core::Result<Value>)>> {
   let callback = callback.create_ref()?;
   let raw = env.raw();
-  Ok(Box::new(move |result| {
+  Ok(Rc::new(move |result| {
     let env = Env::from_raw(raw);
     let args = match result {
       Ok(value) => (Value::Null, value),
       Err(error) => (json!(error), Value::Null),
     };
-    // The runtime's callbacks only settle a Promise; they never throw.
+    // The runtime's callbacks only settle a Promise or queue a delivery; they never throw.
     if let Ok(callback) = callback.borrow_back(&env) {
       let _ = callback.call(args.into());
     }
@@ -114,36 +114,33 @@ impl Carbon {
     self.inner.register(core::Service::replicated(&name, &version, binding.as_deref(), set_up, run)).map_err(to_napi)
   }
 
-  // Submit a call to a space, opening it first, or to the system handle when no
-  // space is named. `reply` is called with (error, {value, tables}).
+  // Make a call by its service key to a space, or to the system handle when no
+  // space is named, as the identity named or as no one. `reply` is called with (error, value).
   #[napi]
-  pub fn call(&self, env: Env, space: Option<String>, actor: Value, call: Value, input: Value, reply: Function<'_, FnArgs<(Value, Value)>, ()>) -> Result<()> {
-    let reply = answer(&env, reply)?;
-    let (actor, call): (core::Actor, core::Call) = (from_json(actor)?, from_json(call)?);
-    let carbon = Rc::clone(&self.inner);
-    let submit = move |space: core::Result<Rc<core::Space>>| match space {
-      Ok(space) => carbon.submit(&space, actor, call, input, Box::new(move |settled| reply(settled.map(|settled| json!(settled))))),
-      Err(error) => reply(Err(error)),
-    };
-    match space {
-      Some(id) => Rc::clone(&self.inner).with_space(&id, Box::new(submit)),
-      None => submit(Ok(Rc::clone(self.inner.system()))),
-    }
+  pub fn call(&self, env: Env, space: Option<String>, identity: Option<String>, key: String, input: Value, reply: Callback<'_>) -> Result<()> {
+    let reply = answering(&env, reply)?;
+    self.inner.call(space.as_deref(), identity.as_deref(), &key, input, Box::new(move |answer| reply(answer)));
     Ok(())
   }
 
-  // Hear every commit to a space, with the tables it wrote.
+  // Run a GET on a space now and after every commit that writes what it read,
+  // as the identity named; `listener` is called with (error, value) each time.
+  // Returns the id that stops it.
   #[napi]
-  pub fn watch(&self, env: Env, space: String, listener: Function<'_, Vec<String>, ()>) -> Result<()> {
-    let listener = listener.create_ref()?;
-    let raw = env.raw();
-    self.inner.listen(&space, Rc::new(move |tables: &[String]| {
-      let env = Env::from_raw(raw);
-      if let Ok(listener) = listener.borrow_back(&env) {
-        let _ = listener.call(tables.to_vec());
-      }
-    }));
-    Ok(())
+  pub fn watch(&self, env: Env, space: String, identity: Option<String>, key: String, listener: Callback<'_>) -> Result<u32> {
+    self.inner.watch(&space, identity.as_deref(), &key, answering(&env, listener)?).map_err(to_napi)
+  }
+
+  // The ref in a space to `kind:slug`, found at once: the space it points to, its kind, name and slug.
+  #[napi]
+  pub fn find_ref(&self, space: String, kind: String, slug: String) -> Result<Value> {
+    self.inner.find_ref(&space, &kind, &slug).map_err(to_napi)
+  }
+
+  // Stop a watch or a RunState listener.
+  #[napi]
+  pub fn unwatch(&self, id: u32) {
+    self.inner.unwatch(id)
   }
 
   // A space's RunState: `{state: 'initializing', services}`, `{state: 'idle'}`,
@@ -153,18 +150,17 @@ impl Carbon {
     to_json(self.inner.run_state(&space))
   }
 
-  // Hear every change of a space's RunState.
+  // Hear every change of a space's RunState. Returns the id that stops it.
   #[napi]
-  pub fn watch_run_state(&self, env: Env, space: String, listener: Function<'_, Value, ()>) -> Result<()> {
+  pub fn watch_run_state(&self, env: Env, space: String, listener: Function<'_, Value, ()>) -> Result<u32> {
     let listener = listener.create_ref()?;
     let raw = env.raw();
-    self.inner.listen_run_state(&space, Rc::new(move |state: &core::RunState| {
+    Ok(self.inner.watch_run_state(&space, Rc::new(move |state: &core::RunState| {
       let env = Env::from_raw(raw);
       if let Ok(listener) = listener.borrow_back(&env) {
         let _ = listener.call(json!(state));
       }
-    }));
-    Ok(())
+    })))
   }
 
   // Resume a space a system failure stopped, once the failure is fixed.
@@ -181,12 +177,6 @@ impl Carbon {
   #[napi]
   pub fn identity(&self, slug: String) -> Result<Value> {
     to_json(self.inner.identity(&slug).map_err(to_napi)?)
-  }
-
-  // The ids of every space on this device.
-  #[napi]
-  pub fn spaces(&self) -> Result<Vec<String>> {
-    self.inner.space_ids().map_err(to_napi)
   }
 }
 
@@ -259,9 +249,9 @@ impl HandlerContext {
 
   // Make a call by its service key from inside this one; `reply` is called with (error, value).
   #[napi]
-  pub fn call(&self, env: Env, key: String, input: Value, reply: Function<'_, FnArgs<(Value, Value)>, ()>) -> Result<()> {
-    let reply = answer(&env, reply)?;
-    Rc::clone(&self.inner).call(&key, input, reply);
+  pub fn call(&self, env: Env, key: String, input: Value, reply: Callback<'_>) -> Result<()> {
+    let reply = answering(&env, reply)?;
+    Rc::clone(&self.inner).call(&key, input, Box::new(move |answer| reply(answer)));
     Ok(())
   }
 

@@ -150,14 +150,10 @@ impl Store {
     }
   }
 
-  // A read on its own connection, over a snapshot of committed state.
+  // A read on its own connection, over a snapshot of committed state; a
+  // system failure it meets stops this store's space.
   pub fn reader(&self) -> Result<Reader> {
-    let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(sqlite)?;
-    connection.busy_timeout(Duration::ZERO).map_err(sqlite)?;
-    let access = guard(&connection)?;
-    batch(&connection, &self.failure, "BEGIN")?;
-    start_reading(&access);
-    Ok(Reader { connection, access, failure: Rc::clone(&self.failure) })
+    Reader::over(&self.path, Rc::clone(&self.failure))
   }
 
   // Bring the core's own tables in this file up to date, in one transaction:
@@ -200,6 +196,20 @@ pub struct Reader {
 }
 
 impl Reader {
+  // A read of a file no store holds open here, over a snapshot of committed state.
+  pub fn open(path: &Path) -> Result<Reader> {
+    Reader::over(path, Failure::default())
+  }
+
+  fn over(path: &Path, failure: Failure) -> Result<Reader> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(sqlite)?;
+    connection.busy_timeout(Duration::ZERO).map_err(sqlite)?;
+    let access = guard(&connection)?;
+    batch(&connection, &failure, "BEGIN")?;
+    start_reading(&access);
+    Ok(Reader { connection, access, failure })
+  }
+
   // End the read and return the tables it read.
   pub fn end(&self) -> Result<Vec<String>> {
     let ended = batch(&self.connection, &self.failure, "COMMIT");

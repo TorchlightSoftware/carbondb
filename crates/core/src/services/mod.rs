@@ -84,6 +84,7 @@ impl Services {
   }
 
   pub fn register(&self, service: Service) -> Result<Rc<Service>> {
+    namespace::check_parts(std::iter::once(service.name.as_str()).chain(service.binding.as_deref()))?;
     let mut registered = self.registered.borrow_mut();
     if registered.contains_key(&service.name) {
       return Err(conflict(format!("A service '{}' is already registered on this device", service.name)));
@@ -150,6 +151,18 @@ mod tests {
     }
     assert_eq!(services.version("chat"), "v1");
     assert_eq!(services.get("chat").unwrap().prefix().unwrap(), Some("chat/db/".into()));
+  }
+
+  #[test]
+  fn refuses_a_name_that_would_nest_inside_another_service_namespace() {
+    let services = Services::builtin();
+    services.register(service("chat")).unwrap();
+    let nested = [Service::replicated("chat/db", "v1", Some("db"), Rc::new(|_: Rc<dyn Db>| Ok(())), Rc::new(|_| {})), Service::replicated("notes", "v1", Some("db/x"), Rc::new(|_: Rc<dyn Db>| Ok(())), Rc::new(|_| {}))];
+    for service in nested {
+      let name = service.name.clone();
+      assert_eq!(services.register(service).err().unwrap().status, 400, "{name}");
+      assert!(services.find(&name).is_none(), "{name}");
+    }
   }
 
   #[test]

@@ -6,9 +6,10 @@
 //! The rewrite parses each statement with sqlparser to find the names, then
 //! replaces them where they stand in the original text, so the statement runs
 //! exactly as written but for its names. A column qualified by a table's name,
-//! as in `note.text`, follows its table. SQLite's own tables and table-valued
-//! functions keep their names, and the authorizer refuses whatever else
-//! reaches outside the service's prefix.
+//! as in `note.text`, follows its table. The table-valued functions SQLite
+//! ships keep their names. SQLite's own tables and pragma functions describe
+//! the whole file, every service in it, so a statement naming one is refused;
+//! the authorizer refuses whatever else reaches outside the service's prefix.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -26,6 +27,16 @@ use crate::error::{Result, ServiceError, bad_request};
 // The namespace of one service's `sql` binding: `chat/db/`.
 pub fn prefix(service: &str, binding: &str) -> String {
   format!("{service}/{binding}/")
+}
+
+// Refuse a service or binding name holding a slash, which separates a
+// namespace's parts: a service `chat/db` with binding `db` would own
+// `chat/db/db/`, inside the namespace of `chat`'s `db`.
+pub fn check_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Result<()> {
+  match parts.into_iter().find(|part| part.contains('/')) {
+    Some(part) => Err(bad_request(format!("'{part}' holds a slash, which would nest its namespace inside another service's, so it cannot name a service or binding"))),
+    None => Ok(()),
+  }
 }
 
 // SQL as SQLite should run it: its text with every name the service owns
@@ -51,15 +62,15 @@ struct Names {
   qualifiers: Vec<Ident>,
   // Names that stand for something else in this statement: CTEs and aliases.
   local: BTreeSet<String>,
-  // Names a service may not reach: another schema, as in `main.note`, or a pragma.
+  // Names a service may not reach: another schema, as in `main.note`, SQLite's own tables, or a pragma.
   refused: Vec<String>,
 }
 
 impl Names {
   fn owns(&mut self, name: &ObjectName) {
     match name.0.as_slice() {
-      [ObjectNamePart::Identifier(ident)] if ident.value.to_lowercase().starts_with("pragma_") => self.refused.push(name.to_string()),
-      [ObjectNamePart::Identifier(ident)] if !unowned(&ident.value) => self.owned.push(ident.clone()),
+      [ObjectNamePart::Identifier(ident)] if whole_file(&ident.value) => self.refused.push(name.to_string()),
+      [ObjectNamePart::Identifier(ident)] if !shipped_function(&ident.value) => self.owned.push(ident.clone()),
       [ObjectNamePart::Identifier(_)] => {}
       _ => self.refused.push(name.to_string()),
     }
@@ -78,10 +89,15 @@ impl Names {
   }
 }
 
-// SQLite's own tables and the table-valued functions it ships keep their names.
-fn unowned(name: &str) -> bool {
+// SQLite's own tables and pragma functions, which describe every service in the file.
+fn whole_file(name: &str) -> bool {
   let name = name.to_lowercase();
-  name.starts_with("sqlite_") || ["json_each", "json_tree", "generate_series"].contains(&name.as_str())
+  name.starts_with("sqlite_") || name.starts_with("pragma_")
+}
+
+// The table-valued functions SQLite ships, which keep their names.
+fn shipped_function(name: &str) -> bool {
+  ["json_each", "json_tree", "generate_series"].contains(&name.to_lowercase().as_str())
 }
 
 impl Visitor for Names {
@@ -230,7 +246,6 @@ mod tests {
         r#"INSERT INTO "chat/db/tag" (name) VALUES (?) ON CONFLICT (name) DO UPDATE SET name = excluded.name"#,
       ),
       ("SELECT value FROM message, json_each(message.tags)", r#"SELECT value FROM "chat/db/message", json_each("chat/db/message".tags)"#),
-      ("SELECT name FROM sqlite_schema", "SELECT name FROM sqlite_schema"),
       (
         "CREATE TRIGGER touch AFTER UPDATE ON message FOR EACH ROW BEGIN UPDATE message SET edited = 1 WHERE id = NEW.id; END",
         r#"CREATE TRIGGER "chat/db/touch" AFTER UPDATE ON "chat/db/message" FOR EACH ROW BEGIN UPDATE "chat/db/message" SET edited = 1 WHERE id = NEW.id; END"#,
@@ -262,7 +277,8 @@ mod tests {
 
   #[test]
   fn refuses_what_it_cannot_namespace() {
-    for sql in ["SELECT * FROM main.message", "SELECT * FROM pragma_table_info('message')", "SELEKT 1"] {
+    let refused = ["SELECT * FROM main.message", "SELECT * FROM pragma_table_info('message')", "SELECT sql FROM sqlite_schema", "SELECT sql FROM SQLITE_MASTER", "SELEKT 1"];
+    for sql in refused {
       assert_eq!(rewrite(sql, "chat/db/").unwrap_err().status, 400, "{sql}");
     }
   }

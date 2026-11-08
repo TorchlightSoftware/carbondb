@@ -44,10 +44,19 @@ struct IdentityInput {
 }
 
 
+// An identity on this device, by its slug.
 pub fn find(system: &dyn Db, slug: &str) -> Result<Identity> {
-  let row = system.get("SELECT slug, id, space, personal, device FROM carbon_system_identity WHERE slug = ?", &[json!(slug)])?;
+  one(system.get("SELECT slug, id, space, personal, device FROM carbon_system_identity WHERE slug = ?", &[json!(slug)])?, slug)
+}
+
+// An identity on this device, by its id: the identity a call acts as, with the device it holds here.
+pub fn acting(system: &dyn Db, id: &str) -> Result<Identity> {
+  one(system.get("SELECT slug, id, space, personal, device FROM carbon_system_identity WHERE id = ?", &[json!(id)])?, id)
+}
+
+fn one(row: Value, named: &str) -> Result<Identity> {
   if row.is_null() {
-    return Err(not_found(format!("No identity '{slug}' on this device")));
+    return Err(not_found(format!("No identity '{named}' on this device")));
   }
   Ok(serde_json::from_value(row)?)
 }

@@ -35,7 +35,7 @@ A generator writes `service.toml` from a `wrangler.toml` for services ported fro
 - A handler sees only bindings to storage that already exists, as a Worker sees `env.DB`. It never creates storage, generates keys or touches the system database.
 - A space keeps every service's tables in its one database file, namespaced per service, so an op touching several services commits atomically: SQLite commits across attached files atomically per file only in WAL mode. For now a service declares at most one `sql` binding.
 - A device sets up a space's services when it applies the op that creates the space or changes its services, and again on every open: it calls each service's `init` in a transaction of its own, outside any op, then checks its tables' keys. This is internal to the core; nothing calls it directly. Every replica does it locally on receiving the op.
-- Each statement a service runs is rewritten by the core into its namespace, `service/binding/name`, and SQLite's authorizer refuses anything outside it.
+- Each statement a service runs is rewritten by the core into its namespace, `service/binding/name`, and SQLite's authorizer refuses anything outside it. A statement naming SQLite's own tables or pragma functions, which describe every service in the file, is refused, and a service or binding name may not hold a slash, which would nest one service's namespace inside another's.
 - A WASM module reaches its bindings through host functions linked into its instance: `run`, `get` and `all` on a named `sql` binding, plus `call` for calls on other services, such as `[space]`. The host resolves a binding name to that service's own file, so a module can never name another service's storage. npm packages receive the same shape as JS objects.
 
 ## The op

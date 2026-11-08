@@ -21,9 +21,9 @@ use serde_json::{Value, json};
 use crate::error::{Result, not_built, single_node};
 use crate::service_call::ServiceCall;
 use crate::services::Service;
-use crate::{Db, HandlerContext};
+use crate::{Db, HandlerContext, Routing};
 
-pub use identities::{Identity, SYSTEM_MIGRATIONS, find};
+pub use identities::{Identity, SYSTEM_MIGRATIONS, acting, find};
 
 // `[@carbon]` as the core registers it. It is not a package: no peer checks
 // its version, so its version is the core's own.

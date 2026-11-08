@@ -154,7 +154,7 @@ The steps for each op:
 2. It hands the call to the service's entry point and waits for it to settle. Handlers may be async.
 3. Database calls from the handler are synchronous and run inside the open transaction.
 4. When the Promise resolves, the core records the op's result and commits, taking the session's changeset; replicated mode keeps it with the op. When it rejects or returns an error, the core rolls back and records the op's result as refused, with its error.
-5. The core gives the runtime one notice per commit: op, outcome and the tables its changeset changed. `watch` is built on this, and apps get no separate event API.
+5. The core keeps every watch: a GET, the tables it read, and when it must run again after a commit that changed one of them, or after its space stops or resumes. A call from the app is answered once the watches its commit touched have run again. The runtime only registers watches and hands each answer to the app, and apps get no separate event API.
 
 Timeouts and refusals:
 
@@ -326,7 +326,7 @@ During a partition, GETs read the local copy, and writes apply locally and publi
 
 ## Core and runtime
 
-**The core (Rust)** owns the p2panda nodes and spaces, identity and devices, the op envelope and clock, the shared order, SQLite execution, sessions, undo, rewind, the apply loop, routing by service name, and `[@carbon]`. It ships `[space]`, `[identity]` and `[device]` as packages written against the service API, like any other service: the core reads and writes their records only through calls to them. It knows nothing of app schemas, routes, zod, roles or merge strategy.
+**The core (Rust)** owns the p2panda nodes and spaces, identity and devices, the op envelope and clock, the shared order, SQLite execution, sessions, undo, rewind, the apply loop, routing by service name, and `[@carbon]`. It ships `[space]`, `[identity]` and `[device]` as packages written against the service API, like any other service: the core reads and writes their records only through calls to them, but for one exception: where an app needs an answer at once, as a handle finding a ref, the core reads a service's tables directly, namespaced, read-only and over committed state. It also keeps what an app needs from CarbonDB itself, such as watches and the device an identity acts from, so the runtime holds no CarbonDB state. It knows nothing of app schemas, routes, zod, roles or merge strategy.
 
 **The service runtime (JS)** owns the entry point of each npm service: its route matching, the handler context, its migrations and its access checks.
 

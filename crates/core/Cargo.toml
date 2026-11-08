@@ -17,6 +17,7 @@ serde_json.workspace = true
 ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
 self_cell = "1.2.1"
+service-key = "0.6.0"
 sqlparser = { version = "=0.63.0", features = ["visitor"] }
 toml = "1.1.8"
 

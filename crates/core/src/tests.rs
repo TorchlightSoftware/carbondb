@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::results::{self, Outcome};
 use crate::testing::{actor, alice, call_now, carbon, room, space_now, texts};
-use crate::{Actor, Db, oplog};
+use crate::{Actor, Db, Routing, oplog};
 
 // The keys of a space's op log, in order.
 fn logged(space: &crate::Space) -> Vec<String> {
@@ -194,7 +194,7 @@ mod run_states {
   fn states_of(carbon: &Rc<crate::Carbon>, space: &crate::Space) -> Rc<RefCell<Vec<String>>> {
     let seen = Rc::new(RefCell::new(vec![]));
     let into = Rc::clone(&seen);
-    carbon.listen_run_state(&space.id, Rc::new(move |state: &RunState| into.borrow_mut().push(serde_json::to_value(state).unwrap()["state"].as_str().unwrap().to_string())));
+    carbon.watch_run_state(&space.id, Rc::new(move |state: &RunState| into.borrow_mut().push(serde_json::to_value(state).unwrap()["state"].as_str().unwrap().to_string())));
     seen
   }
 

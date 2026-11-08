@@ -19,7 +19,7 @@ use std::rc::Rc;
 use serde_json::{Value, json};
 
 use crate::error::{Result, conflict, internal, unknown};
-use crate::{Actor, Call, Carbon, Db, HandlerContext, Identity, Service, Settled, Space};
+use crate::{Actor, Call, Carbon, Db, HandlerContext, Identity, Routing, Service, Settled, Space};
 
 // A single-node CarbonDB in a temporary directory, which lives as long as the
 // directory, running `[notes]`.

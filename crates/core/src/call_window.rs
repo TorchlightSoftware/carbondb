@@ -194,7 +194,10 @@ mod tests {
   fn the_authorizer_refuses_a_service_reaching_outside_its_namespace() {
     let (_directory, store) = store();
     let scoped = store.scoped(chat(None));
-    let refused = ["PRAGMA writable_schema = 1", "ATTACH 'other.db' AS other"];
+    // A service reads the columns of its own tables only, as the session does when an op changes one.
+    scoped.run("CREATE TABLE note (id TEXT PRIMARY KEY) WITHOUT ROWID", &[]).unwrap();
+    assert_eq!(scoped.all("PRAGMA table_xinfo('chat/db/note')", &[]).unwrap().len(), 1);
+    let refused = ["PRAGMA writable_schema = 1", "ATTACH 'other.db' AS other", "PRAGMA table_xinfo('message')", "PRAGMA table_xinfo('notes/db/note')"];
     for sql in refused {
       assert_eq!(scoped.all(sql, &[]).unwrap_err().status, 403, "{sql}");
     }
