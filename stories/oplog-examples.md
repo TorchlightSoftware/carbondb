@@ -129,7 +129,7 @@ team:sales
 
 - A `[space]/ref` only points; it grants nothing. Reaching a space needs both the refs to exist and access to the space, and what is possible there depends on that access. Which teams to show someone is up to the services running in the space.
 - `POST [device]/origin` is what authorizes a key to act for an identity, and it carries only the public key, because the identity space may be published. A device's name and tags go in a `[device]/ref` in the personal space, and its private key stays in `system`.
-- `[identity]` in an identity space is CarbonDB's own service for the identity's origin. The `identity` in FooCorp's services is the app's own role service. They are different services.
+- `[identity]` in an identity space is CarbonDB's own service for the identity's origin. The `identity` in FooCorp's services is the app's own role service. They are different services, which needs [a space's origin naming its packages](packages.md#a-spaces-origin-names-its-packages), not built yet.
 - `manage` is CarbonDB's own permission. CarbonDB maps it onto p2panda's Manage, which p2panda grants only to individual devices.
 - `manage:[self]` on an identity space means the identity manages itself, since its id does not exist until its origin ops are written.
 - `manage:[]` means no one may delete the space or add members; the space dissolves when all members leave.

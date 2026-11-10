@@ -1,6 +1,6 @@
 # A person can add members to a shared space
 
-Status: agreed
+Status: agreed — needs replication; single-node refuses these calls with a 501
 
 ## Calls
 

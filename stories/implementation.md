@@ -1,6 +1,6 @@
 # CarbonDB first draft: implementation notes
 
-Status: agreed — single-node built (build steps 1 to 3), with the op log and results kept apart, per-service namespacing and init(), and a local op carrying its sub-calls on its log row; replicated mode not started, so nothing replays sub-calls yet
+Status: agreed — single-node built (build steps 1 and 2): the whole app interface, the op log and results kept apart, per-service namespacing and init(), watches in the core, call timeouts, and a local op carrying its sub-calls on its log row; replicated mode (step 4) is next, so nothing replays sub-calls or rewinds yet
 
 This is everything we agreed that the code has to honour, gathered in one place for whoever builds the first draft. The nine numbered stories say what a person can do, [services.md](services.md) lists the builtin calls, and [oplog-examples.md](oplog-examples.md) shows them in use. This file covers what happens underneath. Where older notes disagree with it, this file wins.
 
@@ -8,21 +8,22 @@ The spec is the app interface: what an app calls and what CarbonDB guarantees in
 
 ## Build order
 
-1. **Single-node CarbonDB:** the Rust core behind napi-rs, with no p2panda, delivering the whole app interface below. Ops already go through each space's OpWriter, op log, pending ops and results, the same path synced ops will take, and each op already records its session changeset.
-2. **[chat] on it:** `main()` loads CarbonDB, registers [chat] with `carbon.services.add('chat', chat)` and gets a handle. [chat] stays small, resembling an ordinary backend service with minimal dependencies, with plain SQL and no build step.
-3. **A small JS HTTP adapter** in front of [chat]. The tests talk to it over HTTP.
+1. **Single-node CarbonDB:** the Rust core behind napi-rs, with no p2panda, delivering the whole app interface below. Ops already go through each space's OpWriter, op log, pending ops and results, the same path synced ops will take, and each op's session changeset already says which tables it wrote.
+2. **[chat] on it:** `main()` loads CarbonDB, registers [chat] with `carbon.services.add('chat', chat)` and reaches its space through refs. [chat] stays small, resembling an ordinary backend service with minimal dependencies, with plain SQL and no build step.
+3. **A small JS HTTP adapter** in front of [chat]. Not built: the tests call a space handle directly, and an adapter is app code (see [Remote access stays outside CarbonDB](#remote-access-stays-outside-carbondb)).
 4. **Replicated mode:** rewind and p2panda spaces, switched on by config with no change to the app.
 
 The hello world is create a space, post, edit, delete, list and watch, on single-node CarbonDB. Adding a member and joining (story 7) arrive with replicated mode. Richer service runtimes come later on the same app interface.
 
 ## The app interface
 
-- **Setup:** an app's `main()` loads CarbonDB with its TOML config, registers each service with `carbon.services.add(name, impl)`, where `impl` is the service's exported object, and gets the `carbon` handle. Whether it runs single-node or replicated is a config setting, so switching is a config change, not a refactor of the app.
+- **Setup:** an app's `main()` loads CarbonDB with its TOML config, registers each service with `carbon.services.add(name, impl)`, where `impl` is the service's exported module (its `manifest`, `init` and `calls`), and gets the `carbon` handle. Whether it runs single-node or replicated is a config setting, so switching is a config change, not a refactor of the app.
 - **Handles:** one per space, reached through refs from `carbon` (see [Handles](#handles)).
-- **`call(key, input)`:** runs the service's handler and resolves with its result once this device has applied it, or rejects with a service error.
+- **`call(key, input)`:** runs the service's handler and resolves with its result, or rejects with a service error. A GET answers at once; a write once this device has applied it and the watches its commit owes a run have run again.
+- **Timeouts:** every call must settle within its service's `timeout`, or it rejects with a `504`.
 - **`watch(key, fn)`:** re-runs a GET and hands `fn` the result after each commit that touched what it read, and returns a function that stops it.
 - **Service errors:** a rejection carries an HTTP-style status, a code and details, preserved across the core boundary (see [Service errors](#service-errors)).
-- **Handlers** receive `path`, `input`, `db` and `call`, and `op` when the call writes. `op` carries the key, path, input, the verified author and device as plain data, the time, `id()` and `random()`. `call(key, input)` makes a call inside this one (see [Applying an op](#applying-an-op)).
+- **Handlers** receive `path`, `input`, `env` (the service's `sql` binding, under the name its `service.toml` gives it) and `call`, and `op` when the call writes. `op` carries the key, path, input, the verified author and device as plain data, the time, `id()` and `random()`. `call(key, input)` makes a call inside this one (see [Applying an op](#applying-an-op)).
 
 The host function handlers use for SQL is internal and is not part of the spec.
 
@@ -36,7 +37,7 @@ mode = "none"   # single-node: no p2panda node is started
 - The same app interface and builtin services, on the Rust core with no p2panda and no network.
 - Identities, spaces and refs exist locally, so handles reach spaces the same way.
 - The op log is kept from the first draft, so local calls and synced ops share one apply path from the start.
-- Calls that need p2panda reject: `POST [@carbon]/members`, `POST [@carbon]/join`, `POST [@carbon]/sync/start`, and `POST [device]/origin` for a second device.
+- Calls that need p2panda reject: `POST [@carbon]/members`, `POST [@carbon]/join`, `POST [@carbon]/sync/start`, `POST [@carbon]/devices`, `POST [@carbon]/identity` with a `code`, and `POST [device]/origin` for a second device.
 - `GET [@carbon]/status` answers `sync: 'off'`, `peers: []`, and full access for the local identity, since nothing else answers who has access.
 - A single-node instance cannot switch to replicated later. Its data does not carry over.
 
@@ -72,7 +73,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 
 - **Packaging:** one native binary per platform. JS apps drive it as a library, and the Node binding is a napi-rs native module.
 - **Handlers:** service handlers run in the host Node process and call the core for storage and sync. Route definitions stay in JS. Validating a call's input is the service's own business: a handler that validates throws `validationError`, and CarbonDB never sees its schema.
-- **SQLite:** real SQLite in the Rust core. Internally, Rust exposes one `execute(sql, params, method)` host function to handlers, where `method` is Drizzle sqlite-proxy's run, all, get or values.
+- **SQLite:** real SQLite in the Rust core. A handler's `sql` binding offers `run`, `get` and `all`, each one statement with its parameters, run by the core in the call's transaction.
 - **rusqlite:** pinned to 0.39.0 with the `session` and `bundled` features. Version 0.41.1 cannot link beside sqlx 0.9, because it needs libsqlite3-sys 0.39 and sqlx-sqlite 0.9.0 needs below 0.38.
 - **p2panda:** provides transport, signed per-author logs and spaces, so sqlite-sync and cr-sqlite are not needed. Only capture and merge are ours.
 
@@ -81,7 +82,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 - The TOML file names the system database, which holds identities and the system log. `configure` reads it once, and no other call takes a directory.
 - Each space file sits beside the system database, named by space id.
 - Each identity has its own p2panda store file beside it, because a p2panda node takes one set of credentials and one machine may hold several unlinkable identities. That means one p2panda node per identity on a device.
-- A space's op log and changesets live in its own file, so they commit atomically with application writes. The session records every table but the op log and results, using rusqlite's `table_filter`.
+- A space's op log and results live in its own file, so they commit atomically with application writes. The session records every table but the op log and results, using rusqlite's `table_filter`.
 - The core's own tables, the op log and results in every space file and the identities in the system database, move forward by migrations, tracked in `carbon_migrations` and applied in one transaction when the file opens. The system database's file applies a space's migrations, then its own. Until 1.0 these migrations may be consolidated, and development databases deleted when they are.
 
 ## Spaces and services
@@ -92,9 +93,9 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 - **Local services,** marked `[@name]`, run on this device in the context of the space they are called from. They are often built to facilitate system calls which need to be called once and only once.  They can call replicated services, and often do in order to set up replicated record keeping. Replicated services can never call local services, because this would cause them to duplicate their effects. This means that for now a replicated handler therefore cannot create a space - we may revisit this.
 - **`[@carbon]`** is the core's local service, implemented in Rust because it reaches keys and p2panda. Its API calls must happen once, on one device.
 - **`[space]`** runs in every replicated space: its origin, refs, members and manage list.
-- **`[identity]`** runs in identity spaces: the identity's origin. An app may run its own service of the same name, such as one holding roles, in other spaces; the two never share a space.
+- **`[identity]`** runs in identity spaces: the identity's origin. An app may run its own service of the same name, such as one holding roles, in other spaces; the two never share a space. That waits on [a space's origin naming its packages](packages.md#a-spaces-origin-names-its-packages): today a name CarbonDB uses cannot be registered by an app.
 - **`[device]`** follows `[space]`'s pattern: `POST [device]/origin` in the identity space authorizes a device's public key, and `POST [device]/ref` in the personal space records its name and tags. A second ref for the same key replaces the first.
-- **Local ops:** an op on a local service is kept in the op log of the space it ran in, marked with the device that ran it, and replicated like any other once it has applied, so the log shows every action behind a space's state. Its sub-calls, the calls it made to replicated services in that space whose writes committed, are written onto its log row in the order made, each with its own stamp and input, in the same transaction that records its result. A refused sub-call changed nothing, so it is not carried; its outcome stays in the local op's result. Only local ops carry sub-calls: a replicated op replays by re-running itself, calls included. Every replay of a local op, on other devices and in a rewind on the device that ran it, runs its sub-calls in one transaction and never the local op itself, so a local op stays as atomic everywhere as it was where it ran. Calls on the system handle, which belong to no space, go in the system log, the system database's op log, with their results there. Either gives one place to finish interrupted work after a crash.
+- **Local ops:** an op on a local service is kept in the op log of the space it ran in, marked with the device that ran it, and replicated like any other once it has applied, so the log shows every action behind a space's state. Its sub-calls, the calls it made to replicated services in that space whose writes committed, are written onto its log row in the order made, each with its own stamp and input, in the same transaction that records its result. A refused sub-call changed nothing, so it is not carried; its outcome stays in the local op's result. Only local ops carry sub-calls: a replicated op replays by re-running itself, calls included. Every replay of a local op, on other devices and in a rewind on the device that ran it, runs its sub-calls in one transaction and never the local op itself, so a local op stays as atomic everywhere as it was where it ran. Calls in the system space, which is not replicated, go in the system log, the system database's op log, with their results there. Either gives one place to finish interrupted work after a crash.
 
 ### Creating a space
 
@@ -153,7 +154,7 @@ The steps for each op:
 1. The core opens a transaction on the space's database, with a session recording its changes.
 2. It hands the call to the service's entry point and waits for it to settle. Handlers may be async.
 3. Database calls from the handler are synchronous and run inside the open transaction.
-4. When the Promise resolves, the core records the op's result and commits, taking the session's changeset; replicated mode keeps it with the op. When it rejects or returns an error, the core rolls back and records the op's result as refused, with its error.
+4. When the entry point settles it with a value, the core records the op's result and commits, taking the session's changeset; replicated mode keeps it with the op. When it settles with an error, or its deadline passes first, the core rolls back and records the op's result as refused, with its error.
 5. The core keeps every watch: a GET, the tables it read, and when it must run again after a commit that changed one of them, or after its space stops or resumes. A write from the app is answered once the watches its commit owes a run have run again: those that read a table it wrote, and those in flight when it landed, which are judged when they answer. A GET from the app answers at once. The runtime only registers watches and hands each answer to the app, and apps get no separate event API.
 
 Timeouts and refusals:

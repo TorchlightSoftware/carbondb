@@ -19,14 +19,14 @@ CarbonDB lets a service written in the shape of an ordinary backend service (nam
 - **Service**: a module of tables and calls keyed by service key (`POST [chat]/messages`), shipped as a package with its `service.toml`. Its version is the hash of its package.
 - **Registered services**: the services an app registers in `main()` on every start with `carbon.services.add(name, impl)`. A device applies ops only for services it has registered.
 - **system**: the root space, this device's local database and op log, holding what must be readable before any identity opens, such as the identities on this device. It is never replicated. Every other space is reached from it through refs, and `carbon` is its handle. Each space has one handle.
-- **Op**: a service call carried in a space's log, applied by every member's device in one shared order. An op on a local service runs only on the device that made it. It is kept in the op log of the space it ran in, marked with that device, together with the calls it made to replicated services there, and replicates with them; other devices run those calls and never the local op itself. Made on the system handle, it goes in the system log.
+- **Op**: a service call carried in a space's log, applied by every member's device in one shared order. An op on a local service runs only on the device that made it. It is kept in the op log of the space it ran in, marked with that device, together with the calls it made to replicated services there, and replicates with them; other devices run those calls and never the local op itself. Made in the system space, it goes in the system log.
 - **Local service**: a service marked `[@name]`, running on this device in the context of whichever space it is called from. It can call replicated services, and they can never call it. Anyone can run one against a space without installing it there, such as a personal automation on a phone; the space still applies its rules to every op it writes.
 - **Origin op**: a space's first op, `POST [space]/origin`, carrying what the space is: its kind, name, services and manage list. Those services fix what is in scope for the space.
 - **Ref**: a pointer from a log to a space, written with `POST [space]/ref`. It grants nothing; membership grants access. A space has many refs, and a device finds spaces by walking them from its identity space, through its personal space.
 - **Manage**: CarbonDB's own permission, listed on the origin op. CarbonDB maps it onto p2panda's Manage, which p2panda grants only to individual devices. With an empty list, no one may delete the space or add members, and it dissolves when all its members leave.
-- **[@carbon]**: the local service for this device's own CarbonDB, available in every space. It does what must happen once, on one device: generating keys, creating and joining spaces, and changing members and manage lists in p2panda. It handles its own namespace; no other service may.
+- **[@carbon]**: the local service for this device's own CarbonDB, available in the system space and in every space. It does what must happen once, on one device: generating keys, creating and joining spaces, and changing members and manage lists in p2panda. It handles its own namespace; no other service may.
 - **[space]**: the core service running in every replicated space, holding its origin, refs, members and manage list.
-- **[identity]**: CarbonDB's own service for an identity's origin, running only in identity spaces. An app may run its own service of the same name, such as one holding roles, in other spaces.
+- **[identity]**: CarbonDB's own service for an identity's origin, running only in identity spaces. An app may run its own service of the same name, such as one holding roles, in other spaces, once [a space's origin naming its packages](packages.md#a-spaces-origin-names-its-packages) is built; today a name CarbonDB uses cannot be registered by an app.
 - **[device]**: CarbonDB's own service for an identity's devices. In the identity space, `POST [device]/origin` records a device's public key, which authorizes that key to act for the identity. In the personal space, `POST [device]/ref` records each device's name and tags, the way `[space]/ref` points to a space from another one.
 
 ## Responsibilities
@@ -35,12 +35,12 @@ CarbonDB lets a service written in the shape of an ordinary backend service (nam
 
 - **Networking and membership, from p2panda:** the node, spaces and their members.
 - **Identity:** the device constellation (enroll a device by QR code, revoke one, recover with a paper key) and the blind relay, per the README.
-- **The op envelope:** device (signs and syncs), author (the person, for access control and audit), hybrid logical clock time, schema version, and the call itself as a body the core does not interpret beyond its service key.
+- **The op envelope:** device (signs and syncs), author (the person, for access control and audit), hybrid logical clock time, the version (the hash of the package that handles it), and the call itself as a body the core does not interpret beyond its service key.
 - **The shared order:** ops sorted by (time, device, op hash); duplicates dropped.
 - **SQLite:** one database of application tables per space, and the calls a handler uses to read and write it.
 - **Undo:** each op's writes recorded as a SQLite session changeset; rewinding applies the inverse changesets of the ops a late op must re-run, newest first.
 - **The apply-and-rewind loop:** the core owns the order and the changesets, so it decides when a handler runs or re-runs, and calls the service runtime to run it.
-- **Notices:** one per commit to the service runtime, with the op, its outcome and the tables it touched. `watch` is built on them, and apps get no separate event API.
+- **Watches:** the core keeps each watch's read set and re-runs its GET after every commit that wrote a table it read, and a write answers its caller once the watches its commit owes a run have run. Apps get no separate event API.
 - **Builtin services:** `[@carbon]`, `[space]`, `[identity]` and `[device]`, implemented in Rust.
 
 ### Repeatability of State Mutations
@@ -68,10 +68,12 @@ TODO: expand this as a set of rules that services need to follow in order to ens
 
 ### Service runtime (JavaScript)
 
-- **Routing:** a service key to its handler. Validating input is the service's own business.
-- **The handler context:** the call's input and path parameters, the author, and time, ids and randomness taken from the op so every replica computes the same values.
-- **Migrations:** the service's table definitions.
-- **Access:** whether this author may make this call.
+The core routes every call to a service by its name and hands it to the service's entry point. For an npm service, `@tlsft/carbondb` is that entry point:
+
+- **Routing:** a service key to its handler, within the service. Validating input is the service's own business.
+- **The handler context:** the call's input and path parameters, its `sql` binding under `env`, a way to make calls of its own, and the op, with its author and time, and ids and randomness drawn from it so every replica computes the same values.
+- **Schema:** the service's own `init` sets up its tables, for example by applying its migrations.
+- **Access:** whether this author may make this call. Not built: today a service checks it in its handlers.
 - **Later:** richer service runtimes, such as one that derives schema defaults from the op and builds queries from data, run on the same core.
 
 ### What the CarbonDB core never knows
@@ -80,10 +82,10 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 
 ## Applying an op
 
-1. The core picks the next op in the shared order and opens a transaction and a session on the space's database.
-2. It calls the service runtime's `apply` with the op and a database handle, and awaits the Promise it returns. Handlers may be async; the core waits for the Promise to settle before it continues.
-3. The handler reads and writes through the database handle. Those calls are synchronous and run inside the open transaction.
-4. When the Promise resolves, the core commits and keeps the session's changeset with the op. When it rejects or returns an error, the core rolls back and records the op's result as refused, with its error.
+1. The core picks the next op in the space's op log and opens a transaction and a session on the space's database.
+2. It routes the op by service name to the service's entry point, with a handler context. Handlers may be async; the core waits for the context to settle before it continues.
+3. The handler reads and writes through its `sql` binding. Those calls are synchronous and run inside the open transaction.
+4. When the context settles with a value, the core commits and records the op's result as applied, and the session's changeset says which tables it wrote. When it settles with an error, or not within its service's timeout, the core rolls back and records the result as refused, with its error. Keeping each changeset for undo comes with rewinds, which replication needs.
 5. One op at a time per space, since the transaction stays open across the handler's awaits.
 
 ## Undo, write sets and read sets

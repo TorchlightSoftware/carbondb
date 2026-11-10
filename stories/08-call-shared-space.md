@@ -1,6 +1,6 @@
 # A person can call a service in a shared space
 
-Status: agreed
+Status: agreed — the call is built single-node; ordering, rewind and sync between members need replication
 
 ## Calls
 

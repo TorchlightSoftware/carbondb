@@ -4,7 +4,7 @@ Status: backlog
 
 ## Why
 
-Services ported from Cloudflare Workers are written against D1: `env.DB.prepare(sql).bind(...).run()`, `first()`, `all()`, `raw()`, `batch()`, `exec()`, and a result carrying `meta.last_row_id`. CarbonDB's `db` binding offers `run`, `get` and `all` instead, so a port has to rewrite every query. The [packages](../packages.md) plan already ports a Worker's `wrangler.toml` and its D1 migrations; its queries are the missing piece.
+Services ported from Cloudflare Workers are written against D1: `env.DB.prepare(sql).bind(...).run()`, `first()`, `all()`, `raw()`, `batch()`, `exec()`, and a result carrying `meta.last_row_id`. A CarbonDB `sql` binding offers `run`, `get` and `all` instead, so a port has to rewrite every query. The [packages](../packages.md) plan already ports a Worker's `wrangler.toml` and its D1 migrations; its queries are the missing piece.
 
 ## Already agreed
 
@@ -13,7 +13,7 @@ Services ported from Cloudflare Workers are written against D1: `env.DB.prepare(
 
 ## Idea
 
-A layer over a service's `db` binding offering D1's statement API and result shape. It fills the `meta` fields that mean something here, notably `last_row_id` and `changes`, and leaves the rest as D1 does when it has nothing to say.
+A layer over a service's `sql` binding offering D1's statement API and result shape. It fills the `meta` fields that mean something here, notably `last_row_id` and `changes`, and leaves the rest as D1 does when it has nothing to say.
 
 ## To decide
 

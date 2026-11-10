@@ -4,7 +4,7 @@ Status: backlog
 
 ## Why
 
-Every op records its service's version, and a replica refuses an op made for a version it doesn't run, so two devices never run different code under one version and drift. Today an npm service's version is a hash the JS runtime computes over its handlers' source, its `init` and the migrations it exports (`packages/carbondb/src/services.js`). That misses every module a handler imports: change a helper and the version stays the same, so replicas can drift exactly as versioning is meant to prevent.
+Every op records its service's version, and a replica refuses an op made for a version it doesn't run, so two devices never run different code under one version and drift. Today the core hashes every file in an npm package's directory, beside its `service.toml` and without `node_modules`. That misses the code it takes from its dependencies: upgrade one and the version stays the same, so replicas can drift exactly as versioning is meant to prevent.
 
 ## Already agreed
 
@@ -16,7 +16,7 @@ From [packages](../packages.md):
 
 ## Idea
 
-`services.add` takes the version from the app, by default through the lookup utility, and the source hash goes away. The core already stamps the version on each op and refuses ops made for another, so nothing changes there.
+`services.add` takes the version from the app, by default through the lookup utility, and the directory hash goes away. The core already stamps the version on each op and refuses ops made for another, so nothing changes there.
 
 ## To decide
 

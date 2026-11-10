@@ -1,6 +1,6 @@
 # An app developer can register the services the app runs
 
-Status: agreed
+Status: implemented — single-node
 
 ## Calls
 
@@ -18,7 +18,7 @@ A service is its package: a `service.toml` and an exported module. The module ex
 - Nothing is loaded from hard-coded lists or the TOML file.
 - A service's version is the hash of its package, carried in every op.
 - A service without a `service.toml` is refused.
-- A space naming a service this device has not registered is refused.
+- Creating a space that names a service this device has not registered is refused with a 400. A space that already exists and names one opens initializing: its GETs to that service get a 404, and its ops wait until the service is registered.
 - Installing, updating and removing services at runtime is out of scope for the demo.
 
 ## Acceptance

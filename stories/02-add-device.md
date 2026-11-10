@@ -1,6 +1,6 @@
 # A person can add another device to their identity
 
-Status: agreed
+Status: agreed — needs replication; single-node refuses these calls with a 501
 
 ## Calls
 

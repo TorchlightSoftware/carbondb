@@ -26,7 +26,46 @@ CarbonDB is an experiment in creating a general purpose framework for applicatio
 
 ## Status
 
-Early prototyping. p2panda (on iroh) is the base for replication. The single-node hello world runs: [chat] on the Rust core with its JS runtime, served over HTTP by an example app. Replicated mode, with p2panda spaces, is next. The design is in [stories/](stories/README.md).
+The core API runs in single-node mode, and CarbonDB is ready for building replication on p2panda (on iroh). The design is in [stories/](stories/README.md).
+
+**What a service looks like**, as an initial proposal: a package with a `service.toml`, an `init` that sets up its tables, and handlers keyed by service key, written like ordinary backend code. One call from [packages/services/chat/index.js](packages/services/chat/index.js#L43-L51):
+
+```js
+'POST [chat]/messages': {
+  tags: ['append'],
+  handler: ({input, op, env: {db}}) => {
+    const {text} = parse(MessageInput, input)
+    const id = op.id()
+    db.run('INSERT INTO message (id, author, text, sent_at) VALUES (?, ?, ?, ?)', [id, op.author, text, op.time])
+    return {id}
+  }
+},
+```
+
+**What app code looks like:** load CarbonDB, register the services, and reach a space through refs, creating it on the first start. From [packages/services/chat/test/chat.test.js](packages/services/chat/test/chat.test.js#L20-L33):
+
+```js
+async function start(config) {
+  const carbon = await configure(config)
+  carbon.services.add('chat', chat)
+  const identities = await carbon.call('GET [@carbon]/identities')
+  const known = identities.some((identity) => identity.slug === 'app')
+  if (known) {
+    return carbon.ref('identity:app').ref('personal:app').ref('space:lobby')
+  } else {
+    await carbon.call('POST [@carbon]/identity', {slug: 'app', device: 'server'})
+    const personal = carbon.ref('identity:app').ref('personal:app')
+    await personal.call('POST [@carbon]/space', {name: 'Lobby', services: ['chat']})
+    return personal.ref('space:lobby')
+  }
+}
+```
+
+The app then calls the space, `lobby.call('POST [chat]/messages', {text: 'hello'})`, and watches it, `lobby.watch('GET [chat]/messages', render)`.
+
+**Built, single-node:** identities with their identity and personal spaces, nested spaces, refs, calls and watches, every op logged and applied in turn with its results, per-service tables, call timeouts, and services as packages, the builtins in Rust and [chat] on npm. The interface is in [packages/carbondb/README.md](packages/carbondb/README.md).
+
+**Next, replication:** p2panda spaces carry each space's ops between members' devices, which adding devices and members needs.
 
 `npm test` runs everything: the core's Rust tests, a native build, and the JS and end-to-end tests. It needs Rust and Node 22.
 

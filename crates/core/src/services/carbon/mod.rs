@@ -1,8 +1,10 @@
 //! `[@carbon]`, the device's local service: host code that runs once, on this
-//! device, and never replicates. It answers on the system handle, where
-//! identities are created and listed, and in every space, where spaces are
-//! created and the space's status is read. Calls that need peers, or that are
-//! designed but not built, are refused here.
+//! device, and never replicates. It answers in the system space, where
+//! identities are created and listed; in every space, where spaces are created
+//! and the space's status is read; and in identity spaces, where devices are
+//! added. Calls that need peers, or that are designed but not built, are
+//! refused here, and a call made in the wrong kind of space is told where it
+//! is answered.
 //!
 //! It is part of the core, not a service like the others: it reaches keys,
 //! space files and the system database directly, and later p2panda. Everything

@@ -11,11 +11,11 @@ CarbonDB ships four services. Their APIs are provisional and follow `stories/opl
 
 Most services are replicated, which is what creates our P2P collaboration capabilities.  `@carbon`, or any other service that you would see prepended by `@` is a local, non replicated service.  This is useful for making system calls or anything else that needs to run local only: actions that are private and not to be repeated for each peer.  Replicated services can call `[space]` when they have the access to do so, and can never call `[@carbon]`.
 
-CarbonDB's `[identity]` is distinct from an app's own service that may share the name; they should be able to operate side by side, with an app's [identity] offering RBAC for organization spaces, and CarbonDB's [identity] offering P2P personal identity management.  It doesn't seem like they should ever be operating in the same space, so naming conflict is not an issue for now?
+CarbonDB's `[identity]` is distinct from an app's own service that may share the name; they operate side by side, with an app's `[identity]` offering RBAC for organization spaces, and CarbonDB's `[identity]` offering P2P personal identity management. They never run in the same space, and service names are bound per space by its origin ([a space's origin naming its packages](packages.md#a-spaces-origin-names-its-packages)). Not built yet: today a name CarbonDB uses cannot be registered by an app.
 
 ## [@carbon]
 
-The local service for this device's own CarbonDB. Its calls are kept in the op log of the space they ran in, marked with this device, or in the system log for calls on the system handle, so an interrupted call can be finished after a crash (in theory). What it writes in replicated spaces goes through `[space]`, `[identity]` and `[device]`: in the space it runs in, as sub-calls carried on its own log row, which other devices replay without it; in another space, as ops there. The acting identity comes from the handle (current space).
+The local service for this device's own CarbonDB. Its calls are kept in the op log of the space they ran in, marked with this device, or in the system log for calls in the system space, so an interrupted call can be finished after a crash (in theory). What it writes in replicated spaces goes through `[space]`, `[identity]` and `[device]`: in the space it runs in, as sub-calls carried on its own log row, which other devices replay without it; in another space, as ops there. The acting identity comes from the handle (current space).
 
 | Call | Called from | Input | What it does |
 |---|---|---|---|

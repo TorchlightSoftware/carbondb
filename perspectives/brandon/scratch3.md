@@ -1451,3 +1451,48 @@ So yeah it seems like we should keep the routing in @carbon (the service) but pa
 
 Commit:
 standardize application boot and drop handle methods in favor of service calls
+
+---
+
+Let's update the README and stories.  In "Status" I would like you to spell out that:
+
+- we have an initial proposal for what services look like (https://github.com/TorchlightSoftware/carbondb/blob/main/packages/services/chat/index.js)
+- and what the app code should look like (https://github.com/TorchlightSoftware/carbondb/blob/main/packages/services/chat/test/chat.test.js#L20-L33)
+- core API is implemented in single node mode
+- ready for building replication
+
+I'd like it if you could both put examples from the links I posted, as well as link to those files within the codebase.
+
+In addition, I'd like you to update all stories, architecture and plans to be accurate per the present state of the code and the decisions that entails.
+
+Questions before you begin?
+
+---
+
+    How much of index.js to quote
+
+Just one of the service definitions.  `POST [chat]/messages` is sufficient.
+
+Other than that you're good.  Proceed.
+
+---
+
+    the docs promise that an app can run its own [identity] service, and the code refuses it. Several docs say it: stories/README.md, stories/implementation.md, and the FooCorp example in stories/oplog-examples.md. But registering a service under a name CarbonDB already uses is refused with a 409
+
+That's going to be a problem.  I should be able to have:
+
+system
+ |_ identity:Brandon [identity (carbon)], [space], [device]
+     |_ company:FooCorp [identity (Otto)], [space], [books], [automation]
+
+Services are namespaced on a per-space basis.  If there's no other [identity] registered in that space, it's perfectly valid for apps to register their own.
+
+---
+
+    The root cause is that the core keeps one name→service map per device, not per space
+
+That makes sense.
+
+    The space's origin records which package each name runs
+
+That sounds fantastic actually.  That's exactly the right place for a "manifest" of what the space requires.  I definitely think that should be our destination.  But we don't necessarilly need to implement it right now.  Agreed on updating packages.md and package-names.md.  Are you ready to do that?

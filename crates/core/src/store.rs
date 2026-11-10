@@ -4,7 +4,7 @@
 //!
 //! A store keeps one writer connection, on which one op's transaction runs at a
 //! time. A session records the transaction's changes as a changeset: what a
-//! rewind will undo, and the write set a commit notice carries, since it holds
+//! rewind will undo, and the write set watches re-run on, since it holds
 //! only rows whose values changed. A call made inside an op runs under a
 //! savepoint, so its writes roll back alone when it fails, and leave nothing in
 //! the changeset. The op log, results and the core's migrations are left out of

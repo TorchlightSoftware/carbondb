@@ -1,6 +1,6 @@
 # A person can call a service in their personal space
 
-Status: agreed
+Status: implemented — single-node
 
 ## Calls
 
