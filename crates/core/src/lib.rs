@@ -29,11 +29,11 @@ mod testing;
 mod tests;
 
 pub use call::{Call, Routing};
-pub use carbon::Carbon;
+pub use carbon::{Cancel, Carbon, Schedule};
 pub use carbondb_service_bindings::hash;
 pub use carbondb_service_bindings::{Actor, Db, HandlerContext, Op, Package, Reply};
 pub use dispatch::Settled;
 pub use error::{Result, ServiceError};
 pub use services::carbon::Identity;
-pub use services::{Entry, Init, Service};
+pub use services::{Entry, Init, NpmPackage, Service};
 pub use space::{RunState, Space};

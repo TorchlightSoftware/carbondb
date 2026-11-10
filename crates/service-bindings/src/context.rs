@@ -50,13 +50,15 @@ pub trait HandlerContext: Db {
   fn settle(&self, result: Result<Value>) -> Result<()>;
 }
 
-// A Rust service as its crate exports it: its name, version and `sql` binding
-// from its service.toml, the `init` that sets up its schema on every open, and
-// its entry point.
+// A Rust service as its crate exports it: its name, version, `sql` binding and
+// timeout from its service.toml, the `init` that sets up its schema on every
+// open, and its entry point.
 pub struct Package {
   pub name: &'static str,
   pub version: &'static str,
   pub binding: Option<&'static str>,
+  // Milliseconds every call to it must settle within; none takes the host's default.
+  pub timeout: Option<u64>,
   pub init: fn(&dyn Db) -> Result<()>,
   pub entry: fn(Rc<dyn HandlerContext>),
 }

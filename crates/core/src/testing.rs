@@ -11,25 +11,107 @@
 //!   {"call": "POST [notes]/run", "input": {..}}    make a call, adding its answer to the output
 //!   {"call": .., "catch": true}                    the same, adding a failure's status instead of failing
 //!   {"fail": "why"}                                fail with a 409
+//!   {"hang": true}                                 never settle, keeping the call for `hung`
+//!
+//! `GET [notes]/hang` never settles either. `[notes]` must settle within
+//! `NOTES_TIMEOUT`; the host's timers are `Timers`, and a test runs what the
+//! core scheduled when it says.
 
-use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::error::{Result, conflict, internal, unknown};
+use crate::carbon::Schedule;
 use crate::{Actor, Call, Carbon, Db, HandlerContext, Identity, Routing, Service, Settled, Space};
 
 // A single-node CarbonDB in a temporary directory, which lives as long as the
 // directory, running `[notes]`.
 pub fn carbon() -> (tempfile::TempDir, Rc<Carbon>) {
-  let directory = tempfile::tempdir().unwrap();
-  let config = directory.path().join("carbondb.toml");
-  std::fs::write(&config, "system = \"data/system.db\"\n[sync]\nmode = \"none\"\n").unwrap();
-  let carbon = Carbon::open(&config).unwrap();
-  register_notes(&carbon);
+  let (directory, carbon, _timers) = timed();
   (directory, carbon)
+}
+
+// The same, with the timers it schedules on.
+pub fn timed() -> (tempfile::TempDir, Rc<Carbon>, Timers) {
+  let directory = tempfile::tempdir().unwrap();
+  std::fs::write(directory.path().join("carbondb.toml"), "system = \"data/system.db\"\n[sync]\nmode = \"none\"\n").unwrap();
+  let timers = Timers::default();
+  let carbon = Carbon::open(&directory.path().join("carbondb.toml"), timers.schedule()).unwrap();
+  register_notes(&carbon);
+  (directory, carbon, timers)
+}
+
+// The CarbonDB in a directory again, as after a restart, without `[notes]`.
+pub fn reopen(directory: &tempfile::TempDir) -> Rc<Carbon> {
+  Carbon::open(&directory.path().join("carbondb.toml"), Timers::default().schedule()).unwrap()
+}
+
+// The host's timers as a test drives them: what the core scheduled and has
+// not cancelled, kept until the test runs it as though its delay had passed.
+#[derive(Default, Clone)]
+pub struct Timers {
+  scheduled: Rc<RefCell<BTreeMap<usize, Scheduled>>>,
+  next: Rc<Cell<usize>>,
+}
+
+// What the core asked to run, and after how long.
+type Scheduled = (Duration, Box<dyn FnOnce()>);
+
+impl Timers {
+  pub fn schedule(&self) -> Schedule {
+    let timers = self.clone();
+    Rc::new(move |delay, then| {
+      let id = timers.next.replace(timers.next.get() + 1);
+      timers.scheduled.borrow_mut().insert(id, (delay, then));
+      let scheduled = Rc::clone(&timers.scheduled);
+      Box::new(move || {
+        scheduled.borrow_mut().remove(&id);
+      })
+    })
+  }
+
+  // The delays of what is scheduled and has neither run nor been cancelled.
+  pub fn delays(&self) -> Vec<Duration> {
+    self.scheduled.borrow().values().map(|(delay, _)| *delay).collect()
+  }
+
+  // Run everything scheduled so far.
+  pub fn run(&self) {
+    let due = self.scheduled.take();
+    for (_, then) in due.into_values() {
+      then();
+    }
+  }
+}
+
+// `[notes]`'s timeout, unlike the default, so a test sees its own set a call's deadline.
+pub const NOTES_TIMEOUT: Duration = Duration::from_millis(100);
+
+// Start something that answers through a callback, and return where its
+// answer lands, for a test to read once it has answered.
+pub fn later<T: 'static>(start: impl FnOnce(Box<dyn FnOnce(Result<T>)>)) -> Rc<RefCell<Option<Result<T>>>> {
+  let answer = Rc::new(RefCell::new(None));
+  let slot = Rc::clone(&answer);
+  start(Box::new(move |result| *slot.borrow_mut() = Some(result)));
+  answer
+}
+
+thread_local! {
+  // The calls `[notes]` left hanging, for a test to settle late.
+  static HUNG: RefCell<Vec<Context>> = RefCell::default();
+}
+
+// The calls `[notes]` has left hanging since this was last asked.
+pub fn hung() -> Vec<Context> {
+  HUNG.with(|hung| hung.take())
+}
+
+fn hang(context: Context) {
+  HUNG.with(|hung| hung.borrow_mut().push(context));
 }
 
 pub fn register_notes(carbon: &Rc<Carbon>) {
@@ -39,16 +121,13 @@ pub fn register_notes(carbon: &Rc<Carbon>) {
 // The scripted test service under a name of its own, with its own notes.
 pub fn register_script(carbon: &Rc<Carbon>, name: &str) {
   let init = Rc::new(|db: Rc<dyn Db>| db.run("CREATE TABLE IF NOT EXISTS note (id TEXT PRIMARY KEY, text TEXT NOT NULL) WITHOUT ROWID", &[]).map(|_| ()));
-  carbon.register(Service::replicated(name, &format!("{name}-v1"), Some("db"), init, Rc::new(notes))).unwrap();
+  carbon.register(Service::replicated(name, &format!("{name}-v1"), Some("db"), NOTES_TIMEOUT, init, Rc::new(notes))).unwrap();
 }
 
 // Start something that answers through a callback, and return its answer,
 // which every call here gives at once.
 pub fn now<T: 'static>(start: impl FnOnce(Box<dyn FnOnce(Result<T>)>)) -> Result<T> {
-  let answer = Rc::new(RefCell::new(None));
-  let slot = Rc::clone(&answer);
-  start(Box::new(move |result| *slot.borrow_mut() = Some(result)));
-  answer.borrow_mut().take().unwrap_or_else(|| Err(internal("The call answered later")))
+  later(start).borrow_mut().take().unwrap_or_else(|| Err(internal("The call answered later")))
 }
 
 pub fn call_now(carbon: &Rc<Carbon>, space: &Rc<Space>, actor: &Actor, key: &str, input: Value) -> Result<Settled> {
@@ -82,7 +161,7 @@ pub fn texts(db: &dyn Db) -> Result<Value> {
   Ok(Value::Array(rows.into_iter().map(|row| row["text"].clone()).collect()))
 }
 
-type Context = Rc<dyn HandlerContext>;
+pub type Context = Rc<dyn HandlerContext>;
 
 fn notes(context: Context) {
   match context.resource() {
@@ -94,6 +173,7 @@ fn notes(context: Context) {
       let result = seen(context.as_ref());
       let _ = context.settle(result);
     }
+    "/hang" => hang(context),
     resource => {
       let _ = context.settle(Err(unknown(context.method(), resource)));
     }
@@ -120,6 +200,8 @@ fn step(context: Context, mut script: VecDeque<Value>, mut output: Vec<Value>) {
     seen(context.as_ref()).map(|texts| output.push(texts))
   } else if let Some(why) = next["fail"].as_str() {
     Err(conflict(why))
+  } else if next.get("hang").is_some() {
+    return hang(context);
   } else {
     let catch = next["catch"] == json!(true);
     let caller = Rc::clone(&context);

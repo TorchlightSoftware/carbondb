@@ -10,20 +10,27 @@
 //! - JS watches a GET or a space's RunState with `watch` and `watchRunState`,
 //!   and the core calls the listener it was given with each answer, until
 //!   `unwatch`. The core keeps every watch; JS only hands answers to the app.
-//! - JS registers an npm service with `register`: its `init`, which the core
-//!   calls with the service's `db` binding to set up its schema, and its entry
-//!   point, which the core calls with a `HandlerContext` for each call to it.
+//! - JS registers an npm service with `register`: the path of its package's
+//!   `service.toml`, which the core reads; its `init`, which the core calls
+//!   with the service's `sql` binding to set up its schema; and its entry point,
+//!   which the core calls with a `HandlerContext` for each call to it.
 //!   The entry point settles that context once, when its handler's Promise
 //!   settles. Until then the handler's synchronous `run`, `get` and `all`
 //!   re-enter the core inside the open transaction or snapshot.
+//!
+//! The core's timers are Node's: it schedules on `setTimeout`.
 //!
 //! Every error crosses as a JSON service error: from the core, in an Error's
 //! message or a callback's first argument; from JS, as the data `settle` or
 //! `init` hands back.
 
+use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use carbondb_core as core;
+use napi::UnknownRef;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde_json::{Value, json};
@@ -61,10 +68,61 @@ fn answering(env: &Env, callback: Callback<'_>) -> Result<Rc<dyn Fn(core::Result
   }))
 }
 
-// The hex BLAKE3 hash of a value's canonical encoding.
-#[napi]
-pub fn hash(value: Value) -> String {
-  core::hash::hash(&value)
+// Node's `setTimeout(handler, delay)` and `clearTimeout(timeout)`.
+type SetTimeout<'a> = Function<'a, FnArgs<(Function<'a, (), ()>, f64)>, Unknown<'a>>;
+type ClearTimeout<'a> = Function<'a, Unknown<'a>, ()>;
+
+// A timeout set on Node, held until it fires or is cleared, then let go.
+type Timer = Rc<RefCell<Option<UnknownRef>>>;
+
+// The core's timers, on Node's `setTimeout` and `clearTimeout`, run on the JS
+// thread whose env they were made on. Setting or clearing a timeout fails only
+// while Node shuts down, when nothing is left to expire.
+fn node_timers(env: &Env) -> core::Schedule {
+  let raw = env.raw();
+  Rc::new(move |delay: Duration, then: Box<dyn FnOnce()>| {
+    let timer = set_timeout(&Env::from_raw(raw), delay, then);
+    Box::new(move || {
+      if let Ok(timer) = timer {
+        let _ = clear_timeout(&Env::from_raw(raw), &timer);
+      }
+    })
+  })
+}
+
+// Run `then` once `delay` has passed, keeping the timeout so it can be cleared.
+fn set_timeout(env: &Env, delay: Duration, then: Box<dyn FnOnce()>) -> Result<Timer> {
+  let (timer, raw) = (Timer::default(), env.raw());
+  let (fired, then) = (Rc::clone(&timer), RefCell::new(Some(then)));
+  let expire = env.create_function_from_closure::<(), (), _>("expire", move |_| {
+    release(&Env::from_raw(raw), &fired)?;
+    if let Some(then) = then.borrow_mut().take() {
+      then()
+    }
+    Ok(())
+  })?;
+  let set: SetTimeout = env.get_global()?.get_named_property_unchecked("setTimeout")?;
+  let timeout = set.call(FnArgs { data: (expire, delay.as_millis() as f64) })?;
+  timer.replace(Some(timeout.create_ref()?));
+  Ok(timer)
+}
+
+// Clear a timeout that has not fired, and let go of it.
+fn clear_timeout(env: &Env, timer: &Timer) -> Result<()> {
+  let timeout = timer.borrow().as_ref().map(|timeout| timeout.get_value(env)).transpose()?;
+  if let Some(timeout) = timeout {
+    let clear: ClearTimeout = env.get_global()?.get_named_property_unchecked("clearTimeout")?;
+    clear.call(timeout)?;
+  }
+  release(env, timer)
+}
+
+// Let go of a timeout, once it has fired or been cleared.
+fn release(env: &Env, timer: &Timer) -> Result<()> {
+  match timer.take() {
+    Some(timeout) => timeout.unref(env),
+    None => Ok(()),
+  }
 }
 
 #[napi]
@@ -75,20 +133,20 @@ pub struct Carbon {
 #[napi]
 impl Carbon {
   #[napi(factory)]
-  pub fn open(config: String) -> Result<Carbon> {
-    Ok(Carbon { inner: core::Carbon::open(std::path::Path::new(&config)).map_err(to_napi)? })
+  pub fn open(env: Env, config: String) -> Result<Carbon> {
+    Ok(Carbon { inner: core::Carbon::open(Path::new(&config), node_timers(&env)).map_err(to_napi)? })
   }
 
-  // Register an npm service: its version, its `sql` binding, its `init`, which
-  // answers null or a service error's data, and its entry point, which the core
-  // calls with a HandlerContext for each call to the service.
+  // Register an npm service under a name: the path of its package's
+  // service.toml, none when it exports none; its `init`, which answers null or
+  // a service error's data; and its entry point, which the core calls with a
+  // HandlerContext for each call to the service.
   #[napi]
   pub fn register(
     &self,
     env: Env,
     name: String,
-    version: String,
-    binding: Option<String>,
+    manifest: Option<String>,
     init: Function<'_, Db, Value>,
     entry: Function<'_, HandlerContext, ()>,
   ) -> Result<()> {
@@ -103,15 +161,18 @@ impl Carbon {
         Err(error) => Err(core::error::internal(error.reason.clone())),
       }
     });
+    let package = core::NpmPackage::read(&name, manifest.as_deref().map(Path::new)).map_err(to_napi)?;
+    let binding = package.binding.clone();
     let entry = entry.create_ref()?;
     let run: core::Entry = Rc::new(move |context: Rc<dyn core::HandlerContext>| {
       let env = Env::from_raw(raw);
-      let called = entry.borrow_back(&env).and_then(|entry| entry.call(HandlerContext { inner: Rc::clone(&context) }));
+      let handed = HandlerContext { inner: Rc::clone(&context), binding: binding.clone() };
+      let called = entry.borrow_back(&env).and_then(|entry| entry.call(handed));
       if let Err(error) = called {
         let _ = context.settle(Err(core::error::internal(error.reason.clone())));
       }
     });
-    self.inner.register(core::Service::replicated(&name, &version, binding.as_deref(), set_up, run)).map_err(to_napi)
+    self.inner.register(core::Service::npm(&name, &package, set_up, run)).map_err(to_napi)
   }
 
   // Make a call by its service key to a space, or to the system handle when no
@@ -180,7 +241,7 @@ impl Carbon {
   }
 }
 
-// A service's `db` binding as its `init` receives it, open while `init` runs.
+// A service's `sql` binding as its `init` receives it, open while `init` runs.
 #[napi]
 pub struct Db {
   inner: Rc<dyn core::Db>,
@@ -204,18 +265,21 @@ impl Db {
   }
 }
 
-// One call as an npm service's entry point receives it: its handler context.
+// One call as an npm service's entry point receives it: its handler context,
+// and the name of the binding its handler receives, from its service.toml.
 #[napi]
 pub struct HandlerContext {
   inner: Rc<dyn core::HandlerContext>,
+  binding: Option<String>,
 }
 
 #[napi]
 impl HandlerContext {
-  // The service call as data: method, resource, input, and the op when it writes.
+  // The service call as data: method, resource, input, the op when it writes,
+  // and the name its handler receives its binding under.
   #[napi]
   pub fn request(&self) -> Value {
-    json!({"method": self.inner.method(), "resource": self.inner.resource(), "input": self.inner.input(), "op": self.inner.op()})
+    json!({"method": self.inner.method(), "resource": self.inner.resource(), "input": self.inner.input(), "op": self.inner.op(), "binding": self.binding})
   }
 
   // A write statement, inside the op's transaction.

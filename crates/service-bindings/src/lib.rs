@@ -14,13 +14,16 @@
 //! `hash` is the content hash every replica agrees on.
 //!
 //! At build time, with the `build` feature, `build` packages the service: its
-//! build script calls `build::package()`.
+//! build script calls `build::package()`. With the `manifest` feature,
+//! `manifest` reads a package's `service.toml` and its version.
 
 #[cfg(feature = "build")]
 pub mod build;
 pub mod context;
 pub mod error;
 pub mod hash;
+#[cfg(feature = "manifest")]
+pub mod manifest;
 pub mod migrations;
 pub mod op;
 

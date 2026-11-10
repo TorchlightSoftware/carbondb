@@ -2,4 +2,3 @@ name = "space"
 
 [[sql]]
 binding = "db"
-migrations_dir = "migrations"

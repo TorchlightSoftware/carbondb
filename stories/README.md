@@ -16,7 +16,7 @@ CarbonDB lets a service written in the shape of an ordinary backend service (nam
 - **Device**: a physical machine enrolled in one identity. It generates its own keys, which never leave it; it signs, and authorizes subkeys. One machine holding several identities has separate device keys for each, so they cannot be linked. Its metadata (name, type, platform) is self-declared; no fingerprinting. A paper key is an offline device.
 - **Personal space**: the private root of what an identity owns, created with it, like `/home` beside `/`. It holds refs to the spaces the identity creates or joins, its devices' names and tags, and personal data. Others, such as a caretaker, may join it without being conflated with the identity.
 - **Space**: a unit of replication with its own log and SQLite database. Membership decides access; when a device syncs a space is a setting. It runs an immutable set of services fixed when it is created. A personal space starts with one member. A space is not a tenant: a tenant holds many spaces.
-- **Service**: a module of tables and calls keyed by service key (`POST [chat]/messages`). Its schema version is the number of its migrations.
+- **Service**: a module of tables and calls keyed by service key (`POST [chat]/messages`), shipped as a package with its `service.toml`. Its version is the hash of its package.
 - **Registered services**: the services an app registers in `main()` on every start with `carbon.services.add(name, impl)`. A device applies ops only for services it has registered.
 - **system**: the root space, this device's local database and op log, holding what must be readable before any identity opens, such as the identities on this device. It is never replicated. Every other space is reached from it through refs, and `carbon` is its handle. Each space has one handle.
 - **Op**: a service call carried in a space's log, applied by every member's device in one shared order. An op on a local service runs only on the device that made it. It is kept in the op log of the space it ran in, marked with that device, together with the calls it made to replicated services there, and replicates with them; other devices run those calls and never the local op itself. Made on the system handle, it goes in the system log.
@@ -128,6 +128,8 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 - [An app developer can run a Worker's D1 queries on CarbonDB unchanged](backlog/d1-compatibility.md)
 - [A person's interrupted call finishes when the app restarts after a crash](backlog/resume-after-crash.md)
 - [A person gets a paper key when they create an identity](backlog/paper-key.md)
+- [An app developer registers a service by its package or crate name](backlog/package-names.md)
+- [The core keeps its own timers once replication runs](backlog/core-timers.md)
 
 ## API sketch
 
@@ -135,28 +137,38 @@ Names come from the stories; the shape is what we are agreeing on.
 
 ### A service
 
+A service is a package: its `service.toml`, its schema, set up by its own `init`, and the handlers that read and write it.
+
+```toml
+# services/chat/service.toml
+name = "chat"      # its canonical name; the name the app registers it under overrides it
+timeout = 200      # milliseconds every call to it must settle within; 200 when left out
+
+[[sql]]
+binding = "db"     # the storage it asks for, handed to its handlers as env.db
+```
+
 ```js
-// services/chat.js: a service is its tables (in SQLite)
-// and the handlers that read/write from those tables
+// services/chat/index.js
 // The app names it when it registers it: carbon.services.add('chat', chat)
 import {notFound, forbidden} from '@tlsft/service-error'
+import {applyMigrations, readMigrations} from '@tlsft/carbondb/migrations'
 
-export const migrations = [
-  `CREATE TABLE message (
-     id TEXT PRIMARY KEY,
-     author TEXT NOT NULL,
-     text TEXT NOT NULL,
-     sent_at INTEGER NOT NULL,
-     edited_at INTEGER,
-     deleted_at INTEGER
-   )`
-]
+// Its manifest, which CarbonDB reads when the app registers it.
+export const manifest = new URL('./service.toml', import.meta.url)
+
+// Its migrations are its own: D1-style files in migrations/, applied by init on every open.
+const migrations = readMigrations(new URL('./migrations/', import.meta.url))
+
+export function init(db) {
+  applyMigrations(db, migrations)
+}
 
 export const calls = {
   // Posting only adds a message, so it never forces a rewind.
   'POST [chat]/messages': {
     tags: ['append'],
-    handler: ({input, op, db}) => {
+    handler: ({input, op, env: {db}}) => {
       const id = op.id()
       db.run('INSERT INTO message (id, author, text, sent_at) VALUES (?, ?, ?, ?)',
         [id, op.author, input.text, op.time])
@@ -166,7 +178,7 @@ export const calls = {
 
   // Only the author may edit their message.
   'PUT [chat]/messages/:id': {
-    handler: ({path, input, op, db}) => {
+    handler: ({path, input, op, env: {db}}) => {
       const message = db.get('SELECT author FROM message WHERE id = ? AND deleted_at IS NULL', [path.id])
       if (!message) throw notFound('No such message')
       if (message.author !== op.author) throw forbidden('Only the author may edit a message')
@@ -176,7 +188,7 @@ export const calls = {
   },
 
   'DELETE [chat]/messages/:id': {
-    handler: ({path, op, db}) => {
+    handler: ({path, op, env: {db}}) => {
       const message = db.get('SELECT author FROM message WHERE id = ? AND deleted_at IS NULL', [path.id])
       if (!message) throw notFound('No such message')
       if (message.author !== op.author) throw forbidden('Only the author may delete a message')
@@ -187,9 +199,21 @@ export const calls = {
 
   // A read: answered from the local replica, never an op.
   'GET [chat]/messages': {
-    handler: ({db}) => db.all('SELECT id, author, text, sent_at, edited_at FROM message WHERE deleted_at IS NULL ORDER BY sent_at')
+    handler: ({env: {db}}) => db.all('SELECT id, author, text, sent_at, edited_at FROM message WHERE deleted_at IS NULL ORDER BY sent_at')
   }
 }
+```
+
+```sql
+-- services/chat/migrations/0001_create_message.sql
+CREATE TABLE message (
+  id TEXT PRIMARY KEY,
+  author TEXT NOT NULL,
+  text TEXT NOT NULL,
+  sent_at INTEGER NOT NULL,
+  edited_at INTEGER,
+  deleted_at INTEGER
+) WITHOUT ROWID;
 ```
 
 ### An app's main()
@@ -198,7 +222,7 @@ The app code is the same single-node or replicated; only the TOML file differs. 
 
 ```js
 import {configure} from '@tlsft/carbondb'
-import * as chat from './services/chat.js'
+import * as chat from './services/chat/index.js'
 
 // The carbon handle is the system space on this device.
 const carbon = await configure('./carbondb.toml')
@@ -234,15 +258,19 @@ const respond = (room) => async (request) => {
 }
 ```
 
-What the runtime registers with the core for a space, and the only shape the core sees. Apps never call this:
+What the runtime registers with the core for a service, and the only shape the core sees. Apps never call this:
 
 ```js
-core.apply(space, {
-  migrations: chat.migrations,
-  tags: {'POST [chat]/messages': ['append']},
-  // op: {key, path, input, author, device, time, id(), random()}; db: {run, get, all}
-  apply: async (op, db) => routeTo(chat.calls, op.key).handler({path: op.path, input: op.input, op, db})
-})
+// The core reads and validates the service.toml at manifestPath, versions the
+// package by hashing its files, and refuses a service without one.
+native.register(name, manifestPath,
+  // init(db): runs on every open, inside a transaction the core holds.
+  initOf(chat),
+  // entry(context): every call routed to the service by name. The context
+  // carries the request {method, resource, input, op, binding} and is settled
+  // once, with what the handler returns or throws; past the service's timeout
+  // the call fails with a 504 and a late answer is dropped.
+  entryOf(chat.calls))
 ```
 
 ## Implementation

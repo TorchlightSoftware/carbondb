@@ -11,12 +11,14 @@
 //! table that run read.
 //!
 //! Stopping or resuming a space changes what every GET answers, so every
-//! watch on it runs again. A call from the app is answered only once the
-//! watches on its space have settled, so after a call every watched view
-//! already shows it.
+//! watch on it runs again. A write from the app is answered only once the
+//! watches its commit owes a run have run, so after the call every watched
+//! view already shows it: those that read a table it wrote, and those in
+//! flight when it landed, which are judged when they answer. A GET commits
+//! nothing, so it answers at once.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use serde_json::Value;
@@ -36,7 +38,7 @@ pub type Delivery = Rc<dyn Fn(Result<Value>)>;
 // Called with a space's RunState each time it changes.
 pub type RunStateListener = Rc<dyn Fn(&RunState)>;
 
-// A call from the app waiting for the watches on its space to settle.
+// A call from the app waiting for the watches its commit owes a run.
 type Waiting = Box<dyn FnOnce()>;
 
 // When a watch must run again, as data: `read`, the read set of its last
@@ -80,6 +82,17 @@ impl Reads {
   fn outdated(&self) -> Reads {
     Reads { stale: true, ..self.clone() }
   }
+
+  // Whether a run is still owed: it must run again, or the run in flight is
+  // judged only when it answers.
+  fn owed(&self) -> bool {
+    self.stale || self.in_flight.is_some()
+  }
+
+  // Whether to start a run now: it must run again, and none is in flight.
+  fn due(&self) -> bool {
+    self.stale && self.in_flight.is_none()
+  }
 }
 
 fn meets<'a>(read: &BTreeSet<String>, mut tables: impl Iterator<Item = &'a String>) -> bool {
@@ -93,25 +106,24 @@ struct Watch {
   call: Call,
   deliver: Delivery,
   reads: RefCell<Reads>,
-  running: Cell<bool>,
   stopped: Cell<bool>,
 }
 
 impl Watch {
   // Whether it has run against every commit so far, or no longer runs.
   fn settled(&self) -> bool {
-    self.stopped.get() || (!self.running.get() && !self.reads.borrow().stale)
+    self.stopped.get() || !self.reads.borrow().owed()
   }
 }
 
-// Every watch and RunState listener on this device, and whoever waits for a
-// space's watches to settle.
+// Every watch and RunState listener on this device, and the calls waiting for
+// the watches their commits owe a run.
 #[derive(Default)]
 pub struct Watches {
   next: Cell<WatchId>,
   gets: RefCell<BTreeMap<WatchId, Rc<Watch>>>,
   run_states: RefCell<BTreeMap<WatchId, (String, RunStateListener)>>,
-  waiting: RefCell<HashMap<String, Vec<Waiting>>>,
+  waiting: RefCell<Vec<(Vec<WatchId>, Waiting)>>,
 }
 
 impl Watches {
@@ -121,16 +133,26 @@ impl Watches {
     id
   }
 
-  fn on(&self, space: &str) -> Vec<Rc<Watch>> {
-    self.gets.borrow().values().filter(|watch| watch.space == space).cloned().collect()
+  fn on(&self, space: &str) -> Vec<(WatchId, Rc<Watch>)> {
+    self.gets.borrow().iter().filter(|(_, watch)| watch.space == space).map(|(id, watch)| (*id, Rc::clone(watch))).collect()
   }
 
   fn listening(&self, space: &str) -> Vec<RunStateListener> {
     self.run_states.borrow().values().filter(|(on, _)| on == space).map(|(_, listener)| Rc::clone(listener)).collect()
   }
 
-  fn settled(&self, space: &str) -> bool {
-    self.on(space).iter().all(|watch| watch.settled())
+  // Whether each of these watches has run, or no longer runs.
+  fn ran(&self, ids: &[WatchId]) -> bool {
+    let gets = self.gets.borrow();
+    ids.iter().all(|id| gets.get(id).is_none_or(|watch| watch.settled()))
+  }
+
+  // The calls whose watches have all run, no longer waiting.
+  fn ready(&self) -> Vec<Waiting> {
+    let waiting = self.waiting.take();
+    let (ready, still): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|(ids, _)| self.ran(ids));
+    self.waiting.replace(still);
+    ready.into_iter().map(|(_, answer)| answer).collect()
   }
 }
 
@@ -145,7 +167,6 @@ impl Carbon {
       call: Call::from_key(key)?,
       deliver,
       reads: RefCell::new(Reads::unseen()),
-      running: Cell::new(false),
       stopped: Cell::new(false),
     });
     let id = self.watches.id();
@@ -167,24 +188,33 @@ impl Carbon {
     let watch = self.watches.gets.borrow_mut().remove(&id);
     if let Some(watch) = watch {
       watch.stopped.set(true);
-      self.settle(&watch.space);
+      self.settle();
     }
   }
 
-  // Answer once the watches on a space have settled.
-  pub(crate) fn when_settled(&self, space: &str, answer: Waiting) {
-    if self.watches.settled(space) {
+  // Answer once these watches have run.
+  pub(crate) fn when_run(&self, watches: Vec<WatchId>, answer: Waiting) {
+    if self.watches.ran(&watches) {
       return answer();
     }
-    self.watches.waiting.borrow_mut().entry(space.to_string()).or_default().push(answer);
+    self.watches.waiting.borrow_mut().push((watches, answer));
   }
 
-  // A commit to a space wrote these tables: each watch that read one runs again.
-  pub(crate) fn committed(self: &Rc<Self>, space: &str, tables: &[String]) {
-    for watch in self.watches.on(space) {
-      watch.reads.replace_with(|reads| reads.committed(tables));
-      self.rerun(&watch);
+  // A commit to a space wrote these tables: each watch that read one runs
+  // again. Returns the watches it owes a run.
+  pub(crate) fn committed(self: &Rc<Self>, space: &str, tables: &[String]) -> Vec<WatchId> {
+    let watches = self.watches.on(space);
+    let owed = watches
+      .iter()
+      .filter_map(|(id, watch)| {
+        watch.reads.replace_with(|reads| reads.committed(tables));
+        watch.reads.borrow().owed().then_some(*id)
+      })
+      .collect();
+    for (_, watch) in &watches {
+      self.rerun(watch);
     }
+    owed
   }
 
   // Move a space to a RunState and tell whoever listens. Stopping or resuming
@@ -196,7 +226,7 @@ impl Carbon {
       listener(&state);
     }
     if stopping_or_resuming {
-      for watch in self.watches.on(&space.id) {
+      for (_, watch) in self.watches.on(&space.id) {
         watch.reads.replace_with(|reads| reads.outdated());
         self.rerun(&watch);
       }
@@ -205,10 +235,9 @@ impl Carbon {
 
   // Run a watch's GET when a commit since its last run started wrote what it read.
   fn rerun(self: &Rc<Self>, watch: &Rc<Watch>) {
-    if watch.stopped.get() || watch.running.get() || !watch.reads.borrow().stale {
-      return self.settle(&watch.space);
+    if watch.stopped.get() || !watch.reads.borrow().due() {
+      return self.settle();
     }
-    watch.running.set(true);
     watch.reads.replace_with(|reads| reads.started());
     let (carbon, running) = (Rc::clone(self), Rc::clone(watch));
     let answered: Reply = Box::new(move |settled| carbon.answered(&running, settled));
@@ -222,22 +251,17 @@ impl Carbon {
   // A watch's GET answered: hand over the answer, then run again if a commit
   // since it started wrote what it read.
   fn answered(self: &Rc<Self>, watch: &Rc<Watch>, settled: Result<Settled>) {
-    watch.running.set(false);
     if watch.stopped.get() {
-      return self.settle(&watch.space);
+      return self.settle();
     }
     watch.reads.replace_with(|reads| reads.finished(settled.as_ref().ok().map(|settled| settled.tables.as_slice())));
     (watch.deliver)(settled.map(|settled| settled.value));
     self.rerun(watch);
   }
 
-  // Answer whoever waits on a space's watches, once every one has settled.
-  fn settle(&self, space: &str) {
-    if !self.watches.settled(space) {
-      return;
-    }
-    let waiting = self.watches.waiting.borrow_mut().remove(space).unwrap_or_default();
-    for answer in waiting {
+  // Answer the calls whose watches have all run.
+  fn settle(&self) {
+    for answer in self.watches.ready() {
       answer();
     }
   }
@@ -340,6 +364,36 @@ mod tests {
     post("b");
     assert_eq!(*notes.borrow(), [json!([]), json!(["a"])]);
     assert_eq!(refs.borrow().len(), 1);
+  }
+
+  #[test]
+  fn a_write_waits_for_the_watches_its_commit_owes_a_run_and_a_get_for_none() {
+    use crate::testing::{actor, alice, call_now, later, space_now, timed};
+    use serde_json::json;
+
+    let (_directory, carbon, timers) = timed();
+    let identity = alice(&carbon);
+    let personal = space_now(&carbon, &identity.personal).unwrap();
+    let (space, acting) = (Some(identity.personal.as_str()), Some(identity.id.as_str()));
+    let answers = Rc::new(RefCell::new(vec![]));
+    let watching = |key: &str| {
+      let into = Rc::clone(&answers);
+      carbon.watch(&identity.personal, acting, key, Rc::new(move |answer: Result<Value>| into.borrow_mut().push(answer.map_err(|error| error.status)))).unwrap()
+    };
+    let insert = |text: &str| json!({"do": [{"insert": text}]});
+    let (texts, _refs) = (watching("GET [notes]/texts"), watching("GET [space]/refs"));
+    let post = |text: &str| call_now(&carbon, &personal, &actor(&identity), "POST [notes]/run", insert(text)).unwrap();
+    assert_eq!(post("a").watches, [texts], "only the watch that read what it wrote");
+    assert_eq!(call_now(&carbon, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap().watches, Vec::<WatchId>::new());
+
+    watching("GET [notes]/hang");
+    let write = later(|answer| carbon.call(space, acting, "POST [notes]/run", insert("b"), answer));
+    let read = later(|answer| carbon.call(space, acting, "GET [notes]/texts", Value::Null, answer));
+    assert!(write.borrow().is_none(), "a write waits for a watch in flight, judged only when it answers");
+    assert_eq!(read.borrow_mut().take().unwrap().unwrap(), json!(["a", "b"]), "a GET answers at once");
+    timers.run();
+    assert_eq!(answers.borrow().last(), Some(&Err(504)), "the hung watch times out");
+    assert!(write.borrow_mut().take().unwrap().is_ok(), "which frees the write");
   }
 
   #[test]

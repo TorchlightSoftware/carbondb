@@ -1,0 +1,4 @@
+name = "stash"
+
+[[sql]]
+binding = "store"

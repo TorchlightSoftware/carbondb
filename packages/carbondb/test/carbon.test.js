@@ -9,7 +9,15 @@ import {conflict} from '@tlsft/service-error'
 import {configure} from '../src/index.js'
 import {applyMigrations} from '../src/migrations.js'
 
-const tick = () => new Promise((resolve) => setTimeout(resolve, 2))
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const tick = () => sleep(2)
+
+// Where a test service's service.toml is: a package of its own under services/,
+// though its calls are written here.
+const manifestOf = (name) => new URL(`./services/${name}/service.toml`, import.meta.url)
+
+// [notes] must settle each call within the timeout its service.toml names.
+const TIMEOUT = 100
 
 // A GET that reads at once but answers only when the test opens the gate, so a
 // commit can land while it is in flight.
@@ -22,6 +30,7 @@ function closeGate() {
 
 // A small service exercising what the runtime offers a handler.
 const notes = {
+  manifest: manifestOf('notes'),
   migrations: [
     {name: '0001_note', sql: 'CREATE TABLE note (id TEXT PRIMARY KEY, author TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID'},
     {name: '0002_tag', sql: 'CREATE TABLE tag (name TEXT PRIMARY KEY) WITHOUT ROWID'}
@@ -29,7 +38,7 @@ const notes = {
   init: (db) => applyMigrations(db, notes.migrations),
   calls: {
     'POST [notes]/notes': {
-      handler: async ({input, op, db}) => {
+      handler: async ({input, op, env: {db}}) => {
         const id = op.id()
         db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [id, op.author, input.text, op.time])
         await tick()
@@ -38,8 +47,16 @@ const notes = {
         return {id, author: op.author, device: op.device}
       }
     },
+    // Writes, then outlives its timeout before writing again.
+    'POST [notes]/late': {
+      handler: async ({input, op, env: {db}}) => {
+        db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [op.id(), op.author, input.text, op.time])
+        await sleep(TIMEOUT * 1.5)
+        db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [op.id(), op.author, `${input.text} again`, op.time])
+      }
+    },
     'POST [notes]/duplicates': {
-      handler: ({db}) => {
+      handler: ({env: {db}}) => {
         db.run("INSERT INTO note (id, author, text, at) VALUES ('same', 'a', 'x', 0)")
         db.run("INSERT INTO note (id, author, text, at) VALUES ('same', 'a', 'x', 0)")
       }
@@ -47,7 +64,7 @@ const notes = {
     // Writes a note, reads through a call inside the op, then optionally makes
     // another call and refuses: the shapes a nested transaction must get right.
     'POST [notes]/nested': {
-      handler: async ({input, op, db, call}) => {
+      handler: async ({input, op, env: {db}, call}) => {
         db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [op.id(), op.author, input.text, op.time])
         const seen = (await call('GET [notes]/notes')).map((row) => row.text)
         if (input.inner) await call('POST [notes]/notes', input.inner).catch((error) => { if (!input.catch) throw error })
@@ -60,12 +77,12 @@ const notes = {
         call('POST [notes]/notes', {text: 'late'}).catch(() => {})
       }
     },
-    'GET [notes]/notes': {handler: ({db}) => db.all('SELECT text FROM note ORDER BY at, text')},
+    'GET [notes]/notes': {handler: ({env: {db}}) => db.all('SELECT text FROM note ORDER BY at, text')},
     'GET [notes]/writes': {handler: ({call}) => call('POST [notes]/tags', {name: 'red'})},
-    'POST [notes]/tags': {handler: ({input, db}) => db.run('INSERT INTO tag (name) VALUES (?)', [input.name])},
-    'GET [notes]/broken': {handler: ({db}) => db.all('SELECT * FROM nowhere')},
+    'POST [notes]/tags': {handler: ({input, env: {db}}) => db.run('INSERT INTO tag (name) VALUES (?)', [input.name])},
+    'GET [notes]/broken': {handler: ({env: {db}}) => db.all('SELECT * FROM nowhere')},
     'GET [notes]/gated': {
-      handler: async ({db}) => {
+      handler: async ({env: {db}}) => {
         const notes = db.all('SELECT text FROM note ORDER BY at, text')
         await gate
         return notes
@@ -73,7 +90,7 @@ const notes = {
     },
     // Reads the notes only once a tag exists, so its read set grows.
     'GET [notes]/tagged': {
-      handler: async ({db}) => {
+      handler: async ({env: {db}}) => {
         const tags = db.all('SELECT name FROM tag')
         const notes = tags.length ? db.all('SELECT text FROM note ORDER BY at, text') : []
         await gate
@@ -139,6 +156,25 @@ describe('services', () => {
   it('refuses registering a service twice, or under a CarbonDB service name', () => {
     assert.throws(() => carbon.services.add('notes', notes), {status: 409})
     assert.throws(() => carbon.services.add('space', notes), {status: 409})
+  })
+
+  it('hands a handler its binding in env, under the name its service.toml gives it', async () => {
+    carbon.services.add('stash', {
+      manifest: manifestOf('stash'),
+      init: (db) => db.run('CREATE TABLE IF NOT EXISTS item (id TEXT PRIMARY KEY, name TEXT NOT NULL) WITHOUT ROWID'),
+      calls: {
+        'POST [stash]/items': {handler: ({input, op, env}) => env.store.run('INSERT INTO item (id, name) VALUES (?, ?)', [op.id(), input.name])},
+        'GET [stash]/items': {handler: ({env}) => ({bindings: Object.keys(env), items: env.store.all('SELECT name FROM item')})}
+      }
+    })
+    const stash = await personal.createSpace({name: 'Stash', services: ['stash']})
+    await stash.call('POST [stash]/items', {name: 'kept'})
+    assert.deepStrictEqual(await stash.call('GET [stash]/items'), {bindings: ['store'], items: [{name: 'kept'}]})
+  })
+
+  it('refuses a service without a service.toml it can read', () => {
+    assert.throws(() => carbon.services.add('bare', {calls: {}}), {status: 400, message: /exports no manifest/})
+    assert.throws(() => carbon.services.add('lost', {manifest: manifestOf('lost'), calls: {}}), {status: 400, message: /Cannot read/})
   })
 
   it('refuses an identity or space naming a service this device has not registered', async () => {
@@ -336,10 +372,37 @@ describe('watch', () => {
     assert.deepStrictEqual(results.at(-1), await personal.call('GET [notes]/tagged'))
   })
 
+  it('answers a GET at once while a watch is in flight', async () => {
+    const open = closeGate()
+    watching(personal, 'GET [notes]/gated')
+    const read = await Promise.race([personal.call('GET [notes]/notes'), tick().then(() => 'held')])
+    open()
+    assert.deepStrictEqual(read, [])
+  })
+
   it('hands a failing GET its error', async () => {
     const {results, arrival} = watching(personal, 'GET [notes]/broken')
     await arrival()
     assert.deepStrictEqual(results, [{error: 500}])
+  })
+})
+
+describe('timeout', () => {
+  const timeouts = () => process.getActiveResourcesInfo().filter((resource) => resource === 'Timeout').length
+
+  it('clears the deadline of a call that settled', async () => {
+    const before = timeouts()
+    await personal.call('POST [notes]/notes', {text: 'quick'})
+    await personal.call('GET [notes]/notes')
+    assert.ok(timeouts() <= before, 'a settled call leaves no timeout behind')
+  })
+
+  it('settles a call its handler has not settled in time, rolling back its writes and dropping its late answer', async () => {
+    await assert.rejects(personal.call('POST [notes]/late', {text: 'late'}), {status: 504, code: 'TIMED_OUT'})
+    assert.deepStrictEqual(await texts(personal), [])
+    await sleep(TIMEOUT)
+    await personal.call('POST [notes]/notes', {text: 'next'})
+    assert.deepStrictEqual(await texts(personal), ['next', 'next again'])
   })
 })
 
@@ -406,7 +469,7 @@ describe('schema', () => {
       ...notes,
       migrations: [...notes.migrations, {name: '0003_color', sql: "ALTER TABLE tag ADD COLUMN color TEXT NOT NULL DEFAULT 'none'"}],
       init: (db) => applyMigrations(db, grown.migrations),
-      calls: {...notes.calls, 'GET [notes]/tags': {handler: ({db}) => db.all('SELECT name, color FROM tag')}}
+      calls: {...notes.calls, 'GET [notes]/tags': {handler: ({env: {db}}) => db.all('SELECT name, color FROM tag')}}
     }
     const restarted = await configure(config)
     restarted.services.add('notes', grown)
@@ -414,7 +477,7 @@ describe('schema', () => {
   })
 
   it('refuses a service whose table takes its keys from SQLite, and says how to fix it', async () => {
-    carbon.services.add('counter', {init: (db) => db.run('CREATE TABLE IF NOT EXISTS hit (id INTEGER PRIMARY KEY AUTOINCREMENT)'), calls: {}})
+    carbon.services.add('counter', {manifest: manifestOf('counter'), init: (db) => db.run('CREATE TABLE IF NOT EXISTS hit (id INTEGER PRIMARY KEY AUTOINCREMENT)'), calls: {}})
     await assert.rejects(personal.createSpace({name: 'Counted', services: ['counter']}), (error) => {
       assert.deepStrictEqual([error.status, error.details], [400, {table: 'hit'}])
       assert.match(error.message, /must come from the op that creates it.*op_id\(\)/)
@@ -423,7 +486,7 @@ describe('schema', () => {
   })
 
   it("keeps a service inside its own tables, even when it names another service's", async () => {
-    carbon.services.add('snoop', {calls: {'GET [snoop]/refs': {handler: ({db}) => db.all('SELECT * FROM "space/db/ref"')}}})
+    carbon.services.add('snoop', {manifest: manifestOf('snoop'), calls: {'GET [snoop]/refs': {handler: ({env: {db}}) => db.all('SELECT * FROM "space/db/ref"')}}})
     const room = await personal.createSpace({name: 'Snooped', services: ['snoop']})
     await assert.rejects(room.call('GET [snoop]/refs'), {status: 500, message: /no such table: snoop\/db\/space\/db\/ref/})
   })

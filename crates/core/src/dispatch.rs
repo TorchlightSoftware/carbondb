@@ -7,6 +7,11 @@
 //! refused op rolls back and keeps only its result. Either way the call is
 //! routed by service name to the service's entry point, which settles it.
 //!
+//! Every call it is handed must settle within its service's timeout. One
+//! deadline covers a call and every call it makes inside it; when it passes,
+//! the core settles the call with a timeout, rolling an op back like any other
+//! failure, and drops whatever its handler answers later.
+//!
 //! Which op applies next is read from the log: the first of the pending ops,
 //! the op log minus results, in the shared order. They apply one at a time,
 //! and only once every service the space names is set up here.
@@ -30,13 +35,17 @@ use crate::service_call::{CallRecord, Conn, ServiceCall, Settle, sub_calls};
 use crate::services::{self, SERVICE_MISSING, Service};
 use crate::space::{RunState, Space};
 use crate::store::{Store, tables};
+use crate::watch::WatchId;
 use crate::{Actor, Call, Routing, HandlerContext, Op, oplog, results};
 
-// What a call settled with, and the tables it read or wrote, for watch.
+// What a call settled with; the tables it read or wrote, for watch; and the
+// watches its commit owes a run, which a call from the app waits for. A GET
+// commits nothing, so it owes none.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Settled {
   pub value: Value,
   pub tables: Vec<String>,
+  pub watches: Vec<WatchId>,
 }
 
 // How a submitted call answers whoever submitted it.
@@ -113,7 +122,7 @@ impl Carbon {
       carbon.drain(&here);
     });
     let service_call = ServiceCall::new(self, space, actor(&op), call, op.input.clone(), Conn::Writer, Some(op.clone()), live, settle);
-    self.route(service_call);
+    self.start(service_call);
   }
 
   // An op settled: end its transaction with its result and answer whoever waits on it.
@@ -121,9 +130,7 @@ impl Carbon {
     match end(space.store(), op, result, calls) {
       Ok(settled) => {
         self.set_run_state(space, RunState::Idle);
-        if let Ok(settled) = &settled {
-          self.committed(&space.id, &settled.tables);
-        }
+        let settled = settled.map(|settled| Settled { watches: self.committed(&space.id, &settled.tables), ..settled });
         space.answer(&op.hash, settled);
       }
       Err(failure) => self.stop(space, failure),
@@ -181,9 +188,9 @@ impl Carbon {
     let settle: Settle = Box::new(move |result, _calls| {
       ended.set(false);
       let tables = snapshot.end();
-      carbon.answer_read(&here, reply, result.and_then(|value| Ok(Settled { value, tables: tables? })));
+      carbon.answer_read(&here, reply, result.and_then(|value| Ok(Settled { value, tables: tables?, watches: vec![] })));
     });
-    self.route(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, live, settle));
+    self.start(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, live, settle));
   }
 
   fn answer_read(self: &Rc<Self>, space: &Space, reply: Reply, settled: Result<Settled>) {
@@ -191,6 +198,17 @@ impl Carbon {
       self.stop(space, failure);
     }
     reply(settled)
+  }
+
+  // Hand a call to its service, under the deadline its service's timeout sets.
+  // The timer keeps the call until it settles, so a handler that drops it is
+  // still settled.
+  fn start(&self, service_call: Rc<ServiceCall>) {
+    if let Ok(service) = answering(self, service_call.space(), &service_call.call) {
+      let (expiring, timeout) = (Rc::clone(&service_call), service.timeout);
+      service_call.set_deadline(self.after(timeout, Box::new(move || expiring.expire(timeout))));
+    }
+    self.route(service_call);
   }
 
   // Hand a call to the entry point of the service that answers it here.
@@ -255,7 +273,7 @@ fn end(store: &Store, op: &Op, result: Result<Value>, calls: Vec<CallRecord>) ->
         return Err(failure);
       }
       let changeset = store.end_write(true)?;
-      Ok(Ok(Settled { value, tables: tables(&changeset)? }))
+      Ok(Ok(Settled { value, tables: tables(&changeset)?, watches: vec![] }))
     }
     Err(error) => {
       store.end_write(false)?;

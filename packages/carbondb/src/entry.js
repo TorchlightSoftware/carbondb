@@ -23,18 +23,22 @@ async function handle(routes, context, request) {
   return call.handler(handlerContextOf(context, request, path))
 }
 
-// What a handler receives: its path parameters and input, its `db` binding,
-// and a way to make calls of its own; and the op, with `run`, when the call writes.
-function handlerContextOf(context, {input, op}, path) {
+// What a handler receives: its path parameters and input; `env`, its bindings
+// by the names its service.toml gives them, as a Worker's env holds them; a way
+// to make calls of its own; and the op, with `run` on its binding, when the call writes.
+function handlerContextOf(context, {input, op, binding}, path) {
   const queries = {
     get: (sql, params) => core(() => context.get(sql, params)),
     all: (sql, params) => core(() => context.all(sql, params))
   }
   const call = (key, callInput = null) => answered((reply) => context.call(key, callInput, reply))
-  if (!op) return {path, input, db: queries, call}
+  if (!op) return {path, input, env: envOf(binding, queries), call}
   const db = {...queries, run: (sql, params) => core(() => context.run(sql, params))}
-  return {path, input, db, call, op: opOf(context, op, path)}
+  return {path, input, env: envOf(binding, db), call, op: opOf(context, op, path)}
 }
+
+// A service's env: its one sql binding under its name, or nothing when it declares none.
+const envOf = (binding, db) => (binding ? {[binding]: db} : {})
 
 // An op as a handler sees it: who made it, when, and the ids and randomness a
 // handler takes from it, drawn from the op's hash so every replica computes the same.

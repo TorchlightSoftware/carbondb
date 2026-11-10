@@ -6,20 +6,24 @@
 //!
 //! A call made inside another runs inside the same op, under a savepoint, so
 //! it sees the writes before it, and a failure rolls back only its own writes
-//! and throws to the handler that made it. A local service writing to a
+//! and throws to the handler that made it.
+//!
+//! A call that outlives its deadline expires: the core settles it with a
+//! timeout, and its handler's own answer, when it comes, is dropped. A local service writing to a
 //! replicated one also stamps the call as an op of its own: a sub-call, which
 //! the local op carries on its log row so other devices replay it without the
 //! local op.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::carbon::Carbon;
+use crate::carbon::{Cancel, Carbon};
 use crate::dispatch::Settled;
-use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal};
+use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal, timed_out};
 use crate::space::Space;
 use crate::call_window::{CallWindow, Scoped};
 use crate::store::Reader;
@@ -109,6 +113,10 @@ pub struct ServiceCall {
   calls: RefCell<Vec<CallRecord>>,
   pending: Cell<usize>,
   settle: RefCell<Option<Settle>>,
+  // Cancels its deadline, when it is a top-level call.
+  deadline: RefCell<Option<Cancel>>,
+  // Whether the core settled it when its deadline passed.
+  expired: Cell<bool>,
 }
 
 impl ServiceCall {
@@ -136,7 +144,22 @@ impl ServiceCall {
       calls: RefCell::default(),
       pending: Cell::new(0),
       settle: RefCell::new(Some(settle)),
+      deadline: RefCell::default(),
+      expired: Cell::new(false),
     })
+  }
+
+  // The deadline it must settle by, which settling cancels.
+  pub(crate) fn set_deadline(&self, cancel: Cancel) {
+    self.deadline.replace(Some(cancel));
+  }
+
+  // Its deadline passed: settle it with a timeout, unless it has settled.
+  pub(crate) fn expire(&self, timeout: Duration) {
+    self.deadline.take();
+    let Some(settle) = self.settle.borrow_mut().take() else { return };
+    self.expired.set(true);
+    settle(Err(timed_out(&self.call.key(), timeout)), self.calls.take());
   }
 
   pub fn carbon(&self) -> &Rc<Carbon> {
@@ -289,9 +312,18 @@ impl HandlerContext for ServiceCall {
   }
 
   // A handler that finishes before the calls it made fails, since their writes
-  // would land outside its op.
+  // would land outside its op. Settling an expired call drops the answer.
   fn settle(&self, result: Result<Value>) -> Result<()> {
-    let settle = self.settle.borrow_mut().take().ok_or_else(|| conflict(format!("{} has already settled", self.call.key())))?;
+    let taken = self.settle.borrow_mut().take();
+    let Some(settle) = taken else {
+      return match self.expired.get() {
+        true => Ok(()),
+        false => Err(conflict(format!("{} has already settled", self.call.key()))),
+      };
+    };
+    if let Some(cancel) = self.deadline.take() {
+      cancel();
+    }
     let result = match result {
       Ok(_) if self.pending.get() > 0 => Err(internal(format!("{} finished before the calls it made", self.call.key()))),
       result => result,

@@ -19,8 +19,8 @@ pub type Answer = Box<dyn FnOnce(Result<Value>)>;
 
 impl Carbon {
   // A call from the app, by its service key, to a space or, with none, to the
-  // system handle; made as the identity named, or as no one. It answers once
-  // the watches on its space have run against its commit.
+  // system handle; made as the identity named, or as no one. A write answers
+  // once the watches its commit owes a run have run; a GET at once.
   pub fn call(self: &Rc<Self>, space: Option<&str>, identity: Option<&str>, key: &str, input: Value, answer: Answer) {
     let made = self.actor(identity).and_then(|actor| Ok((actor, Call::from_key(key)?)));
     let (actor, call) = match made {
@@ -30,8 +30,11 @@ impl Carbon {
     let carbon = Rc::clone(self);
     self.reach(space, Box::new(move |space| match space {
       Ok(space) => {
-        let (settling, id) = (Rc::clone(&carbon), space.id.clone());
-        carbon.submit(&space, actor, call, input, Box::new(move |settled| settling.when_settled(&id, Box::new(move || answer(settled.map(|settled| settled.value))))))
+        let settling = Rc::clone(&carbon);
+        carbon.submit(&space, actor, call, input, Box::new(move |settled| {
+          let owed = settled.as_ref().map_or_else(|_| vec![], |settled| settled.watches.clone());
+          settling.when_run(owed, Box::new(move || answer(settled.map(|settled| settled.value))))
+        }))
       }
       Err(error) => answer(Err(error)),
     }));

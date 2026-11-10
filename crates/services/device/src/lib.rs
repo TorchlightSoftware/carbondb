@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 
 include!(concat!(env!("OUT_DIR"), "/package.rs"));
 
-pub const PACKAGE: Package = Package { name: NAME, version: VERSION, binding: BINDING, init, entry };
+pub const PACKAGE: Package = Package { name: NAME, version: VERSION, binding: BINDING, timeout: TIMEOUT, init, entry };
+
+// Its tables, set up by `init` on every open.
+const MIGRATIONS: &[migrations::Migration] = &[("0001_devices", include_str!("../migrations/0001_devices.sql"))];
 
 fn init(db: &dyn Db) -> Result<()> {
   migrations::apply(db, "d1_migrations", MIGRATIONS)

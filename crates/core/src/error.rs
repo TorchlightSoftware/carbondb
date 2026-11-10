@@ -50,6 +50,11 @@ pub(crate) fn stopped(space: &str, failure: &ServiceError) -> ServiceError {
     .with_details(serde_json::json!({"failure": failure}))
 }
 
+// What a call fails with when its handler has not settled it within its service's timeout.
+pub(crate) fn timed_out(key: &str, timeout: std::time::Duration) -> ServiceError {
+  ServiceError::new(504, "TIMED_OUT", format!("{key} did not settle within {}ms", timeout.as_millis()))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

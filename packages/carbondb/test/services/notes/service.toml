@@ -1,0 +1,5 @@
+name = "notes"
+timeout = 100
+
+[[sql]]
+binding = "db"

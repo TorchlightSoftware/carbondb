@@ -1,7 +1,11 @@
-//! This device's CarbonDB: its config, its clock, the services it runs, the
-//! system database as its root space, the spaces opened so far, and the
-//! watches on them (`watch`). Every call goes through `submit`, in `dispatch`;
-//! a call from the app comes in through `call` (`app`).
+//! This device's CarbonDB: its config, its clock, the host's timers, the
+//! services it runs, the system database as its root space, the spaces opened
+//! so far, and the watches on them (`watch`). Every call goes through
+//! `submit`, in `dispatch`; a call from the app comes in through `call` (`app`).
+//!
+//! The core keeps no timers of its own: it runs on the host's thread, in
+//! callback style, so the host schedules what the core asks for later, as
+//! Node does with `setTimeout`.
 //!
 //! This is the single-node core: no p2panda and no network. Calls that need
 //! peers are refused.
@@ -10,6 +14,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -27,9 +32,17 @@ use crate::{Actor, Call, Routing, Op};
 // How an opened space reaches whoever asked for it.
 pub type Opened = Box<dyn FnOnce(Result<Rc<Space>>)>;
 
+// How the host runs something once a delay has passed, on the core's thread,
+// handing back a way to cancel it before then.
+pub type Schedule = Rc<dyn Fn(Duration, Box<dyn FnOnce()>) -> Cancel>;
+
+// Cancels something scheduled, if it has not run yet.
+pub type Cancel = Box<dyn FnOnce()>;
+
 pub struct Carbon {
   config: Config,
   clock: Clock,
+  schedule: Schedule,
   services: Services,
   system: Rc<Space>,
   spaces: RefCell<HashMap<String, Rc<Space>>>,
@@ -37,7 +50,7 @@ pub struct Carbon {
 }
 
 impl Carbon {
-  pub fn open(config_path: &Path) -> Result<Rc<Carbon>> {
+  pub fn open(config_path: &Path, schedule: Schedule) -> Result<Rc<Carbon>> {
     let config = Config::load(config_path)?;
     if config.sync != SyncMode::None {
       return Err(not_built("Replicated mode"));
@@ -47,6 +60,7 @@ impl Carbon {
     let carbon = Rc::new(Carbon {
       config,
       clock: Clock::default(),
+      schedule,
       services: Services::builtin(),
       system,
       spaces: RefCell::default(),
@@ -76,6 +90,11 @@ impl Carbon {
     Ok(())
   }
 
+  // Run something once a delay has passed, unless cancelled first.
+  pub(crate) fn after(&self, delay: Duration, then: Box<dyn FnOnce()>) -> Cancel {
+    (self.schedule)(delay, then)
+  }
+
   // Stamp a call as an op, now.
   pub(crate) fn stamp(&self, actor: &Actor, call: &Call, input: &Value) -> Op {
     stamp(actor, call, input, &self.services.version(&call.service), self.clock.now())
@@ -85,7 +104,6 @@ impl Carbon {
   pub(crate) fn space_path(&self, id: &str) -> PathBuf {
     self.config.directory().join(format!("{id}.db"))
   }
-
 
   // A space on this device, opened on first use: `[space]` is set up first,
   // then `GET [space]/origin` names the services it runs, and each registered
@@ -170,7 +188,7 @@ mod tests {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("carbondb.toml");
     std::fs::write(&config, "system = \"system.db\"\n").unwrap();
-    assert_eq!(Carbon::open(&config).err().unwrap().code, "NOT_BUILT");
+    assert_eq!(Carbon::open(&config, crate::testing::Timers::default().schedule()).err().unwrap().code, "NOT_BUILT");
   }
 
   #[test]
@@ -199,7 +217,7 @@ mod tests {
     let (directory, carbon) = carbon();
     let identity = alice(&carbon);
     drop(carbon);
-    let restarted = Carbon::open(&directory.path().join("carbondb.toml")).unwrap();
+    let restarted = crate::testing::reopen(&directory);
     let personal = space_now(&restarted, &identity.personal).unwrap();
     let error = call_now(&restarted, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap_err();
     assert_eq!((error.status, error.details), (404, Some(json!({"service": "notes"}))));

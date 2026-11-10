@@ -2,4 +2,3 @@ name = "device"
 
 [[sql]]
 binding = "db"
-migrations_dir = "migrations"

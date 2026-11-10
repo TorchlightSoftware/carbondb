@@ -1,6 +1,6 @@
 # Services ship as hashed packages that declare their bindings
 
-Status: agreed — the builtins are packages with their own service.toml, migrations and package hash, linked natively; every service table is namespaced by service and binding; the WASM host is not built
+Status: agreed — the builtins and [chat] are packages with their own service.toml and package hash, the builtins linked natively and [chat] on npm; every service table is namespaced by service and binding; the WASM host is not built
 
 ## Why
 
@@ -21,10 +21,11 @@ The fix is one package form for every replicated service, builtins included: a s
 
 CarbonDB's own manifest, baked into the package and covered by its hash: a service asking for different bindings is a different version. It holds:
 
-- the service's name;
+- the service's canonical name. A host registers it under a name of its own, which overrides it on that device;
+- `timeout`: the milliseconds every call to the service must settle within, 200 when it names none (see Timeouts and refusals in [implementation.md](implementation.md));
 - `version`: the version the package declares, semver canonically. It is advisory: CarbonDB records it beside the hash and never trusts it, since only the hash says which code ran;
 - `vars`: constants the handlers read;
-- `sql` bindings: a binding name and its migrations, which the service's own `init` applies and tracks.
+- `sql` bindings: a binding name. How a service shapes its storage, such as by migrations, is internal to it: its own `init` applies and tracks them.
 
 The runtime refuses a `service.toml` with any field it does not know. There are no environments: each space and service is isolated already, so one config serves every device.
 
@@ -62,7 +63,7 @@ carbon.services.add_wasm('chat', './chat.wasm')
 
 ## Build order
 
-1. `service.toml`, table namespacing per service, and the package hash in the op, with npm packages. Built: namespacing, `init`, and the package hash, which a Rust package's build script computes over its service.toml, migrations and source, and the JS runtime over an npm service's handlers, `init` and migrations. Open: [chat] as an npm package with a `service.toml`, and [an npm package's version from its lockfile integrity](backlog/npm-package-integrity.md).
+1. `service.toml`, table namespacing per service, and the package hash in the op, with npm packages. Built: namespacing, `init`, `service.toml` for the builtins and for npm packages such as [chat], and the package hash. For now the hash covers every file in the package: a Rust package's build script hashes its crate, and the core an npm package's directory, beside its `service.toml` and without `node_modules`. An npm service's module exports `manifest`, where its `service.toml` is, and `carbon.services.add(name, module)` hands it to the core, which refuses a service without one. Open: [an npm package's version from its lockfile integrity](backlog/npm-package-integrity.md), and [registering a package by its name](backlog/package-names.md).
 2. The WASM host: wasmtime, the host functions, and `add_wasm`.
 3. `[space]`, `[identity]` and `[device]` as committed WASM packages embedded in the library.
 4. The `wrangler.toml` generator and the integrity lookup utility.

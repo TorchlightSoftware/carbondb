@@ -4,7 +4,7 @@
 // keeps its migrations directory and applies it from `init`:
 //
 //   import {applyMigrations, readMigrations} from '@tlsft/carbondb/migrations'
-//   export const migrations = readMigrations(new URL('./migrations/', import.meta.url))
+//   const migrations = readMigrations(new URL('./migrations/', import.meta.url))
 //   export const init = (db) => applyMigrations(db, migrations)
 //
 // It uses nothing but the `db` binding, and the core only from the outside, so

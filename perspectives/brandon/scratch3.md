@@ -1276,4 +1276,94 @@ I would like to review with you the `packages/carbondb/src` code.  I want to ens
 
 Update the agenda with any violations of these rules that you find.  Prefix your topics with `JS:`.  For each topic either provide justification for why it needs to be that way, or admission that it should be folded into the core Rust code.
 
+---
 
+    Building it raises two questions:
+    1. Who names a service? Two agreements disagree.
+       - service.toml holds the service's name (stories/packages.md:21).
+
+Yes.
+
+       - The app names the service when it registers it: carbon.services.add('chat', chat).
+
+Yes.  That's not a conflict, it's just what they get named locally within the space.  The toml name gets overridden at this point.
+
+   The runtime even ignores the service name written in a declared key, for that reason (packages/carbondb/src/routes.js:1-3, README.md:34).
+
+Yes.  So?
+
+    2. How does registration find the file?
+
+You can add a card to the backlog for "map canonical package/crate names onto services".  But I don't think we need that right now.
+
+---
+
+    npm services will run under the core's 200ms default until they get a service.toml
+
+No, we still need to talk about that.  Or to say it clearly: [chat] needs to have a service.toml, and CarbonDB needs to expect it.
+
+---
+
+    - The binding name in a toml only partly takes effect
+
+Why didn't you fix that Claude?  It's obviously wrong.
+
+    - Every call schedules a JS timer, and nothing cancels it.
+
+Again, obviously wrong, and it sounds like you didn't complete your implementation.
+
+    The JS test services' versions cover only their toml.
+
+This doesn't matter right now.
+
+Do you have any (non-dumb) questions before you fix items 1 and 2?  Be concise and don't repeat a bunch of stuff we already know.
+
+---
+
+    The core needs that much from the host because it has no event loop of its own. It runs on Node's JS thread and only acts when something calls into it.
+
+That's an interesting design.  It seems like that would be very memory/CPU efficient.  But is that still going to work when we implement replication?
+
+---
+
+    My proposal: keep setTimeout plus cancellation now, since single-node has no tokio. When replication lands, move timers onto tokio and the crossing
+
+That's fine.  Just put the timer move in the backlog.
+
+    I've added replication's threading to the agenda as an open topic off the critical path
+
+Get rid of that.  We don't need to dive into that further.
+
+    I'll keep db unless you want it renamed to match Otto
+
+No rename, keep it as it is.
+
+Are you ready to implement?
+
+
+---
+
+
+Let's review chat.test.js, which is essentially a mark of how well we did in terms of the overall application experience: initializing CarbonDB and a service, binding a watcher, and calling some mutations.
+
+    // An app's start: load CarbonDB, register [chat], and reach the lobby, made on
+    // the first start and found again on later ones.
+    async function start(config) {
+      const carbon = await configure(config)
+      carbon.services.add('chat', chat)
+
+Looks good up to this point.
+
+      const known = (await carbon.listIdentities()).some((identity) => identity.slug === 'app')
+
+I think this should probably be:
+
+    const ids = await carbon.call('GET [identity]/identity')
+    const known = ids.some((identity) => identity.slug === 'app')
+
+Or similar.
+
+      if (known) return carbon.resumeIdentity('app').ref('personal:app').ref('space:lobby')
+      const {personal} = await carbon.createIdentity({slug: 'app', device: 'server', services: []})
+      return personal.createSpace({name: 'Lobby', services: ['chat']})
+    }

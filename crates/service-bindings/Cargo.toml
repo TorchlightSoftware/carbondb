@@ -7,9 +7,12 @@ version.workspace = true
 publish = false
 
 [features]
+# A package's service.toml and version, for the core, which reads an npm
+# package's at registration.
+manifest = ["dep:toml"]
 # Packaging, for a service's build script: list the crate under
 # [build-dependencies] with this feature, so toml stays out of its runtime.
-build = ["dep:toml"]
+build = ["manifest"]
 
 [dependencies]
 blake3 = "1.8.7"

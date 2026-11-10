@@ -9,7 +9,6 @@ import {deserializeError, isServiceError, toServiceError} from '@tlsft/service-e
 const binding = createRequire(import.meta.url)('../carbondb.node')
 
 export const NativeCarbon = binding.Carbon
-export const hash = binding.hash
 
 const jsonOf = (text) => {
   try {

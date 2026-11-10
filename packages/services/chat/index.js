@@ -1,5 +1,6 @@
-// [chat]: messages in a space. A service is its schema, set up by its `init`,
-// and the handlers that read and write it; the app names it when it registers it:
+// [chat]: messages in a space. A service is its package's service.toml, its
+// schema, set up by its `init`, and the handlers that read and write it; the
+// app names it when it registers it, overriding the name in its service.toml:
 //
 //   carbon.services.add('chat', chat)
 //
@@ -10,8 +11,11 @@ import {z} from 'zod'
 import {forbidden, notFound, validationError} from '@tlsft/service-error'
 import {applyMigrations, readMigrations} from '@tlsft/carbondb/migrations'
 
+// Its manifest, which CarbonDB reads when the app registers it.
+export const manifest = new URL('./service.toml', import.meta.url)
+
 // Its migrations, D1-style files in migrations/, applied by `init` on every open.
-export const migrations = readMigrations(new URL('./migrations/', import.meta.url))
+const migrations = readMigrations(new URL('./migrations/', import.meta.url))
 
 export function init(db) {
   applyMigrations(db, migrations)
@@ -38,7 +42,7 @@ export const calls = {
   // Posting only adds a message, so it never forces a rewind.
   'POST [chat]/messages': {
     tags: ['append'],
-    handler: ({input, op, db}) => {
+    handler: ({input, op, env: {db}}) => {
       const {text} = parse(MessageInput, input)
       const id = op.id()
       db.run('INSERT INTO message (id, author, text, sent_at) VALUES (?, ?, ?, ?)', [id, op.author, text, op.time])
@@ -47,7 +51,7 @@ export const calls = {
   },
 
   'PUT [chat]/messages/:id': {
-    handler: ({path, input, op, db}) => {
+    handler: ({path, input, op, env: {db}}) => {
       const {text} = parse(MessageInput, input)
       ownMessage(db, path.id, op.author)
       db.run('UPDATE message SET text = ?, edited_at = ? WHERE id = ?', [text, op.time, path.id])
@@ -56,7 +60,7 @@ export const calls = {
   },
 
   'DELETE [chat]/messages/:id': {
-    handler: ({path, op, db}) => {
+    handler: ({path, op, env: {db}}) => {
       ownMessage(db, path.id, op.author)
       db.run('UPDATE message SET deleted_at = ? WHERE id = ?', [op.time, path.id])
       return {id: path.id, deleted: true}
@@ -65,6 +69,6 @@ export const calls = {
 
   // A read, answered from this device's copy; never an op.
   'GET [chat]/messages': {
-    handler: ({db}) => db.all('SELECT id, author, text, sent_at, edited_at FROM message WHERE deleted_at IS NULL ORDER BY sent_at, id')
+    handler: ({env: {db}}) => db.all('SELECT id, author, text, sent_at, edited_at FROM message WHERE deleted_at IS NULL ORDER BY sent_at, id')
   }
 }

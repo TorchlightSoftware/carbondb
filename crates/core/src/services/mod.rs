@@ -2,16 +2,23 @@
 //! itself; the builtin packages `[space]`, `[identity]` and `[device]`; and the
 //! app services the runtime registers at startup. A service is its name,
 //! whether it is local (`[@name]`, run once on this device) or replicated, its
-//! version, its `sql` binding, the `init` that sets up its schema, and its entry
-//! point. CarbonDB routes a call to an entry point by service name only; the
-//! entry point routes method and resource itself.
+//! version, its `sql` binding, the time every call to it must settle within,
+//! the `init` that sets up its schema, and its entry point. CarbonDB routes a
+//! call to an entry point by service name only; the entry point routes method
+//! and resource itself.
+//!
+//! An npm service is registered from its package's `service.toml`, under the
+//! name the app gives it, which overrides the canonical name in the manifest.
 
 pub mod carbon;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
+use carbondb_service_bindings::manifest::{self, Manifest};
 use serde_json::json;
 
 use crate::error::{Result, bad_request, conflict, not_found};
@@ -21,6 +28,9 @@ use crate::{Db, HandlerContext, Package};
 
 // The packages CarbonDB ships, linked into the library.
 const BUILTINS: [Package; 3] = [carbondb_space::PACKAGE, carbondb_identity::PACKAGE, carbondb_device::PACKAGE];
+
+// How long a call to a service may take to settle when its service.toml names no timeout.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
 
 // What sets up a service's schema, given its `db` binding.
 pub type Init = Rc<dyn Fn(Rc<dyn Db>) -> Result<()>>;
@@ -35,18 +45,21 @@ pub struct Service {
   // The hash of the package that handles its calls, which every op on it carries.
   pub version: String,
   pub binding: Option<String>,
+  // Every top-level call to it must settle within this, or it is settled with a timeout.
+  pub timeout: Duration,
   pub init: Init,
   // Every service but `[@carbon]` sees its service call only as a handler context.
   pub(crate) entry: Rc<dyn Fn(Rc<ServiceCall>)>,
 }
 
 impl Service {
-  pub fn replicated(name: &str, version: &str, binding: Option<&str>, init: Init, entry: Entry) -> Service {
+  pub fn replicated(name: &str, version: &str, binding: Option<&str>, timeout: Duration, init: Init, entry: Entry) -> Service {
     Service {
       name: name.into(),
       local: false,
       version: version.into(),
       binding: binding.map(str::to_string),
+      timeout,
       init,
       entry: Rc::new(move |call: Rc<ServiceCall>| entry(call)),
     }
@@ -54,7 +67,12 @@ impl Service {
 
   fn package(package: &Package) -> Service {
     let (init, entry) = (package.init, package.entry);
-    Service::replicated(package.name, package.version, package.binding, Rc::new(move |db: Rc<dyn Db>| init(db.as_ref())), Rc::new(entry))
+    Service::replicated(package.name, package.version, package.binding, timeout(package.timeout), Rc::new(move |db: Rc<dyn Db>| init(db.as_ref())), Rc::new(entry))
+  }
+
+  // An npm package's service, registered under `name`.
+  pub fn npm(name: &str, package: &NpmPackage, init: Init, entry: Entry) -> Service {
+    Service::replicated(name, &package.version, package.binding.as_deref(), package.timeout, init, entry)
   }
 
   // The namespace its statements run in: `chat/db/`. None for `[@carbon]`, the
@@ -65,6 +83,25 @@ impl Service {
       (None, true) => Ok(None),
       (None, false) => Err(bad_request(format!("Service '{}' declares no sql binding, so it has no tables", self.name))),
     }
+  }
+}
+
+// An npm package as the core reads it, from the service.toml its module points
+// to: the binding its handlers receive, its timeout, and its version, the hash
+// of every file beside its service.toml.
+pub struct NpmPackage {
+  pub binding: Option<String>,
+  pub timeout: Duration,
+  pub version: String,
+}
+
+impl NpmPackage {
+  // The package of the service registered as `name`, refused when it exports no manifest.
+  pub fn read(name: &str, manifest: Option<&Path>) -> Result<NpmPackage> {
+    let path = manifest.ok_or_else(|| bad_request(format!("Service '{name}' exports no manifest, the URL of its service.toml")))?;
+    let read = Manifest::read(path).map_err(bad_request)?;
+    let version = manifest::version(path.parent().unwrap_or(path)).map_err(bad_request)?;
+    Ok(NpmPackage { binding: read.binding().map(str::to_string), timeout: timeout(read.timeout), version })
   }
 }
 
@@ -120,6 +157,11 @@ impl Services {
   }
 }
 
+// A service's timeout, from the milliseconds its service.toml names.
+fn timeout(milliseconds: Option<u64>) -> Duration {
+  milliseconds.map_or(DEFAULT_TIMEOUT, Duration::from_millis)
+}
+
 // The version of an op made on this device for a service it does not run. No
 // handler sees it: the op is refused when its turn comes, which also keeps it
 // from running again and from being published.
@@ -135,7 +177,11 @@ mod tests {
   use super::*;
 
   fn service(name: &str) -> Service {
-    Service::replicated(name, "v1", Some("db"), Rc::new(|_: Rc<dyn Db>| Ok(())), Rc::new(|_| {}))
+    replicated(name, Some("db"))
+  }
+
+  fn replicated(name: &str, binding: Option<&str>) -> Service {
+    Service::replicated(name, "v1", binding, DEFAULT_TIMEOUT, Rc::new(|_: Rc<dyn Db>| Ok(())), Rc::new(|_| {}))
   }
 
   #[test]
@@ -157,7 +203,7 @@ mod tests {
   fn refuses_a_name_that_would_nest_inside_another_service_namespace() {
     let services = Services::builtin();
     services.register(service("chat")).unwrap();
-    let nested = [Service::replicated("chat/db", "v1", Some("db"), Rc::new(|_: Rc<dyn Db>| Ok(())), Rc::new(|_| {})), Service::replicated("notes", "v1", Some("db/x"), Rc::new(|_: Rc<dyn Db>| Ok(())), Rc::new(|_| {}))];
+    let nested = [replicated("chat/db", Some("db")), replicated("notes", Some("db/x"))];
     for service in nested {
       let name = service.name.clone();
       assert_eq!(services.register(service).err().unwrap().status, 400, "{name}");
@@ -172,5 +218,37 @@ mod tests {
     let error = services.require_registered(&["space".into(), "crm".into()]).unwrap_err();
     assert_eq!((error.status, error.details), (400, Some(json!({"services": ["crm"]}))));
     assert_eq!(services.get("crm").err().unwrap().details, Some(json!({"service": "crm"})));
+  }
+
+  // An npm package on disk: its service.toml and a handler file.
+  fn package(manifest: &str) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("service.toml"), manifest).unwrap();
+    std::fs::write(root.path().join("index.js"), "export const calls = {}").unwrap();
+    root
+  }
+
+  fn npm(name: &str, manifest: Option<&Path>) -> Result<Service> {
+    Ok(Service::npm(name, &NpmPackage::read(name, manifest)?, Rc::new(|_: Rc<dyn Db>| Ok(())), Rc::new(|_| {})))
+  }
+
+  #[test]
+  fn registers_an_npm_service_from_its_service_toml_under_the_name_the_app_gives_it() {
+    let chat = package("name = \"chat\"\ntimeout = 50\n[[sql]]\nbinding = \"db\"\n");
+    let manifest = chat.path().join("service.toml");
+    let service = npm("lobby", Some(&manifest)).unwrap();
+    assert_eq!((service.name.as_str(), service.binding.as_deref(), service.timeout), ("lobby", Some("db"), Duration::from_millis(50)));
+    assert_eq!(service.version, manifest::version(chat.path()).unwrap());
+    let plain = package("name = \"plain\"\n");
+    assert_eq!(npm("plain", Some(&plain.path().join("service.toml"))).unwrap().timeout, DEFAULT_TIMEOUT);
+  }
+
+  #[test]
+  fn refuses_an_npm_service_without_a_service_toml_it_can_read() {
+    let unknown = package("name = \"chat\"\nenv = \"production\"\n");
+    let cases = [("no manifest", None), ("a manifest that is not there", Some(unknown.path().join("missing.toml"))), ("a field it does not know", Some(unknown.path().join("service.toml")))];
+    for (why, manifest) in cases {
+      assert_eq!(npm("chat", manifest.as_deref()).err().unwrap().status, 400, "{why}");
+    }
   }
 }

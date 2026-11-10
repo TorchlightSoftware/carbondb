@@ -154,14 +154,14 @@ The steps for each op:
 2. It hands the call to the service's entry point and waits for it to settle. Handlers may be async.
 3. Database calls from the handler are synchronous and run inside the open transaction.
 4. When the Promise resolves, the core records the op's result and commits, taking the session's changeset; replicated mode keeps it with the op. When it rejects or returns an error, the core rolls back and records the op's result as refused, with its error.
-5. The core keeps every watch: a GET, the tables it read, and when it must run again after a commit that changed one of them, or after its space stops or resumes. A call from the app is answered once the watches its commit touched have run again. The runtime only registers watches and hands each answer to the app, and apps get no separate event API.
+5. The core keeps every watch: a GET, the tables it read, and when it must run again after a commit that changed one of them, or after its space stops or resumes. A write from the app is answered once the watches its commit owes a run have run again: those that read a table it wrote, and those in flight when it landed, which are judged when they answer. A GET from the app answers at once. The runtime only registers watches and hands each answer to the app, and apps get no separate event API.
 
 Timeouts and refusals:
 
 - A call refused on the author's device is not published.
 - A rejection on a later replica leaves the op in the log; its result records the refusal, on that device only, and `[@error]` reads it (see [rejected after merge](backlog/rejected-after-merge.md)).
 - Every op stays in the log, so no data is lost. Each space gets a standard op history interface for finding a culprit op, such as a destructive offline edit, and reverting it. A revert is a new compensating op.
-- A handler that overruns a timeout rolls back. A local call is then refused and never published. A synced op is not recorded as rejected, because a timeout differs between replicas, so the space pauses, reports the error and retries.
+- A handler that overruns a timeout rolls back. Each service names its timeout in its `service.toml`, 200ms by default, and one deadline covers a call and the calls it makes. The core has no timers, so the host schedules the deadline, and the core settles the call with a `504` when it passes and drops its handler's later answer. A local call is then refused and never published. A synced op is not recorded as rejected, because a timeout differs between replicas, so the space pauses, reports the error and retries.
 
 System failures:
 
@@ -328,7 +328,7 @@ During a partition, GETs read the local copy, and writes apply locally and publi
 
 **The core (Rust)** owns the p2panda nodes and spaces, identity and devices, the op envelope and clock, the shared order, SQLite execution, sessions, undo, rewind, the apply loop, routing by service name, and `[@carbon]`. It ships `[space]`, `[identity]` and `[device]` as packages written against the service API, like any other service: the core reads and writes their records only through calls to them, but for one exception: where an app needs an answer at once, as a handle finding a ref, the core reads a service's tables directly, namespaced, read-only and over committed state. It also keeps what an app needs from CarbonDB itself, such as watches and the device an identity acts from, so the runtime holds no CarbonDB state. It knows nothing of app schemas, routes, zod, roles or merge strategy.
 
-**The service runtime (JS)** owns the entry point of each npm service: its route matching, the handler context, its migrations and its access checks.
+**The service runtime (JS)** owns the entry point of each npm service: its route matching, the handler context and its access checks. How a service shapes its tables, such as by migrations, is the service's own concern.
 
 CarbonDB is a message bus that handles state management: handlers and triggers subscribe to service keys, and handlers are language agnostic.
 

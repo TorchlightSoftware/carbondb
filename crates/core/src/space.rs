@@ -236,7 +236,7 @@ mod tests {
   }
 
   fn service(name: &str, schema: &'static str) -> Rc<Service> {
-    Rc::new(Service::replicated(name, "v1", Some("db"), Rc::new(move |db: Rc<dyn Db>| db.run(schema, &[]).map(|_| ())), Rc::new(|_| {})))
+    Rc::new(Service::replicated(name, "v1", Some("db"), crate::services::DEFAULT_TIMEOUT, Rc::new(move |db: Rc<dyn Db>| db.run(schema, &[]).map(|_| ())), Rc::new(|_| {})))
   }
 
   // The core migrations a store's file has applied, in order.
