@@ -351,7 +351,7 @@ const sales = carbon.ref('identity:alice').ref('personal:alice').ref('company:fo
 await sales.call('POST [chat]/messages', {text: 'lunch?'})
 ```
 
-The stories' names stay: `configure`, `services.add`, `createIdentity`, `resumeIdentity`, `joinIdentity`, `addDevice`, `listIdentities`, `createSpace`, `listSpaces`, `ref`, `call` and `watch`. They are thin wrappers over the calls in [services.md](services.md).
+An app needs only `configure`, `services.add`, `ref`, `call` and `watch`. Everything else is a call, listed in [services.md](services.md), such as creating and listing identities and spaces. A handle keeps no helpers over them; what a call creates is reached through `ref`.
 
 ## Porting existing services
 

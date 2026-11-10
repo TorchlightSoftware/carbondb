@@ -229,7 +229,7 @@ fn answering(carbon: &Carbon, space: &Space, call: &Call) -> Result<Rc<Service>>
   match (call.confined, found) {
     (true, Some(service)) => Ok(service),
     (true, None) => Err(not_found(format!("No local service [@{}] on this device", call.service))),
-    (false, _) if space.is_root() => Err(not_found(format!("The system handle answers only local services, not {}", call.key()))),
+    (false, _) if space.is_root() => Err(not_found(format!("The system space runs local services only, not {}", call.key()))),
     (false, Some(service)) if space.runs(&call.service) => Ok(service),
     (false, None) if space.names(&call.service) => Err(services::missing(&call.service)),
     (false, _) => Err(not_found(format!("[{}] does not run in this space", call.service))),

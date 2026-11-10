@@ -6,8 +6,8 @@ Status: agreed
 
 ```js
 // created with the identity (story 1)
-const {identity, personal} = await carbon.createIdentity({slug: 'alice', device: 'laptop', services: ['contacts', 'chat']})
-// later sessions
+await carbon.call('POST [@carbon]/identity', {slug: 'alice', device: 'laptop', services: ['contacts', 'chat']})
+// this session and later ones
 const personal = carbon.ref('identity:alice').ref('personal:alice')
 
 await personal.call('PUT [contacts]/contacts/sally', {name: 'Sally'})

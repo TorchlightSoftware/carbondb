@@ -67,20 +67,6 @@ export class SpaceHandle {
   resume() {
     core(() => this.#native.resume(this.space))
   }
-
-  // Create a space nested in this one, and return its handle.
-  async createSpace(input) {
-    const created = await this.call('POST [@carbon]/space', input)
-    return new SpaceHandle(this.#native, created.space, this.identity)
-  }
-
-  listSpaces() {
-    return this.call('GET [space]/refs')
-  }
-
-  status() {
-    return this.call('GET [@carbon]/status')
-  }
 }
 
 // The system handle, `carbon`: this device's root, where identities live.
@@ -100,25 +86,9 @@ export class SystemHandle {
     return new SpaceHandle(this.#native, identity.space, identity)
   }
 
-  // A call on the system handle, the root space, which runs only local services.
+  // A call on the system handle, the root space, which runs only local services:
+  // `POST [@carbon]/identity` creates an identity, `GET [@carbon]/identities` lists them.
   call(key, input = null) {
     return answered((reply) => this.#native.call(null, null, key, input, reply))
-  }
-
-  // An identity, its first device and its personal space, which runs the services named.
-  async createIdentity({slug, device, services = []}) {
-    const identity = await this.call('POST [@carbon]/identity', {slug, device, services})
-    return {
-      identity: new SpaceHandle(this.#native, identity.space, identity),
-      personal: new SpaceHandle(this.#native, identity.personal, identity)
-    }
-  }
-
-  resumeIdentity(slug) {
-    return this.ref(`identity:${slug}`)
-  }
-
-  listIdentities() {
-    return this.call('GET [@carbon]/identities')
   }
 }

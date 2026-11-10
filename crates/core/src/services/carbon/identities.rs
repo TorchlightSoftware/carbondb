@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use super::steps::{self, Step, Target};
 use carbondb_space::names::slugify;
 
-use crate::error::{Result, bad_request, conflict, internal, not_found};
+use crate::error::{Result, bad_request, conflict, internal, not_found, single_node};
 use crate::hash::hash;
 use crate::keys::{self, KeyPair};
 use crate::service_call::ServiceCall;
@@ -41,6 +41,8 @@ struct IdentityInput {
   device: String,
   #[serde(default)]
   services: Vec<String>,
+  // A code scanned from a device already in the identity, to join it rather than found one.
+  code: Option<String>,
 }
 
 
@@ -123,6 +125,9 @@ struct Founding {
 // call's op, so a retry after a crash reaches the same spaces.
 fn plan(call: &ServiceCall) -> Result<Founding> {
   let request: IdentityInput = serde_json::from_value(call.input.clone())?;
+  if request.code.is_some() {
+    return Err(single_node("Joining an identity from another device"));
+  }
   if request.slug.is_empty() || slugify(&request.slug) != request.slug {
     return Err(bad_request(format!("'{}' is not a lowercase kebab-case slug", request.slug)));
   }

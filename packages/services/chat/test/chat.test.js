@@ -20,10 +20,16 @@ function configFile() {
 async function start(config) {
   const carbon = await configure(config)
   carbon.services.add('chat', chat)
-  const known = (await carbon.listIdentities()).some((identity) => identity.slug === 'app')
-  if (known) return carbon.resumeIdentity('app').ref('personal:app').ref('space:lobby')
-  const {personal} = await carbon.createIdentity({slug: 'app', device: 'server', services: []})
-  return personal.createSpace({name: 'Lobby', services: ['chat']})
+  const identities = await carbon.call('GET [@carbon]/identities')
+  const known = identities.some((identity) => identity.slug === 'app')
+  if (known) {
+    return carbon.ref('identity:app').ref('personal:app').ref('space:lobby')
+  } else {
+    await carbon.call('POST [@carbon]/identity', {slug: 'app', device: 'server'})
+    const personal = carbon.ref('identity:app').ref('personal:app')
+    await personal.call('POST [@carbon]/space', {name: 'Lobby', services: ['chat']})
+    return personal.ref('space:lobby')
+  }
 }
 
 let config, lobby
@@ -93,7 +99,7 @@ describe('errors', () => {
 
 describe('status', () => {
   it('describes the lobby: its name, services and single-node state', async () => {
-    const {kind, name, services, access, sync, peers} = await lobby.status()
+    const {kind, name, services, access, sync, peers} = await lobby.call('GET [@carbon]/status')
     assert.deepStrictEqual({kind, name, services, access, sync, peers}, {kind: 'space', name: 'Lobby', services: ['chat'], access: ['manage'], sync: 'off', peers: []})
   })
 })

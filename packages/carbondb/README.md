@@ -13,8 +13,10 @@ import * as chat from './services/chat.js'
 const carbon = await configure('./carbondb.toml')
 carbon.services.add('chat', chat)
 
-const {personal} = await carbon.createIdentity({slug: 'alice', device: 'laptop'})
-const room = await personal.createSpace({name: 'Lobby', services: ['chat']})
+await carbon.call('POST [@carbon]/identity', {slug: 'alice', device: 'laptop'})
+const personal = carbon.ref('identity:alice').ref('personal:alice')
+await personal.call('POST [@carbon]/space', {name: 'Lobby', services: ['chat']})
+const room = personal.ref('space:lobby')
 
 await room.call('POST [chat]/messages', {text: 'hello'})
 const stop = room.watch('GET [chat]/messages', (messages) => render(messages))
@@ -39,7 +41,7 @@ mode = "none"               # single-node
 - **`watch(key, fn)`** runs a GET, then again after each commit that wrote a table it read. `fn` gets each result, or `undefined` and the error when the GET fails. It returns a function that stops the watch.
 - **Run state:** `runState()` on a space handle says where the space is in applying its ops: `{state: 'initializing', services}` while a service the space names is not set up here, `{state: 'idle'}`, `{state: 'applying', op}`, or `{state: 'stopped', error}`. `watchRunState(fn)` calls `fn` with each change and returns a function that stops it. A space stops on a system failure, such as a full disk, an I/O error or another process holding its file: every call and watch on it then gets a `503 SPACE_STOPPED` carrying the failure, and nothing is logged or applied, until the problem is fixed by hand and `resume()` is called, for example from a button. The op that was applying applies again then.
 - **Handlers** receive `{path, input, env, call}`, and `op` when the call writes. `env` holds the service's `sql` binding under the name its `service.toml` gives it, as a Worker's `env` does: `({env: {db}}) => db.all(...)` for `binding = "db"`. A write runs in one transaction, committed when the handler resolves and rolled back when it throws. `call(key, input)` makes a call inside it: it sees the handler's writes so far, and when it fails only its own writes roll back and the error rejects the `call`. A GET reads committed state, never waits for a write, and cannot call one. `op` carries the author, device and time, with `id()` and `random()` derived from the op, so take ids, time and randomness from it, never from `Date.now()` or `Math.random()`. Validating input is the service's own business: throw `validationError`.
-- **Builtin calls:** `GET [@carbon]/status`, `GET [space]/refs`, `GET [device]/refs`, and the helpers `createIdentity`, `resumeIdentity`, `listIdentities`, `createSpace`, `listSpaces` and `status`. Calls that need peers, such as `POST [@carbon]/members`, reject with `501 SINGLE_NODE`.
+- **Builtin calls:** on `carbon`, `POST [@carbon]/identity` creates an identity, its first device and its personal space, and `GET [@carbon]/identities` lists them; in a space, `POST [@carbon]/space` creates a space nested in it and answers its ref, `GET [@carbon]/status` describes it, and `GET [space]/refs` and `GET [device]/refs` list its refs and devices. A handle has no methods beyond these calls: reach what a call created through `ref`. Calls that need peers, such as `POST [@carbon]/members`, reject with `501 SINGLE_NODE`.
 
 CarbonDB binds no protocol. To serve a space over HTTP, write an adapter that turns a request into `space.call(key, input)` and a service error into a response.
 

@@ -4,7 +4,7 @@ Status: backlog
 
 ## Idea
 
-[Story 01](../01-initialize-identity.md) returns a paper key once from `createIdentity` and never stores it. The build returns none, because recovery is not designed. A paper key is an offline device: in Keybase's device chain it is a full-powered device key, and it is the usual way back in when every device is lost.
+[Story 01](../01-initialize-identity.md) returns a paper key once from `POST [@carbon]/identity` and never stores it. The build returns none, because recovery is not designed. A paper key is an offline device: in Keybase's device chain it is a full-powered device key, and it is the usual way back in when every device is lost.
 
 Already agreed (see [implementation](../implementation.md)): the paper key is an identity log entry only, and stays out of the p2panda group until recovery is designed.
 

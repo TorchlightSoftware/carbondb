@@ -130,6 +130,7 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 - [A person gets a paper key when they create an identity](backlog/paper-key.md)
 - [An app developer registers a service by its package or crate name](backlog/package-names.md)
 - [The core keeps its own timers once replication runs](backlog/core-timers.md)
+- [An app can sign a message as an identity and verify one](backlog/sign-and-verify.md)
 
 ## API sketch
 
@@ -229,10 +230,12 @@ const carbon = await configure('./carbondb.toml')
 carbon.services.add('chat', chat)
 
 // An identity, its first device and its personal space, with keys generated here.
-const {personal} = await carbon.createIdentity({slug: 'alice', device: 'laptop', services: []})
+await carbon.call('POST [@carbon]/identity', {slug: 'alice', device: 'laptop'})
+const personal = carbon.ref('identity:alice').ref('personal:alice')
 
 // A space is one chat room, nested privately under the personal space.
-const room = await personal.createSpace({name: 'Room', services: ['chat']})
+await personal.call('POST [@carbon]/space', {name: 'Room', services: ['chat']})
+const room = personal.ref('space:room')
 
 // Any medium can carry the code; Sally joins with it on her device.
 const {code} = await room.call('POST [@carbon]/members', {contact: sallyContact})

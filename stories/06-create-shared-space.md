@@ -5,16 +5,17 @@ Status: agreed
 ## Calls
 
 ```js
-const rph = await personal.createSpace({name: "Randall's Playhouse", services: ['chat']})
-rph.slug   // 'randalls-playhouse'
+const {slug} = await personal.call('POST [@carbon]/space', {name: "Randall's Playhouse", services: ['chat']})
+slug   // 'randalls-playhouse'
+const rph = personal.ref(`space:${slug}`)
 ```
 
 ## Rules
 
 - A space a person creates for themselves is nested in their personal space, so its ref stays private.
-- `createSpace` takes a name shared with members and derives a local slug from it, adding `-N` with an incrementing integer when the slug is taken; an optional `slug` overrides it. `personal.listSpaces()` lists them.
+- `POST [@carbon]/space` takes a name shared with members and derives a local slug from it, adding `-N` with an incrementing integer when the slug is taken; an optional `slug` overrides it. It answers the new space's ref. `GET [space]/refs` on the personal space lists them.
 
-- `createSpace` calls `POST [@carbon]/space` in the context of the handle it is called on, so the new space is nested where it was added. Its handler creates the space in p2panda and writes the space's first op, `POST [space]/origin`, carrying its name, services and manage list.
+- `POST [@carbon]/space` runs in the space of the handle it is called on, so the new space is nested where it was added. Its handler creates the space in p2panda and writes the space's first op, `POST [space]/origin`, carrying its name, services and manage list.
 - `manage` defaults to the calling identity. An empty list means no one may delete the space or add members.
 - Anyone may create a space. Attaching it to another space, so that it is visible to and managed by that space's members, needs that space to accept a `POST [space]/ref` first.
 - The creator is a member.

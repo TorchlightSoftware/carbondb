@@ -5,20 +5,28 @@ Status: agreed
 ## Calls
 
 ```js
-// on the new device
-const join = await carbon.joinIdentity({device: {name: 'phone', type: 'mobile'}})
-// or on a device already in the identity
-const join = identity.addDevice()
+// on a device already in the identity, in its identity space: show a code
+const identity = carbon.ref('identity:alice')
+const {code} = await identity.call('POST [@carbon]/devices')
+display(code)
 
-display(join.qr)            // either side may show its code
-join.apply(scannedCode)     // either side may scan the other's
-const result = await join.done
+// on the new device, in the system space: scan it, and join the identity
+await carbon.call('POST [@carbon]/identity', {code: scannedCode, device: 'phone'})
+
+// or the other way round: the existing device scans the new device's code
+await identity.call('POST [@carbon]/devices', {code: scannedCode})
 ```
+
+### Open questions
+
+- How the new device shows its code when it is the one shown: which call in the system space generates its key pair and answers the code, before it knows the identity.
+- How the side that showed its code learns the exchange finished: a watch, such as `GET [@carbon]/identities` on the new device, which needs watches on the system space, or `GET [device]/refs` on the existing one.
+- Whether a call that waits on p2panda fits its service's timeout, or starts the work and a watch reports it done.
 
 ## Rules
 
 - Either device may start, and either may show or scan; one scan completes the exchange. How the app offers this is up to its interface.
-- The new device generates its keys with `POST [@carbon]/devices` in system, which never replicates. The existing device authorizes that key with `POST [device]/origin` in the identity space, and adds the new device to the identity's p2panda group, which gives it the group secrets of every space the identity is in. It records the new device's name and tags with `POST [device]/ref` in the personal space; without the `manage` tag, a device cannot write to `[space]`. The new device syncs the identity space and finds its spaces by walking the refs from it, through the personal space.
+- The new device generates its keys in the system space, which never replicates, as part of `POST [@carbon]/identity` with a `code`. The existing device runs `POST [@carbon]/devices` in the identity space: it authorizes that key with `POST [device]/origin` there, and adds the new device to the identity's p2panda group, which gives it the group secrets of every space the identity is in. It records the new device's name and tags with `POST [device]/ref` in the personal space; without the `manage` tag, a device cannot write to `[space]`. The new device syncs the identity space and finds its spaces by walking the refs from it, through the personal space.
 - Codes are single-use and short-lived.
 - The identity's existing devices see every join through `GET [device]/refs` in the personal space; the interface decides whether and how to show it.
 

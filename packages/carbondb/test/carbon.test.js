@@ -113,11 +113,19 @@ async function start(path) {
   return carbon
 }
 
-let config, carbon, identity, personal
+// A space made in `parent`, as an app makes one: a call there, then a ref to it.
+async function spaceIn(parent, input) {
+  const {kind, slug} = await parent.call('POST [@carbon]/space', input)
+  return parent.ref(`${kind}:${slug}`)
+}
+
+let config, carbon, alice, identity, personal
 beforeEach(async () => {
   config = configFile()
   carbon = await start(config)
-  ;({identity, personal} = await carbon.createIdentity({slug: 'alice', device: 'Pixel9', services: ['notes']}))
+  alice = await carbon.call('POST [@carbon]/identity', {slug: 'alice', device: 'Pixel9', services: ['notes']})
+  identity = carbon.ref('identity:alice')
+  personal = identity.ref('personal:alice')
 })
 
 const texts = async (space) => (await space.call('GET [notes]/notes')).map((row) => row.text)
@@ -130,15 +138,15 @@ describe('configure', () => {
 
 describe('identities', () => {
   it('lists the identity and resumes it in a fresh start with the same id and device', async () => {
-    const [listed] = await carbon.listIdentities()
-    assert.deepStrictEqual([listed.slug, listed.id, listed.device], ['alice', identity.identity.id, identity.identity.device])
-    const again = (await start(config)).resumeIdentity('alice')
-    assert.deepStrictEqual(again.identity, identity.identity)
+    const [listed] = await carbon.call('GET [@carbon]/identities')
+    assert.deepStrictEqual([listed.slug, listed.id, listed.device], ['alice', alice.id, alice.device])
+    const again = (await start(config)).ref('identity:alice')
+    assert.deepStrictEqual(again.identity, alice)
   })
 
   it('keeps the device key in the identity space and its name and tags in the personal space', async () => {
-    assert.deepStrictEqual(await identity.call('GET [device]/devices'), [identity.identity.device])
-    assert.deepStrictEqual(await personal.call('GET [device]/refs'), [{pubkey: identity.identity.device, name: 'Pixel9', tags: ['manage']}])
+    assert.deepStrictEqual(await identity.call('GET [device]/devices'), [alice.device])
+    assert.deepStrictEqual(await personal.call('GET [device]/refs'), [{pubkey: alice.device, name: 'Pixel9', tags: ['manage']}])
   })
 
   it('reaches the personal space through refs from the system handle', () => {
@@ -167,7 +175,7 @@ describe('services', () => {
         'GET [stash]/items': {handler: ({env}) => ({bindings: Object.keys(env), items: env.store.all('SELECT name FROM item')})}
       }
     })
-    const stash = await personal.createSpace({name: 'Stash', services: ['stash']})
+    const stash = await spaceIn(personal, {name: 'Stash', services: ['stash']})
     await stash.call('POST [stash]/items', {name: 'kept'})
     assert.deepStrictEqual(await stash.call('GET [stash]/items'), {bindings: ['store'], items: [{name: 'kept'}]})
   })
@@ -178,15 +186,15 @@ describe('services', () => {
   })
 
   it('refuses an identity or space naming a service this device has not registered', async () => {
-    await assert.rejects(carbon.createIdentity({slug: 'sally', device: 'x', services: ['crm']}), {status: 400, details: {services: ['crm']}})
-    await assert.rejects(personal.createSpace({name: 'Sales', services: ['crm']}), {status: 400})
+    await assert.rejects(carbon.call('POST [@carbon]/identity', {slug: 'sally', device: 'x', services: ['crm']}), {status: 400, details: {services: ['crm']}})
+    await assert.rejects(personal.call('POST [@carbon]/space', {name: 'Sales', services: ['crm']}), {status: 400})
   })
 
   it('keeps data across a restart that registers the service again, and refuses the space when it does not', async () => {
     await personal.call('POST [notes]/notes', {text: 'kept'})
-    const restarted = (await start(config)).resumeIdentity('alice').ref('personal:alice')
+    const restarted = (await start(config)).ref('identity:alice').ref('personal:alice')
     assert.deepStrictEqual(await texts(restarted), ['kept', 'kept again'])
-    const unregistered = (await configure(config)).resumeIdentity('alice').ref('personal:alice')
+    const unregistered = (await configure(config)).ref('identity:alice').ref('personal:alice')
     await assert.rejects(unregistered.call('GET [notes]/notes'), {status: 404, details: {service: 'notes'}})
     assert.deepStrictEqual(unregistered.runState(), {state: 'initializing', services: ['notes']})
   })
@@ -195,7 +203,7 @@ describe('services', () => {
 describe('calls', () => {
   it('commits an async handler, with the author and device from the acting identity', async () => {
     const result = await personal.call('POST [notes]/notes', {text: 'hello'})
-    assert.deepStrictEqual([result.author, result.device], [identity.identity.id, identity.identity.device])
+    assert.deepStrictEqual([result.author, result.device], [alice.id, alice.device])
     assert.deepStrictEqual(await texts(personal), ['hello', 'hello again'])
   })
 
@@ -268,15 +276,15 @@ describe('calls', () => {
 
 describe('spaces', () => {
   it('creates a space nested in the calling one, with its own slug and status', async () => {
-    const room = await personal.createSpace({name: "Randall's Playhouse", services: ['notes']})
-    const [listed] = (await personal.listSpaces()).filter((ref) => ref.kind === 'space')
+    const room = await spaceIn(personal, {name: "Randall's Playhouse", services: ['notes']})
+    const [listed] = (await personal.call('GET [space]/refs')).filter((ref) => ref.kind === 'space')
     assert.deepStrictEqual([listed.slug, listed.space], ['randalls-playhouse', room.space])
     assert.strictEqual(personal.ref('space:randalls-playhouse').space, room.space)
 
-    const status = await room.status()
+    const status = await room.call('GET [@carbon]/status')
     assert.deepStrictEqual(
       {name: status.name, services: status.services, manage: status.manage, access: status.access, sync: status.sync, peers: status.peers},
-      {name: "Randall's Playhouse", services: ['notes'], manage: [identity.identity.id], access: ['manage'], sync: 'off', peers: []}
+      {name: "Randall's Playhouse", services: ['notes'], manage: [alice.id], access: ['manage'], sync: 'off', peers: []}
     )
     await room.call('POST [notes]/notes', {text: 'in the room'})
     assert.deepStrictEqual(await texts(room), ['in the room', 'in the room again'])
@@ -327,7 +335,7 @@ describe('watch', () => {
   it('watches a builtin GET too', async () => {
     const {results, arrival} = watching(personal, 'GET [space]/refs')
     await arrival()
-    personal.createSpace({name: 'Lobby', services: ['notes']})
+    personal.call('POST [@carbon]/space', {name: 'Lobby', services: ['notes']})
     await arrival()
     assert.deepStrictEqual(results.map((refs) => refs.map((ref) => ref.slug)), [[], ['lobby']])
   })
@@ -455,10 +463,10 @@ describe('run state', () => {
 
 describe('refs', () => {
   it('reach a space at once, also after a restart', async () => {
-    const room = await personal.createSpace({name: 'Lobby', services: ['notes']})
-    assert.strictEqual(personal.ref('space:lobby').space, room.space)
+    const {space} = await personal.call('POST [@carbon]/space', {name: 'Lobby', services: ['notes']})
+    assert.strictEqual(personal.ref('space:lobby').space, space)
     const restarted = await start(config)
-    assert.strictEqual(restarted.ref('identity:alice').ref('personal:alice').ref('space:lobby').space, room.space)
+    assert.strictEqual(restarted.ref('identity:alice').ref('personal:alice').ref('space:lobby').space, space)
   })
 })
 
@@ -473,12 +481,12 @@ describe('schema', () => {
     }
     const restarted = await configure(config)
     restarted.services.add('notes', grown)
-    assert.deepStrictEqual(await restarted.resumeIdentity('alice').ref('personal:alice').call('GET [notes]/tags'), [{name: 'red', color: 'none'}])
+    assert.deepStrictEqual(await restarted.ref('identity:alice').ref('personal:alice').call('GET [notes]/tags'), [{name: 'red', color: 'none'}])
   })
 
   it('refuses a service whose table takes its keys from SQLite, and says how to fix it', async () => {
     carbon.services.add('counter', {manifest: manifestOf('counter'), init: (db) => db.run('CREATE TABLE IF NOT EXISTS hit (id INTEGER PRIMARY KEY AUTOINCREMENT)'), calls: {}})
-    await assert.rejects(personal.createSpace({name: 'Counted', services: ['counter']}), (error) => {
+    await assert.rejects(personal.call('POST [@carbon]/space', {name: 'Counted', services: ['counter']}), (error) => {
       assert.deepStrictEqual([error.status, error.details], [400, {table: 'hit'}])
       assert.match(error.message, /must come from the op that creates it.*op_id\(\)/)
       return true
@@ -487,7 +495,7 @@ describe('schema', () => {
 
   it("keeps a service inside its own tables, even when it names another service's", async () => {
     carbon.services.add('snoop', {manifest: manifestOf('snoop'), calls: {'GET [snoop]/refs': {handler: ({env: {db}}) => db.all('SELECT * FROM "space/db/ref"')}}})
-    const room = await personal.createSpace({name: 'Snooped', services: ['snoop']})
+    const room = await spaceIn(personal, {name: 'Snooped', services: ['snoop']})
     await assert.rejects(room.call('GET [snoop]/refs'), {status: 500, message: /no such table: snoop\/db\/space\/db\/ref/})
   })
 })

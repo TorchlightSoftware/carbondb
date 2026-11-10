@@ -96,11 +96,15 @@ team:sales
 ## Tom adds a second device
 
 ```
-# on the new device
-system
-  POST [@carbon]/devices {name:'TomTablet'}                     # generates the key pair; its QR code carries the pubkey and name
+# on TomPhone, showing a code
+identity:tom
+  POST [@carbon]/devices                                        # answers 'tom-code'
 
-# on TomPhone, after scanning
+# on the new device, after scanning it
+system
+  POST [@carbon]/identity {code:'tom-code', device:'TomTablet'} # generates the key pair and hands TomPhone its public key
+
+# on TomPhone, once the new device answers (how the exchange runs is open, see story 02)
 identity:tom
   POST [device]/origin {pubkey:'qwer117'}
 

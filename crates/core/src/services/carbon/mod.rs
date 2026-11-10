@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use serde_json::{Value, json};
 
-use crate::error::{Result, not_built, single_node};
+use crate::error::{Result, ServiceError, not_built, not_found, single_node};
 use crate::service_call::ServiceCall;
 use crate::services::Service;
 use crate::{Db, HandlerContext, Routing};
@@ -39,15 +39,28 @@ pub fn service() -> Service {
   }
 }
 
+// The calls `[@carbon]` answers in the system space, where identities live.
+const IN_SYSTEM: [(&str, &str); 2] = [("POST", "/identity"), ("GET", "/identities")];
+
+// The calls it answers in an identity space, which runs `[identity]`: the
+// identity's devices and its export, which need this device's private key or
+// the space's op log.
+const IN_IDENTITY: [(&str, &str); 2] = [("POST", "/devices"), ("GET", "/identity/export")];
+
 fn entry(call: Rc<ServiceCall>) {
   let root = call.space().is_root();
+  let identity = call.space().runs("identity");
   let answer = |result: Result<Value>| {
     let _ = call.settle(result);
   };
   match (root, call.call.method(), call.call.resource.as_str()) {
     (true, "POST", "/identity") => identities::create(Rc::clone(&call)),
     (true, "GET", "/identities") => answer(identities::list(call.as_ref()).map(|identities| json!(identities))),
-    (true, "POST", "/devices") => answer(Err(single_node("Adding a device"))),
+    (true, _, _) => answer(Err(only_in_system(&call.call.key()))),
+    (false, method, resource) if IN_SYSTEM.contains(&(method, resource)) => answer(Err(answered_in(&call.call.key(), "the system space"))),
+    (false, "POST", "/devices") if identity => answer(Err(single_node("Adding a device"))),
+    (false, "GET", "/identity/export") if identity => answer(Err(not_built("Exporting an identity"))),
+    (false, method, resource) if IN_IDENTITY.contains(&(method, resource)) => answer(Err(answered_in(&call.call.key(), "an identity space"))),
     (false, "GET", "/status") => status(Rc::clone(&call)),
     (false, "POST", "/space") => spaces::create(Rc::clone(&call)),
     (false, "GET", "/manage") => {
@@ -61,6 +74,17 @@ fn entry(call: Rc<ServiceCall>) {
     (false, "DELETE", "/data") => answer(Err(not_built("Deleting a space's data"))),
     _ => answer(Err(call.call.unknown())),
   }
+}
+
+// A call made in the system space that `[@carbon]` answers only in a space.
+fn only_in_system(key: &str) -> ServiceError {
+  let calls: Vec<String> = IN_SYSTEM.iter().map(|(method, resource)| format!("{method} [@carbon]{resource}")).collect();
+  not_found(format!("In the system space, [@carbon] answers only {}, not {key}", calls.join(" and ")))
+}
+
+// A call `[@carbon]` answers, made in the wrong kind of space.
+fn answered_in(key: &str, place: &str) -> ServiceError {
+  not_found(format!("{key} is answered in {place}, not here"))
 }
 
 // What a space is, and its state on this device. Single-node: sync is off, there

@@ -452,7 +452,9 @@ mod spaces {
       (&personal, &alice, "POST [@carbon]/sync/start", json!({}), "SINGLE_NODE"),
       (&personal, &alice, "POST [@carbon]/manage", json!({}), "NOT_BUILT"),
       (&personal, &alice, "DELETE [@carbon]/data", json!({}), "NOT_BUILT"),
-      (&system, &Actor::default(), "POST [@carbon]/devices", json!({}), "SINGLE_NODE"),
+      (&identity_space, &alice, "POST [@carbon]/devices", json!({}), "SINGLE_NODE"),
+      (&identity_space, &alice, "GET [@carbon]/identity/export", Value::Null, "NOT_BUILT"),
+      (&system, &Actor::default(), "POST [@carbon]/identity", json!({"slug": "alice-2", "device": "x", "code": "scanned"}), "SINGLE_NODE"),
       (&personal, &alice, "POST [space]/members", json!({"identity": "sally"}), "SINGLE_NODE"),
       (&personal, &alice, "POST [space]/manage", json!({}), "NOT_BUILT"),
       (&identity_space, &alice, "POST [device]/origin", json!({"pubkey": "k2"}), "SINGLE_NODE"),
@@ -467,6 +469,28 @@ mod spaces {
     for (space, actor, key, input, code) in cases {
       let error = call_now(&carbon, space, actor, key, input).unwrap_err();
       assert_eq!(error.code, code, "{key}");
+    }
+  }
+
+  #[test]
+  fn says_where_a_carbon_call_made_in_the_wrong_space_is_answered() {
+    let (_directory, carbon) = carbon();
+    let identity = alice(&carbon);
+    let personal = space_now(&carbon, &identity.personal).unwrap();
+    let alice = actor(&identity);
+    let system = Rc::clone(carbon.system());
+    let cases = [
+      (&system, Actor::default(), "POST [@carbon]/space", "In the system space, [@carbon] answers only POST [@carbon]/identity and GET [@carbon]/identities, not POST [@carbon]/space"),
+      (&system, Actor::default(), "POST [@carbon]/devices", "In the system space, [@carbon] answers only POST [@carbon]/identity and GET [@carbon]/identities, not POST [@carbon]/devices"),
+      (&personal, alice.clone(), "POST [@carbon]/identity", "POST [@carbon]/identity is answered in the system space, not here"),
+      (&personal, alice.clone(), "GET [@carbon]/identities", "GET [@carbon]/identities is answered in the system space, not here"),
+      (&personal, alice.clone(), "POST [@carbon]/devices", "POST [@carbon]/devices is answered in an identity space, not here"),
+      (&personal, alice.clone(), "GET [@carbon]/identity/export", "GET [@carbon]/identity/export is answered in an identity space, not here"),
+      (&personal, alice.clone(), "GET [@carbon]/nothing", "GET [@carbon]/nothing is not a call CarbonDB answers"),
+    ];
+    for (space, actor, key, message) in cases {
+      let error = call_now(&carbon, space, &actor, key, json!({})).unwrap_err();
+      assert_eq!((error.status, error.message.as_str()), (404, message), "{key}");
     }
   }
 

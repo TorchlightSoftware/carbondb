@@ -1363,7 +1363,91 @@ I think this should probably be:
 
 Or similar.
 
-      if (known) return carbon.resumeIdentity('app').ref('personal:app').ref('space:lobby')
-      const {personal} = await carbon.createIdentity({slug: 'app', device: 'server', services: []})
-      return personal.createSpace({name: 'Lobby', services: ['chat']})
+      if (known) {
+          return carbon.resumeIdentity('app').ref('personal:app').ref('space:lobby')
+      } else {
+          const {personal} = await carbon.call('POST [@carbon]/identity')
+          return carbon.call('POST [@carbon]/space', {name: 'Lobby', services: ['chat']})
+      }
     }
+
+And the last part should use an explicit if/else and should use GET/POST calls instead of relying on direct methods on the handle.  I don't think those direct methods should exist.
+
+I think you maybe created those with some convenience wrapped in in terms of resolving space refs?  But I think it's possible you could build the service calls to be approximately as fluent/ergonomic?  You're just passing around a string ref to the space instead of a memory reference.
+
+
+---
+
+    - I didn't merge SystemHandle into SpaceHandle (your proposal 4).
+
+That makes sense to me.  What do you think about the [@carbon] calls on system, vs on an allocated space?  Is there also an issue there where calls that are valid on one may not be on the other?
+
+    - Story 02 (adding a device) still uses joinIdentity() and identity.addDevice().
+
+That should use normal .call() as well.  We should discuss what the exact API should be and update the story, but now is not the time to implement it.
+
+    Its join object carries a running two-sided exchange (qr, apply, done), which isn't one call
+
+We have handled most cases like this as [@carbon] calls.
+
+---
+
+    - System only: POST /identity
+
+It's not helpful for you to give example calls which don't specify the service you are calling.
+
+    POST [@carbon]/space on carbon falls through to unknown()
+
+Do you mean on "system"?  Or the "carbon" handle, which is indeed system?  Can we keep our terminology consistent and refer to the space name rather than use "carbon" to mean both space and service?
+
+    My proposal: turn the match into a route table, where each row is (system or space, method, resource, handler). A key that exists in the table but was called on the wrong handle gets an error saying where it is answered
+
+You're then muddying the responsibility separation we set between core and service.
+
+To be clear, I think it is feasible to detect "system" vs "space" and have [carbon] present better messages based on context.  But I don't want to implement this as a general rule affecting all services (look through all service catalogs for similar routes).  Maybe that happens at some phase, but it's later, as a helper/assistant for correcting errors.  But not part of the fundamental routing.
+
+    The alternative I'd rather not take without you: give the system space's calls their own local service name
+
+We have a list of @carbon services in stories/services.md.  Is that up to date?  Feel free to update it to our present understanding.  As an aside remind me: what is the glow command I need in order to print the tables out at terminal width?  Is there some way I can make that default behavior of glow?
+
+    A join has one side waiting while the other scans.
+
+I don't think device joining should be happening in context with system.  We decided to group devices under the "identity" space, remember?  So it may be a @carbon call to facilitate wiring together system calls and replicated calls, but it should be happening on the designated "identity".
+
+---
+
+    Proposal: split the match in crates/core/src/services/carbon/mod.rs:42-63 into two route lookups, one for system and one for other spaces
+
+That sounds really ugly.  Let's look at the table of calls together: I have a feeling we're probably trying to put things into @carbon that may not be a good fit.
+
+    POST [@carbon]/identity        │ The system space          │
+    GET [@carbon]/identities       │ The system space          │
+
+These I agree with.
+
+    GET [@carbon]/identity/export  │ The identity space        │
+
+This could be on [identity].
+
+    POST [@carbon]/devices         │ The system space          |
+
+This I think should be done inside the identity space.
+
+So we only have 2 calls that are system only.  What if we make them direct calls on the "carbon" handle, then move the other two as I've suggested.  Now we have 0 calls left on system.
+
+---
+
+Mmm... Ok.  So you're saying that:
+
+1) we need the two identity interactions to be calls.
+2) `GET [@carbon]/identity/export` reaches into oplog internals, and therefore needs to be @carbon
+3) `POST [@carbon]/devices` also needs to be @carbon because it's dealing with private key stuff that's local only
+
+The same might be true of "joining devices" and "signing messages" when we get that far, because both operations need the private key, and therefore need to operate from @carbon.
+
+So yeah it seems like we should keep the routing in @carbon (the service) but pass it a context so it can determine what other services are operating in the environment, and some sort of tag for "is this system or a space?"  And then the appropriate error messages can be built from within the service.  Does that sound right?
+
+---
+
+Commit:
+standardize application boot and drop handle methods in favor of service calls

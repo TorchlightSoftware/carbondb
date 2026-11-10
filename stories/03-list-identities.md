@@ -5,16 +5,16 @@ Status: agreed
 ## Calls
 
 ```js
-const identities = await carbon.listIdentities()
+const identities = await carbon.call('GET [@carbon]/identities')
 // [{slug: 'alice', id, device: 'laptop', lastUsed}, ...]
-const identity = await carbon.resumeIdentity(identities[0].slug)
+const identity = carbon.ref(`identity:${identities[0].slug}`)
 ```
 
 ## Rules
 
-- `configure` returns the `carbon` handle; identity calls are its methods, so no state lives in the module and a test can open two devices in one process.
+- `configure` returns the `carbon` handle; identity calls are made on it, so no state lives in the module and a test can open two devices in one process.
 - Entries carry slug, id, this device's slug in that identity, and when it was last used. The fields may evolve.
 
 ## Acceptance
 
-- With two identities created on one database, `listIdentities` returns both, and resuming either returns the right one.
+- With two identities created on one database, `GET [@carbon]/identities` returns both, and a ref to either reaches the right one.
