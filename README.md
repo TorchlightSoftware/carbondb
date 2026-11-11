@@ -30,7 +30,14 @@ The core API currently runs in single-node mode (no replication). Next step is t
 
 This should be considered a first draft that shows you what the API surface looks like, and what it looks like to build an app on top of CarbonDB.
 
-**What a service looks like**, as an initial proposal: a package with a `service.toml`, an `init` that sets up its tables, and handlers keyed by service key, written like ordinary backend code. One call from [packages/services/chat/index.js](packages/services/chat/index.js#L43-L51):
+**What a service looks like**:
+
+- a package with a `service.toml`
+- an `init` that sets up its tables
+- handlers keyed by [service key](https://www.npmjs.com/package/@tlsft/service-key), meant to be close to REST but decoupled from the transport layer
+- handlers perform SQLite queries and return JSON
+
+Example service call from [packages/services/chat/index.js](packages/services/chat/index.js#L43-L51):
 
 ```js
 'POST [chat]/messages': {
