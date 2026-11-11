@@ -26,7 +26,9 @@ CarbonDB is an experiment in creating a general purpose framework for applicatio
 
 ## Status
 
-The core API runs in single-node mode, and CarbonDB is ready for building replication on p2panda (on iroh). The design is in [stories/](stories/README.md).
+The core API currently runs in single-node mode (no replication). Next step is to build replication with p2panda (on iroh). The design is in [stories/](stories/README.md).
+
+This should be considered a first draft that shows you what the API surface looks like, and what it looks like to build an app on top of CarbonDB.
 
 **What a service looks like**, as an initial proposal: a package with a `service.toml`, an `init` that sets up its tables, and handlers keyed by service key, written like ordinary backend code. One call from [packages/services/chat/index.js](packages/services/chat/index.js#L43-L51):
 
@@ -63,9 +65,21 @@ async function start(config) {
 
 The app then calls the space, `lobby.call('POST [chat]/messages', {text: 'hello'})`, and watches it, `lobby.watch('GET [chat]/messages', render)`.
 
-**Built, single-node:** identities with their identity and personal spaces, nested spaces, refs, calls and watches, every op logged and applied in turn with its results, per-service tables, call timeouts, and services as packages, the builtins in Rust and [chat] on npm. The interface is in [packages/carbondb/README.md](packages/carbondb/README.md).
+**Built on single-node:**
+ - create cryptographic identities KeyBase style, with multiple devices attached to an identity
+ - secret keys stay on device and are never transmitted over the network
+ - "personal space" for apps and data
+ - "shared spaces" for organizations, or friends & family
+ - nested spaces for teams, departments
+ - we're wrapping a SQLite instance and implementing oplog sync, rewind, playback (CRDT semantics)
+ - SQLite tables are namespaced per [space, service]
+ - builtin services in Rust and [chat] on Node.js.
 
-**Next, replication:** p2panda spaces carry each space's ops between members' devices, which adding devices and members needs.
+The interface is in [packages/carbondb/README.md](packages/carbondb/README.md).
+
+**Next:**
+    - replication: p2panda spaces carry each space's ops between members' devices, which adding devices and members needs.
+    - services delivered via WASM and NPM
 
 `npm test` runs everything: the core's Rust tests, a native build, and the JS and end-to-end tests. It needs Rust and Node 22.
 
