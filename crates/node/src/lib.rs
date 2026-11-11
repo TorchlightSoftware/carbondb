@@ -29,7 +29,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use carbondb_core as core;
+use carbondb as core;
 use napi::UnknownRef;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;

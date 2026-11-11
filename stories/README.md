@@ -68,7 +68,7 @@ TODO: expand this as a set of rules that services need to follow in order to ens
 
 ### Service runtime (JavaScript)
 
-The core routes every call to a service by its name and hands it to the service's entry point. For an npm service, `@tlsft/carbondb` is that entry point:
+The core routes every call to a service by its name and hands it to the service's entry point. For an npm service, `carbondb` is that entry point:
 
 - **Routing:** a service key to its handler, within the service. Validating input is the service's own business.
 - **The handler context:** the call's input and path parameters, its `sql` binding under `env`, a way to make calls of its own, and the op, with its author and time, and ids and randomness drawn from it so every replica computes the same values.
@@ -124,7 +124,7 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 - [A manager can add a service to an existing space](backlog/add-services-to-space.md)
 - [A manager can move a space to a new version of a service](backlog/upgrade-package-version.md)
 - [A service can store files in a space](backlog/file-bindings.md)
-- [An app developer can install @tlsft/carbondb on any desktop platform](backlog/native-packaging-per-platform.md)
+- [An app developer can install carbondb on any desktop platform](backlog/native-packaging-per-platform.md)
 - [An iOS user runs the app's shipped services at native speed](backlog/ios-ahead-of-time-packages.md)
 - [An app developer's npm service runs at the version npm installed](backlog/npm-package-integrity.md)
 - [An app developer can run a Worker's D1 queries on CarbonDB unchanged](backlog/d1-compatibility.md)
@@ -155,7 +155,7 @@ binding = "db"     # the storage it asks for, handed to its handlers as env.db
 // services/chat/index.js
 // The app names it when it registers it: carbon.services.add('chat', chat)
 import {notFound, forbidden} from '@tlsft/service-error'
-import {applyMigrations, readMigrations} from '@tlsft/carbondb/migrations'
+import {applyMigrations, readMigrations} from 'carbondb/migrations'
 
 // Its manifest, which CarbonDB reads when the app registers it.
 export const manifest = new URL('./service.toml', import.meta.url)
@@ -224,7 +224,7 @@ CREATE TABLE message (
 The app code is the same single-node or replicated; only the TOML file differs. `[sync] mode = "none"` runs single-node, with no p2panda and no network, and calls that need peers, such as `POST [@carbon]/members`, reject.
 
 ```js
-import {configure} from '@tlsft/carbondb'
+import {configure} from 'carbondb'
 import * as chat from './services/chat/index.js'
 
 // The carbon handle is the system space on this device.

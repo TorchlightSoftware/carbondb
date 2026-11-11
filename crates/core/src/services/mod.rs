@@ -11,6 +11,9 @@
 //! name the app gives it, which overrides the canonical name in the manifest.
 
 pub mod carbon;
+pub mod device;
+pub mod identity;
+pub mod space;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -26,8 +29,11 @@ use crate::namespace;
 use crate::service_call::ServiceCall;
 use crate::{Db, HandlerContext, Package};
 
-// The packages CarbonDB ships, linked into the library.
-const BUILTINS: [Package; 3] = [carbondb_space::PACKAGE, carbondb_identity::PACKAGE, carbondb_device::PACKAGE];
+// The packages CarbonDB ships, linked into the library. Each is a directory of
+// this module, with its own service.toml and migrations, written against
+// ServiceBindings alone as a package of its own would be; the build script
+// packages each.
+const BUILTINS: [Package; 3] = [space::PACKAGE, identity::PACKAGE, device::PACKAGE];
 
 // How long a call to a service may take to settle when its service.toml names no timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);

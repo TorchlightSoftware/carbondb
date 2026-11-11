@@ -12,12 +12,12 @@ use names::{slugify, unique_slug};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-include!(concat!(env!("OUT_DIR"), "/package.rs"));
+include!(concat!(env!("OUT_DIR"), "/space_package.rs"));
 
 pub const PACKAGE: Package = Package { name: NAME, version: VERSION, binding: BINDING, timeout: TIMEOUT, init, entry };
 
 // Its tables, set up by `init` on every open.
-const MIGRATIONS: &[migrations::Migration] = &[("0001_origin_and_refs", include_str!("../migrations/0001_origin_and_refs.sql"))];
+const MIGRATIONS: &[migrations::Migration] = &[("0001_origin_and_refs", include_str!("migrations/0001_origin_and_refs.sql"))];
 
 fn init(db: &dyn Db) -> Result<()> {
   migrations::apply(db, "d1_migrations", MIGRATIONS)

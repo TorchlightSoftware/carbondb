@@ -14,7 +14,8 @@
 //! `hash` is the content hash every replica agrees on.
 //!
 //! At build time, with the `build` feature, `build` packages the service: its
-//! build script calls `build::package()`. With the `manifest` feature,
+//! crate's build script calls `build::package(dir)` with the directory holding
+//! its `service.toml`. With the `manifest` feature,
 //! `manifest` reads a package's `service.toml` and its version.
 
 #[cfg(feature = "build")]

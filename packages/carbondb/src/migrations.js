@@ -3,7 +3,7 @@
 // `d1_migrations` table, as Cloudflare D1 does. A service ported from a Worker
 // keeps its migrations directory and applies it from `init`:
 //
-//   import {applyMigrations, readMigrations} from '@tlsft/carbondb/migrations'
+//   import {applyMigrations, readMigrations} from 'carbondb/migrations'
 //   const migrations = readMigrations(new URL('./migrations/', import.meta.url))
 //   export const init = (db) => applyMigrations(db, migrations)
 //

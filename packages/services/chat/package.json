@@ -1,17 +1,24 @@
 {
-  "name": "@tlsft/chat-service",
+  "name": "@tlsft/carbondb-svc-chat",
   "version": "0.1.0",
-  "private": true,
   "description": "[chat]: post, edit, delete and list messages in a space",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TorchlightSoftware/carbondb.git",
+    "directory": "packages/services/chat"
+  },
   "type": "module",
   "main": "index.js",
   "scripts": {
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "@tlsft/carbondb": "^0.1.0",
     "@tlsft/service-error": "^0.1.0",
+    "carbondb": "^0.1.0",
     "zod": "^4.1.12"
   },
-  "license": "MIT OR Apache-2.0"
+  "license": "MIT OR Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  }
 }

@@ -10,7 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-carbondb-core = { path = "../core" }
+carbondb.workspace = true
 napi = { version = "3.16.1", features = ["serde-json", "napi5"] }
 napi-derive = "3.7.0"
 serde.workspace = true

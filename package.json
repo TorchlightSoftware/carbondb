@@ -9,7 +9,7 @@
     "packages/services/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace @tlsft/carbondb",
+    "build": "npm run build --workspace carbondb",
     "test": "cargo test --workspace --all-features && npm run build && npm test --workspaces --if-present"
   }
 }

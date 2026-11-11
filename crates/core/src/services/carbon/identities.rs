@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::steps::{self, Step, Target};
-use carbondb_space::names::slugify;
+use crate::services::space::names::slugify;
 
 use crate::error::{Result, bad_request, conflict, internal, not_found, single_node};
 use crate::hash::hash;

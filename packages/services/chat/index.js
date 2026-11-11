@@ -9,7 +9,7 @@
 
 import {z} from 'zod'
 import {forbidden, notFound, validationError} from '@tlsft/service-error'
-import {applyMigrations, readMigrations} from '@tlsft/carbondb/migrations'
+import {applyMigrations, readMigrations} from 'carbondb/migrations'
 
 // Its manifest, which CarbonDB reads when the app registers it.
 export const manifest = new URL('./service.toml', import.meta.url)

@@ -10,7 +10,7 @@ import * as chat from './services/chat.js'
 carbon.services.add('chat', chat)   // in main(), on every start
 ```
 
-A service is its package: a `service.toml` and an exported module. The module exports `manifest`, where its `service.toml` is; its calls keyed by service key, each with a handler and optional tags (such as `append`); and an optional `init`, which sets up its schema through its `sql` binding on every open. A handler receives that binding in `env`, under the name its `service.toml` gives it. How it shapes its tables is its own concern: `@tlsft/carbondb/migrations` applies a directory of D1-style migrations from `init`. The name it runs under is the one passed to `services.add`, which overrides the name in its `service.toml`.
+A service is its package: a `service.toml` and an exported module. The module exports `manifest`, where its `service.toml` is; its calls keyed by service key, each with a handler and optional tags (such as `append`); and an optional `init`, which sets up its schema through its `sql` binding on every open. A handler receives that binding in `env`, under the name its `service.toml` gives it. How it shapes its tables is its own concern: `carbondb/migrations` applies a directory of D1-style migrations from `init`. The name it runs under is the one passed to `services.add`, which overrides the name in its `service.toml`.
 
 ## Rules
 

@@ -6,7 +6,7 @@ import assert from 'node:assert'
 import {mkdtempSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
-import {configure} from '@tlsft/carbondb'
+import {configure} from 'carbondb'
 import * as chat from '../index.js'
 
 function configFile() {

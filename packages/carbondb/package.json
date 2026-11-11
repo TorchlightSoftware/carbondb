@@ -1,7 +1,12 @@
 {
-  "name": "@tlsft/carbondb",
+  "name": "carbondb",
   "version": "0.1.0",
   "description": "CarbonDB for Node: services as ordinary backend code, with state that lives on every member's device",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TorchlightSoftware/carbondb.git",
+    "directory": "packages/carbondb"
+  },
   "type": "module",
   "main": "src/index.js",
   "exports": {
@@ -11,11 +16,10 @@
   "files": [
     "src",
     "carbondb.node",
-    "README.md"
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "build": "cargo build --release -p carbondb-node && cp ../../target/release/libcarbondb_node.so carbondb.node",
     "test": "node --test test/*.test.js"

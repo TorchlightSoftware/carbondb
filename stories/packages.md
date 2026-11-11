@@ -78,7 +78,7 @@ Open:
 
 ## Build order
 
-1. `service.toml`, table namespacing per service, and the package hash in the op, with npm packages. Built: namespacing, `init`, `service.toml` for the builtins and for npm packages such as [chat], and the package hash. For now the hash covers every file in the package: a Rust package's build script hashes its crate, and the core an npm package's directory, beside its `service.toml` and without `node_modules`. An npm service's module exports `manifest`, where its `service.toml` is, and `carbon.services.add(name, module)` hands it to the core, which refuses a service without one. Open: [an npm package's version from its lockfile integrity](backlog/npm-package-integrity.md), and [registering a package by its name](backlog/package-names.md).
+1. `service.toml`, table namespacing per service, and the package hash in the op, with npm packages. Built: namespacing, `init`, `service.toml` for the builtins and for npm packages such as [chat], and the package hash. For now the hash covers every file in the package: a Rust package's build script hashes its directory, and the core an npm package's directory, beside its `service.toml` and without `node_modules`. An npm service's module exports `manifest`, where its `service.toml` is, and `carbon.services.add(name, module)` hands it to the core, which refuses a service without one. Open: [an npm package's version from its lockfile integrity](backlog/npm-package-integrity.md), and [registering a package by its name](backlog/package-names.md).
 2. The WASM host: wasmtime, the host functions, and `add_wasm`.
 3. `[space]`, `[identity]` and `[device]` as committed WASM packages embedded in the library.
 4. The `wrangler.toml` generator and the integrity lookup utility.

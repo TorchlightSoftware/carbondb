@@ -1,4 +1,4 @@
-# @tlsft/carbondb
+# carbondb
 
 Write a service the way you write an ordinary backend service, with named calls, SQL tables and handlers, and CarbonDB keeps its state on the devices of the people using it.
 
@@ -7,7 +7,7 @@ This release runs **single-node**: one device, no peers. The app interface is th
 ## Use
 
 ```js
-import {configure} from '@tlsft/carbondb'
+import {configure} from 'carbondb'
 import * as chat from './services/chat.js'
 
 const carbon = await configure('./carbondb.toml')
@@ -34,7 +34,7 @@ mode = "none"               # single-node
 
 - **`configure(path)`** loads CarbonDB from its TOML file and returns `carbon`, the system handle.
 - **`carbon.services.add(name, impl)`** registers a service on every start. `impl` is the service's exported module: `manifest`, where its package's `service.toml` is (`new URL('./service.toml', import.meta.url)`); `calls`, keyed by service key, each with a `handler`; and an optional `init(db)`, which sets up the service's schema on every open, inside a transaction, and finishes before it returns. CarbonDB reads the `service.toml`, and refuses with a 400 a service that exports none, or whose `service.toml` it cannot read or holds a field it does not know. The service runs under `name`, which overrides the name in its `service.toml`. Its version is the hash of every file in its package's directory, leaving out `node_modules`. A space naming a service this device has not registered opens and stays initializing: a GET to that service rejects with a 404, and every op on the space is logged and waits until the service is registered. An op made for a service this device has not registered is refused with a 404 when its turn comes. A name already registered, CarbonDB's own included, is refused with a 409, and a name holding a slash with a 400.
-- **Schema:** a service names its tables plainly; CarbonDB keeps them as `service/db/name` in the space's one file, and refuses anything outside them. A row's key must come from the op that creates it, never from SQLite: after `init`, a table whose key is SQLite's rowid (`INTEGER PRIMARY KEY`, with or without `AUTOINCREMENT`) or that has no primary key is refused, with an error saying what to change. Use `op.id()`, or `id INTEGER PRIMARY KEY DEFAULT (op_id())` in a `WITHOUT ROWID` table for an integer key. `@tlsft/carbondb/migrations` applies a directory of D1-style migrations from `init`: `init: (db) => applyMigrations(db, readMigrations(url))`.
+- **Schema:** a service names its tables plainly; CarbonDB keeps them as `service/db/name` in the space's one file, and refuses anything outside them. A row's key must come from the op that creates it, never from SQLite: after `init`, a table whose key is SQLite's rowid (`INTEGER PRIMARY KEY`, with or without `AUTOINCREMENT`) or that has no primary key is refused, with an error saying what to change. Use `op.id()`, or `id INTEGER PRIMARY KEY DEFAULT (op_id())` in a `WITHOUT ROWID` table for an integer key. `carbondb/migrations` applies a directory of D1-style migrations from `init`: `init: (db) => applyMigrations(db, readMigrations(url))`.
 - **Handles** reach spaces, one per space: `carbon.ref('identity:alice').ref('personal:alice').ref('space:lobby')`. A handle acts as the identity its ref chain passed through. `ref()` answers at once, read from the space's refs as committed, and throws a 404 for a ref that is not there.
 - **`call(key, input)`** resolves with the handler's result: a GET at once, and a write once this device has applied it and every watch its commit touched, or that was running when it landed, has run again. It rejects with a service error from [`@tlsft/service-error`](https://www.npmjs.com/package/@tlsft/service-error): status, code, message and details intact.
 - **Timeout:** every call to a service must settle within the `timeout` its `service.toml` names, in milliseconds, or 200. One deadline covers a call and the calls it makes. When it passes, the call rejects with a `504 TIMED_OUT`, a write rolls back as though its handler threw, and whatever the handler answers later is dropped. A watch whose GET times out gets the error, and runs again after the next commit that writes what it read.

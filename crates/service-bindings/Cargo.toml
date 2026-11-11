@@ -4,7 +4,10 @@ description = "ServiceBindings: the toolkit a Rust CarbonDB service builds with,
 edition.workspace = true
 license.workspace = true
 version.workspace = true
-publish = false
+repository.workspace = true
+readme = "README.md"
+keywords = ["carbondb", "local-first", "sqlite", "service"]
+categories = ["database"]
 
 [features]
 # A package's service.toml and version, for the core, which reads an npm

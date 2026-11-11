@@ -33,7 +33,7 @@ pub fn service() -> Service {
   Service {
     name: "carbon".into(),
     local: true,
-    version: concat!("carbondb-core@", env!("CARGO_PKG_VERSION")).into(),
+    version: concat!("carbondb@", env!("CARGO_PKG_VERSION")).into(),
     binding: None,
     timeout: crate::services::DEFAULT_TIMEOUT,
     init: Rc::new(|_: Rc<dyn Db>| Ok(())),

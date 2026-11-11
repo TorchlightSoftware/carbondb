@@ -1,4 +1,4 @@
-# An app developer can install @tlsft/carbondb on any desktop platform
+# An app developer can install carbondb on any desktop platform
 
 Status: backlog
 

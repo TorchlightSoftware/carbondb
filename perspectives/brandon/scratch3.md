@@ -1496,3 +1496,39 @@ That makes sense.
     The space's origin records which package each name runs
 
 That sounds fantastic actually.  That's exactly the right place for a "manifest" of what the space requires.  I definitely think that should be our destination.  But we don't necessarilly need to implement it right now.  Agreed on updating packages.md and package-names.md.  Are you ready to do that?
+
+---
+
+- crates.io: carbondb, carbondb-core, carbondb-service-bindings, carbondb-space, carbondb-identity, carbondb-device
+
+Mostly makes sense.
+
+1) how is carbondb-core different from carbondb?  Why would I choose one over the other?
+2) carbondb-svc-space <= prefix services with svc
+3) I know we're targetting WASM builds for the builtin services, but they will also get compiled as blobs into the binary... therefore they probably don't deserve their own dedicated crates?
+
+- npm: @tlsft/carbondb, @tlsft/chat-service, and unscoped carbondb. We already own the @tlsft scope, since @tlsft/service-key is published there.
+
+I think unscoped `carbondb` is the main target.  I don't see any urgency or reason to grab the @tlsft scoped one: no one else can grab it.  @tlsft/carbondb-svc-chat would be the preferred name for chat.
+
+    Publish the real code as 0.1.0, not empty placeholders. As far as I recall, crates.io's usage policy bans name-squatting and lets them remove crates that are only placeholders. Real code avoids that risk.
+
+We have real code Claude.  Quit being a dumbass.
+
+---
+
+    Eleven files reference the old names, including README.md, the stories and the chat test
+
+Those should be renamed.
+
+    Do you want carbondb-service-bindings renamed too
+
+No.  That's not a service, it's service bindings.  Keep the name as is.
+
+Proceed.  Get everything ready to publish, and then make a one time throw away script that will publish them all when I run it.
+
+---
+
+You just wrote a mixture of Apache and MIT licenses, and didn't ask me about any of that.  That's very dumb Claude.
+
+

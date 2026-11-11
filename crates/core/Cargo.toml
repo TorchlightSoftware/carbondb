@@ -1,16 +1,16 @@
 [package]
-name = "carbondb-core"
-description = "CarbonDB's core: spaces on SQLite, the services this device runs, and the one path every call takes to them"
+name = "carbondb"
+description = "CarbonDB: spaces on SQLite, its builtin services, and the one path every call takes to the services a device runs"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
-publish = false
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["database", "local-first", "sqlite", "p2p", "sync"]
+categories = ["database-implementations"]
 
 [dependencies]
-carbondb-service-bindings = { path = "../service-bindings", features = ["manifest"] }
-carbondb-space = { path = "../services/space" }
-carbondb-identity = { path = "../services/identity" }
-carbondb-device = { path = "../services/device" }
+carbondb-service-bindings = { workspace = true, features = ["manifest"] }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +20,9 @@ self_cell = "1.2.1"
 service-key = "0.6.0"
 sqlparser = { version = "=0.63.0", features = ["visitor"] }
 toml = "1.1.8"
+
+[build-dependencies]
+carbondb-service-bindings = { workspace = true, features = ["build"] }
 
 [dev-dependencies]
 tempfile = "3"

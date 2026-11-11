@@ -10,12 +10,12 @@ use carbondb_service_bindings::{Db, HandlerContext, Package, migrations};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-include!(concat!(env!("OUT_DIR"), "/package.rs"));
+include!(concat!(env!("OUT_DIR"), "/identity_package.rs"));
 
 pub const PACKAGE: Package = Package { name: NAME, version: VERSION, binding: BINDING, timeout: TIMEOUT, init, entry };
 
 // Its tables, set up by `init` on every open.
-const MIGRATIONS: &[migrations::Migration] = &[("0001_identity", include_str!("../migrations/0001_identity.sql"))];
+const MIGRATIONS: &[migrations::Migration] = &[("0001_identity", include_str!("migrations/0001_identity.sql"))];
 
 fn init(db: &dyn Db) -> Result<()> {
   migrations::apply(db, "d1_migrations", MIGRATIONS)

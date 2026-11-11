@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/node", "crates/service-bindings", "crates/services/*"]
+members = ["crates/core", "crates/node", "crates/service-bindings"]
 # Spikes are standalone experiments with their own lockfiles.
 exclude = ["spikes"]
 
@@ -8,8 +8,13 @@ exclude = ["spikes"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
+repository = "https://github.com/TorchlightSoftware/carbondb"
 
 [workspace.dependencies]
+# The workspace's own crates, by path here and by version on crates.io. Bump
+# these with [workspace.package] version.
+carbondb = { path = "crates/core", version = "0.1.0" }
+carbondb-service-bindings = { path = "crates/service-bindings", version = "0.1.0" }
 rusqlite = { version = "=0.39.0", features = ["bundled", "hooks", "functions", "session"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
