@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 
 use crate::error::Result;
-use crate::oplog::{self, LogRow};
+use crate::ops::oplog::{self, LogRow};
 use crate::store::Store;
 
 #[derive(Default)]

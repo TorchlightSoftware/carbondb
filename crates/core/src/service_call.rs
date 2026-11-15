@@ -201,7 +201,7 @@ impl ServiceCall {
       return reply(Err(self.ended()));
     }
     match Call::from_key(&sub_call.key) {
-      Ok(call) => self.inside(crate::op::actor(&sub_call), call, sub_call.input.clone(), Some(sub_call), reply),
+      Ok(call) => self.inside(crate::ops::op::actor(&sub_call), call, sub_call.input.clone(), Some(sub_call), reply),
       Err(error) => reply(Err(error)),
     }
   }

@@ -8,7 +8,7 @@
 //! place and changed nothing a later op depends on, so the result is the same
 //! as applying it in order. Otherwise its run rolls back and the space
 //! rewinds. Writes are known by row, from the changeset. Reads are known by
-//! row when a statement looks one row up by its whole key (`statements`), and
+//! row when a statement looks one row up by its whole key (`sql::lookup`), and
 //! otherwise by table, which reads every row of it. So ops inserting different
 //! rows into one table apply in place, and so does an insert before an edit
 //! that looked up another row by its key: a handler that needs a value to be
@@ -30,9 +30,9 @@ use std::collections::BTreeSet;
 use serde_json::{Value, json};
 
 use crate::error::Result;
-use crate::oplog::ORDER;
-use crate::call_window::Read;
-use crate::store::{Row, rows};
+use crate::ops::oplog::ORDER;
+use crate::sql::authorizer::Read;
+use crate::store::changeset::{Row, rows};
 use crate::{Call, Db, Op, Routing};
 
 // An op's read set and write set: the tables and rows it read, and the rows its changeset changed.

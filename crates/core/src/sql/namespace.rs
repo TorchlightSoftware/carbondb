@@ -11,11 +11,9 @@
 //! the whole file, every service in it, so a statement naming one is refused;
 //! the authorizer refuses whatever else reaches outside the service's prefix.
 //!
-//! sqlparser is used in two modules. `parse`, here, is the one place a
-//! statement is parsed, and it has two readers: the rewrite here, and
-//! `statements`, which also tokenizes the statement to number its parameters,
-//! finds the one row it looks up by its key, and caches both per statement
-//! text. A better way to read SQL replaces only this module and `statements`.
+//! `parse`, here, is the one place a statement is parsed, and it has two
+//! readers: the rewrite here, and `lookup`, which finds the one row a
+//! statement looks up by its key (see `sql`).
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -52,7 +50,7 @@ pub fn rewrite(sql: &str, prefix: &str) -> Result<String> {
 }
 
 // A service's SQL as sqlparser reads it: the one place CarbonDB parses SQL.
-// Its two readers are `rename`, here, and `statements`, which finds the row a
+// Its two readers are `rename`, here, and `lookup`, which finds the row a
 // statement looks up by its key. SQL it cannot read is refused.
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
   Parser::parse_sql(&SQLiteDialect {}, sql).map_err(|error| unparsed(sql, error))

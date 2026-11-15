@@ -36,17 +36,19 @@ use serde_json::{Value, json};
 
 use crate::carbon::Carbon;
 use crate::error::{Result, ServiceError, conflict, not_found, stopped};
-use crate::op::actor;
-use crate::oplog::LogRow;
-use crate::results::Outcome;
-use crate::call_window::Read;
-use crate::rewind::{self, Recorded, Sets};
+use crate::ops::op::actor;
+use crate::ops::oplog::LogRow;
+use crate::ops::results::Outcome;
+use crate::sql::authorizer::Read;
+use crate::ops::rewind::{self, Recorded, Sets};
 use crate::service_call::{CallRecord, Conn, ServiceCall, Settle, sub_calls};
 use crate::services::{self, SERVICE_MISSING, Service};
 use crate::space::{RunState, Space};
-use crate::store::{Store, tables};
+use crate::store::Store;
+use crate::store::changeset::tables;
 use crate::watch::WatchId;
-use crate::{Actor, Call, Routing, HandlerContext, Op, oplog, results};
+use crate::ops::{oplog, results};
+use crate::{Actor, Call, Routing, HandlerContext, Op};
 
 // What a call settled with; the tables it read or wrote, for watch; and the
 // watches its commit owes a run, which a call from the app waits for. A GET

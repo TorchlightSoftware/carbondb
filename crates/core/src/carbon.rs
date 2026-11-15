@@ -18,16 +18,16 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::clock::{self, Clock};
+use crate::ops::clock::{self, Clock};
 use crate::config::{Config, SyncMode};
 use crate::error::{Result, bad_request, not_built};
-use crate::op::stamp;
+use crate::ops::op::stamp;
 use crate::services::carbon::{self as local, Identity};
 use crate::services::{Service, Services};
 use crate::space::{self, RunState, Space};
 use crate::store::Store;
 use crate::watch::Watches;
-use crate::oplog::LogRow;
+use crate::ops::oplog::LogRow;
 use crate::{Actor, Call, Routing, Op};
 
 // How an opened space reaches whoever asked for it.

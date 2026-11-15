@@ -25,7 +25,7 @@ use carbondb_service_bindings::manifest::{self, Manifest};
 use serde_json::json;
 
 use crate::error::{Result, bad_request, conflict, not_found};
-use crate::namespace;
+use crate::sql::namespace;
 use crate::service_call::ServiceCall;
 use crate::{Db, HandlerContext, Package};
 

@@ -5,9 +5,10 @@ use std::rc::Rc;
 
 use serde_json::{Value, json};
 
-use crate::results::{self, Outcome};
+use crate::ops::results::{self, Outcome};
 use crate::testing::{actor, alice, call_now, carbon, room, space_now, texts};
-use crate::{Actor, Db, Routing, oplog};
+use crate::ops::oplog;
+use crate::{Actor, Db, Routing};
 
 // The keys of a space's op log, in order.
 fn logged(space: &crate::Space) -> Vec<String> {
@@ -565,8 +566,8 @@ mod deadlines {
 // state, as though each had applied them in the shared order.
 mod replicas {
   use super::*;
-  use crate::op::stamp;
-  use crate::oplog::LogRow;
+  use crate::ops::op::stamp;
+  use crate::ops::oplog::LogRow;
   use crate::testing::{now, register_script};
   use crate::{Call, Carbon, Space};
 
@@ -813,7 +814,7 @@ mod replicas {
     let (_directory, carbon) = device();
     receive(&carbon, row(&carbon, &origin()));
     // A minute ahead of this device's clock, within how far clocks drift.
-    let future = crate::clock::wall() + 60_000;
+    let future = crate::ops::clock::wall() + 60_000;
     receive(&carbon, row(&carbon, &script(future, "notes", json!([{"insert": "a"}]))));
     let space = space_now(&carbon, ROOM).unwrap();
     call_now(&carbon, &space, &Actor { identity: Some("alice".into()), device: Some("pixel".into()) }, "POST [notes]/run", json!({"do": [{"read": true}]})).unwrap();
@@ -826,8 +827,8 @@ mod replicas {
   fn a_row_whose_time_is_too_far_ahead_or_impossible_is_refused_unlogged_and_leaves_the_clock_alone() {
     let (_directory, carbon) = device();
     receive(&carbon, row(&carbon, &origin()));
-    let wall = crate::clock::wall();
-    let cases = [("too far ahead, for now", wall + 3_600_000, 425), ("never", crate::clock::NEVER, 400)];
+    let wall = crate::ops::clock::wall();
+    let cases = [("too far ahead, for now", wall + 3_600_000, 425), ("never", crate::ops::clock::NEVER, 400)];
     for (name, time, status) in cases {
       let refused = now(|received| carbon.receive(ROOM, row(&carbon, &script(time, "notes", json!([{"insert": "a"}]))), received));
       assert_eq!(refused.unwrap_err().status, status, "{name}");

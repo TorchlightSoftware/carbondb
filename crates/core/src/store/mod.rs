@@ -30,9 +30,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use rusqlite::fallible_streaming_iterator::FallibleStreamingIterator;
-use rusqlite::hooks::Action;
-use rusqlite::session::{ChangesetItem, ChangesetIter, ConflictAction, Session, invert_strm};
+use rusqlite::session::{ConflictAction, Session, invert_strm};
 use rusqlite::types::Value as Sql;
 use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::{Batch, Connection, OpenFlags, params_from_iter};
@@ -42,8 +40,11 @@ use serde_json::{Map, Value};
 pub use carbondb_service_bindings::Db;
 use carbondb_service_bindings::migrations::{self, Migration};
 
-use crate::call_window::{CallWindow, Read, Scoped, Shared, guard, start_reading, stop_reading, unrecorded};
-use crate::statements::Statements;
+pub mod changeset;
+
+use crate::call_window::{CallWindow, Scoped, guard};
+use crate::sql::Statements;
+use crate::sql::authorizer::{Read, Shared, start_reading, stop_reading, unrecorded};
 use crate::error::{Result, ServiceError, bad_request, is_system_failure, sqlite, system_failure};
 
 // The core's own record of a space, which no rewind undoes.
@@ -276,45 +277,6 @@ impl Db for Reader {
   }
 }
 
-// A row a changeset changes: its table, and its primary key's values as JSON
-// text. Every table a service owns has a primary key the op chose, so a row
-// is the same row on every replica.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-pub struct Row {
-  pub table: String,
-  pub key: String,
-}
-
-// The rows a changeset changes, in table and key order.
-pub fn rows(changeset: &[u8]) -> Result<Vec<Row>> {
-  let input: &mut dyn std::io::Read = &mut &changeset[..];
-  let mut items = ChangesetIter::start_strm(&input).map_err(sqlite)?;
-  let mut rows = std::collections::BTreeSet::new();
-  while let Some(item) = items.next().map_err(sqlite)? {
-    rows.insert(changed_row(item).map_err(sqlite)?);
-  }
-  Ok(rows.into_iter().collect())
-}
-
-// The row one change touches: an insert names it by its new key, an update
-// or a delete by its old one.
-fn changed_row(item: &ChangesetItem) -> rusqlite::Result<Row> {
-  let op = item.op()?;
-  let value = |column: usize| match op.code() {
-    Action::SQLITE_INSERT => item.new_value(column),
-    _ => item.old_value(column),
-  };
-  let keys = item.pk()?.iter().enumerate().filter(|(_, in_key)| **in_key != 0);
-  let key = keys.map(|(column, _)| Ok(from_sql(Sql::try_from(value(column)?)?))).collect::<rusqlite::Result<Vec<Value>>>()?;
-  Ok(Row { table: op.table_name().to_string(), key: Value::Array(key).to_string() })
-}
-
-// The tables a changeset changes, in name order.
-pub fn tables(changeset: &[u8]) -> Result<Vec<String>> {
-  let tables: std::collections::BTreeSet<String> = rows(changeset)?.into_iter().map(|row| row.table).collect();
-  Ok(tables.into_iter().collect())
-}
-
 // A SQLite result as the core's, noting a system failure on the store.
 pub(crate) fn checked<T>(failure: &Failure, result: rusqlite::Result<T>) -> Result<T> {
   result.map_err(|error| {
@@ -384,7 +346,7 @@ pub(crate) fn to_sql(value: &Value) -> Sql {
   }
 }
 
-fn from_sql(value: Sql) -> Value {
+pub(crate) fn from_sql(value: Sql) -> Value {
   match value {
     Sql::Null => Value::Null,
     Sql::Integer(number) => Value::from(number),
@@ -405,6 +367,7 @@ pub(crate) fn hold_lock(path: &Path) -> Connection {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::store::changeset::{rows, tables};
   use serde_json::json;
 
   fn store() -> (tempfile::TempDir, Store) {

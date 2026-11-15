@@ -1,6 +1,4 @@
-//! What CarbonDB knows of each statement a service runs, worked out once per
-//! statement text and kept in memory per space: the SQL as SQLite runs it,
-//! moved into the service's namespace, and whether it reads just one row.
+//! The one row a statement reads, when it reads just one.
 //!
 //! SQLite's authorizer reports the tables a statement reads, never the rows,
 //! so a read is of a whole table unless this module finds the one row the
@@ -11,12 +9,13 @@
 //! module cannot confirm reads the whole table, so a mistake here costs a
 //! rewind, never a wrong state. A statement reads one row only when:
 //!
-//! - it is one SELECT, UPDATE or DELETE of one table, with no join, subquery
-//!   or CTE, whose WHERE clause is `column = value` terms joined by AND
-//!   naming every primary key column, each value a literal or a parameter;
-//! - SQLite's query planner plans it as a search of that table by its whole
-//!   primary key, which rules out a view, an OR, a range, and a key compared
-//!   under another collation;
+//! - it is one SELECT, UPDATE or DELETE whose WHERE clause holds
+//!   `column = value` terms, joined by AND, for every primary key column of
+//!   the table it names, each value a literal or a parameter;
+//! - SQLite's query planner plans it as one search of that table by its whole
+//!   primary key and nothing else, which rules out a join, a subquery, a CTE
+//!   it reads, a view, an OR, a range and a key compared under another
+//!   collation;
 //! - the key compares its values exactly (BINARY), so the value looked up
 //!   names the one row it finds;
 //! - the table has no triggers, whose reads the authorizer reports as the
@@ -27,74 +26,37 @@
 //!
 //! The authorizer confirms each run: the statement's row read is kept only
 //! when the tables it read are that one table.
-//!
-//! The cache is keyed by the statement's text and the service's namespace,
-//! and cleared whenever SQLite's schema version changes, so a trigger or an
-//! index added later is always seen. It is not persisted: after a restart
-//! each statement is worked out once more.
 
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ops::ControlFlow;
-use std::rc::Rc;
 
 use rusqlite::Connection;
 use serde_json::Value;
-use sqlparser::ast::{BinaryOperator, Expr, FromTable, ObjectNamePart, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins, Value as Literal, Visit, Visitor};
+use sqlparser::ast::{BinaryOperator, Expr, FromTable, ObjectNamePart, SetExpr, Statement, TableFactor, Value as Literal};
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::tokenizer::{Location, Token, Tokenizer};
 
-use crate::error::Result;
-use crate::namespace;
-use crate::store::{Failure, Row, checked};
-
-// The statements a space's services have run, under the schema version they were worked out for.
-#[derive(Default)]
-pub(crate) struct Statements {
-  schema: Cell<Option<i64>>,
-  known: RefCell<HashMap<(String, String), Rc<Analysed>>>,
-}
-
-impl Statements {
-  // A service's statement as worked out the first time its text ran under
-  // the schema this connection reads.
-  pub(crate) fn get(&self, connection: &Connection, failure: &Failure, prefix: &str, sql: &str) -> Result<Rc<Analysed>> {
-    let version = checked(failure, connection.prepare_cached("PRAGMA schema_version").and_then(|mut pragma| pragma.query_row([], |row| row.get(0))))?;
-    if self.schema.replace(Some(version)) != Some(version) {
-      self.known.borrow_mut().clear();
-    }
-    let key = (prefix.to_string(), sql.to_string());
-    if let Some(known) = self.known.borrow().get(&key) {
-      return Ok(Rc::clone(known));
-    }
-    let analysed = Rc::new(analyse(connection, prefix, sql)?);
-    self.known.borrow_mut().insert(key, Rc::clone(&analysed));
-    Ok(analysed)
-  }
-}
-
-// A statement as SQLite runs it, and the row it looks up, if it reads just one.
-#[derive(Debug, PartialEq)]
-pub(crate) struct Analysed {
-  pub sql: String,
-  lookup: Option<Lookup>,
-}
-
-impl Analysed {
-  // The row this run reads, from the values bound to it, when it reads just one.
-  pub(crate) fn looked_up(&self, params: &[Value]) -> Option<Row> {
-    let lookup = self.lookup.as_ref()?;
-    let values = lookup.key.iter().map(|(source, kind)| source.value(params).filter(|value| kind.holds(value))).collect::<Option<Vec<Value>>>()?;
-    Some(Row { table: lookup.table.clone(), key: Value::Array(values).to_string() })
-  }
-}
+use crate::store::changeset::Row;
 
 // One row of one table, found by its whole primary key: where each key
 // column's value comes from, in key order, and the type it must have.
 #[derive(Debug, PartialEq)]
-struct Lookup {
+pub(crate) struct Lookup {
   table: String,
   key: Vec<(Source, Kind)>,
+}
+
+impl Lookup {
+  // The row a run reads, from the values bound to it, when each has its key column's type.
+  pub(crate) fn row(&self, params: &[Value]) -> Option<Row> {
+    let values = self.key.iter().map(|(source, kind)| source.value(params).filter(|value| kind.holds(value))).collect::<Option<Vec<Value>>>()?;
+    Some(Row { table: self.table.clone(), key: Value::Array(values).to_string() })
+  }
+}
+
+// The row a parsed statement looks up by its whole key, confirmed by SQLite
+// on the statement as it runs, moved into the service's namespace.
+pub(crate) fn find(connection: &Connection, sql: &str, statements: &[Statement], renamed: &str, prefix: &str) -> Option<Lookup> {
+  candidate(sql, statements).and_then(|candidate| confirm(connection, renamed, prefix, candidate).ok().flatten())
 }
 
 // Where a key value comes from: a parameter, by its index from 0, or a literal.
@@ -142,14 +104,6 @@ impl Kind {
   }
 }
 
-// Work a service's statement out: its namespaced SQL, and the row it looks up.
-fn analyse(connection: &Connection, prefix: &str, sql: &str) -> Result<Analysed> {
-  let statements = namespace::parse(sql)?;
-  let renamed = namespace::rename(sql, &statements, prefix)?;
-  let lookup = candidate(sql, &statements).and_then(|candidate| confirm(connection, &renamed, prefix, candidate).ok().flatten());
-  Ok(Analysed { sql: renamed, lookup })
-}
-
 // What the text says a statement looks up: the table it reads, the name it
 // goes by in the plan, each `column = value` term of its WHERE clause, and
 // how many parameters it takes.
@@ -161,57 +115,35 @@ struct Candidate {
   params: usize,
 }
 
-// The candidate for one row read, from a lone SELECT, UPDATE or DELETE of one
-// table with no subquery, whose WHERE clause holds `column = value` terms.
+// The candidate for one row read, from a lone SELECT, UPDATE or DELETE
+// whose WHERE clause holds `column = value` terms. Whether it reads anything
+// more, through a join, a subquery or a CTE, is the planner's to say.
 fn candidate(sql: &str, statements: &[Statement]) -> Option<Candidate> {
   let [statement] = statements else { return None };
-  let (from, selection, queries) = match statement {
-    Statement::Query(query) => (one_table(&select(query)?.from)?, select(query)?.selection.as_ref()?, 1),
-    Statement::Update(update) if update.from.is_none() => (one_table(std::slice::from_ref(&update.table))?, update.selection.as_ref()?, 0),
-    Statement::Delete(delete) if delete.using.is_none() && delete.tables.is_empty() => match &delete.from {
-      FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from) => (one_table(from)?, delete.selection.as_ref()?, 0),
-    },
-    _ => return None,
-  };
-  if count_queries(statement) != queries {
-    return None;
-  }
-  let (table, alias) = from;
-  let shown_as = alias.unwrap_or_else(|| table.clone());
+  let (TableFactor::Table { name, alias, .. }, selection) = target(statement)? else { return None };
+  let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else { return None };
+  let table = table.value.clone();
+  let shown_as = alias.as_ref().map_or_else(|| table.clone(), |alias| alias.name.value.clone());
   let params = numbered(sql)?;
   let terms = conjuncts(selection).into_iter().filter_map(|term| equality(term, &[&table, &shown_as], &params)).collect();
   let count = params.values().map(|index| index + 1).max().unwrap_or(0);
   Some(Candidate { table, shown_as, terms, params: count })
 }
 
-// The SELECT a query is, when it is a plain one with no CTE.
-fn select(query: &Query) -> Option<&Select> {
-  match (&query.with, query.body.as_ref()) {
-    (None, SetExpr::Select(select)) => Some(select),
-    _ => None,
-  }
-}
-
-// The one table a FROM clause names, with no join, and its alias.
-fn one_table(from: &[TableWithJoins]) -> Option<(String, Option<String>)> {
-  let [TableWithJoins { relation: TableFactor::Table { name, alias, args: None, .. }, joins }] = from else { return None };
-  let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else { return None };
-  joins.is_empty().then(|| (table.value.clone(), alias.as_ref().map(|alias| alias.name.value.clone())))
-}
-
-// How many queries a statement holds, its own SELECT and every subquery.
-fn count_queries(statement: &Statement) -> usize {
-  struct Queries(usize);
-  impl Visitor for Queries {
-    type Break = ();
-    fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
-      self.0 += 1;
-      ControlFlow::Continue(())
-    }
-  }
-  let mut queries = Queries(0);
-  let _ = statement.visit(&mut queries);
-  queries.0
+// The table a statement names first, and its WHERE clause.
+fn target(statement: &Statement) -> Option<(&TableFactor, &Expr)> {
+  let (from, selection) = match statement {
+    Statement::Query(query) => match query.body.as_ref() {
+      SetExpr::Select(select) => (select.from.first()?, &select.selection),
+      _ => return None,
+    },
+    Statement::Update(update) => (&update.table, &update.selection),
+    Statement::Delete(delete) => match &delete.from {
+      FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from) => (from.first()?, &delete.selection),
+    },
+    _ => return None,
+  };
+  Some((&from.relation, selection.as_ref()?))
 }
 
 // The terms a WHERE clause joins with AND.
@@ -360,8 +292,10 @@ fn searches_by_key(plan: &[String], shown_as: &str, index: &str, columns: &[KeyC
 mod tests {
   use super::*;
   use crate::Db;
-  use crate::call_window::{CallWindow, Read};
-  use crate::store::{Store, rows};
+  use crate::call_window::CallWindow;
+  use crate::sql::authorizer::Read;
+  use crate::store::Store;
+  use crate::store::changeset::rows;
   use serde_json::json;
 
   const PREFIX: &str = "notes/db/";
@@ -432,7 +366,10 @@ mod tests {
       ("a join", "SELECT n.text FROM note n JOIN tag t ON t.name = n.text WHERE n.id = ?", vec![json!("a")], vec!["note", "tag"]),
       ("a subquery of the same table", "SELECT text FROM note WHERE id = ? AND text IN (SELECT text FROM note)", vec![json!("a")], vec!["note"]),
       ("a subquery in what it selects", "SELECT (SELECT count(*) FROM note) AS n FROM note WHERE id = ?", vec![json!("a")], vec!["note"]),
-      ("a CTE", "WITH one AS (SELECT 1) SELECT text FROM note WHERE id = ?", vec![json!("a")], vec!["note"]),
+      ("a CTE it never reads", "WITH one AS (SELECT 1) SELECT text FROM note WHERE id = ?", vec![json!("a")], vec![r#"note@["a"]"#]),
+      ("a CTE it reads", "WITH texts AS (SELECT text FROM note) SELECT text FROM note WHERE id = ? AND text IN (SELECT text FROM texts)", vec![json!("a")], vec!["note"]),
+      ("a second table, without JOIN", "SELECT n.text FROM note n, tag t WHERE n.id = ? AND t.name = ?", vec![json!("a"), json!("red")], vec!["note", "tag"]),
+      ("a subquery in the FROM clause", "SELECT text FROM (SELECT * FROM note) WHERE id = ?", vec![json!("a")], vec!["note"]),
       ("a view", "SELECT text FROM recent WHERE id = ?", vec![json!("a")], vec!["note", "recent"]),
       ("a key that ignores case", "SELECT text FROM folded WHERE id = ?", vec![json!("a")], vec!["folded"]),
       ("the key compared ignoring case", "SELECT text FROM note WHERE id = ? COLLATE NOCASE", vec![json!("a")], vec!["note"]),
@@ -464,42 +401,13 @@ mod tests {
     store.end_write(true).unwrap();
   }
 
-  // The cache, on a bare connection holding a service's namespaced tables.
-  fn connection() -> Connection {
-    let connection = Connection::open_in_memory().unwrap();
-    connection.execute_batch(r#"CREATE TABLE "notes/db/note" (id TEXT PRIMARY KEY, text TEXT) WITHOUT ROWID"#).unwrap();
-    connection
-  }
-
-  #[test]
-  fn a_statement_is_worked_out_once_until_the_schema_changes() {
-    let (connection, statements, failure) = (connection(), Statements::default(), Failure::default());
-    let sql = "SELECT text FROM note WHERE id = ?";
-    let first = statements.get(&connection, &failure, PREFIX, sql).unwrap();
-    assert!(Rc::ptr_eq(&first, &statements.get(&connection, &failure, PREFIX, sql).unwrap()), "a repeat run reuses its entry");
-    connection.execute_batch(r#"CREATE TABLE "notes/db/tag" (name TEXT PRIMARY KEY) WITHOUT ROWID"#).unwrap();
-    let again = statements.get(&connection, &failure, PREFIX, sql).unwrap();
-    assert!(!Rc::ptr_eq(&first, &again), "a schema change replaces it");
-    assert_eq!(*first, *again);
-  }
-
   #[test]
   fn sqlite_plans_a_lookup_by_key_as_one_search_of_its_key() {
-    let connection = connection();
+    let connection = crate::sql::tests::connection();
     let table = "notes/db/note";
     let index = key_index(&connection, table).unwrap();
     let plan = plan(&connection, r#"SELECT text FROM "notes/db/note" WHERE id = ?"#, 1).unwrap();
     assert_eq!((index.clone(), plan), (Some("sqlite_autoindex_notes/db/note_1".into()), Some(vec!["SEARCH notes/db/note USING PRIMARY KEY (id=?)".to_string()])));
     assert_eq!(key_collations(&connection, &index.unwrap()).unwrap(), vec!["BINARY".to_string()]);
-  }
-
-  #[test]
-  fn a_trigger_added_later_turns_a_row_read_back_into_a_read_of_the_whole_table() {
-    let (connection, statements, failure) = (connection(), Statements::default(), Failure::default());
-    let sql = "SELECT text FROM note WHERE id = ?";
-    let params = [json!("a")];
-    assert!(statements.get(&connection, &failure, PREFIX, sql).unwrap().looked_up(&params).is_some());
-    connection.execute_batch(r#"CREATE TRIGGER "notes/db/kept" AFTER DELETE ON "notes/db/note" BEGIN SELECT 1; END"#).unwrap();
-    assert_eq!(statements.get(&connection, &failure, PREFIX, sql).unwrap().looked_up(&params), None);
   }
 }

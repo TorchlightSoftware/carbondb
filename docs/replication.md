@@ -56,7 +56,7 @@ SQLite's authorizer reports which tables a statement reads, never which rows, so
 
 Each statement is worked out once per text and kept in memory per space, until SQLite's schema version changes; after a restart each is worked out again. Only the core's first look at a statement asks the planner, and every run is still compiled once, so the authorizer checks it.
 
-CarbonDB reads SQL with sqlparser in two modules: `crates/core/src/namespace.rs` parses each statement and moves a service's names into its namespace, and `crates/core/src/statements.rs` reads that parse, and the statement's tokens to number its parameters, to find the row it looks up. A better way to read SQL would replace those two.
+Everything CarbonDB reads in a service's SQL lives in `crates/core/src/sql/`. sqlparser is used in two of its files: `namespace.rs` parses each statement and moves a service's names into its namespace, and `lookup.rs` reads that parse, and the statement's tokens to number its parameters, to find the row it looks up. A better way to read SQL would replace those two.
 
 ## Otherwise the space rewinds
 
