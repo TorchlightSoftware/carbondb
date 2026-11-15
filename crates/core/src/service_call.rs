@@ -185,7 +185,23 @@ impl ServiceCall {
       return self.elsewhere(space, actor, call, input, reply);
     }
     match within(&self.call, &call) {
-      Ok(within) => self.inside(actor, call, input, within, reply),
+      Ok(Within::OwnOp) => {
+        let own_op = self.carbon.stamp(&actor, &call, &input);
+        self.inside(actor, call, input, Some(own_op), reply)
+      }
+      Ok(Within::SameOp) => self.inside(actor, call, input, None, reply),
+      Err(error) => reply(Err(error)),
+    }
+  }
+
+  // Replay a sub-call a local op made, as recorded on its row: under the
+  // stamp it was made with, in place of the local op itself.
+  pub(crate) fn replay(self: &Rc<Self>, sub_call: Op, reply: Reply) {
+    if !self.live.get() {
+      return reply(Err(self.ended()));
+    }
+    match Call::from_key(&sub_call.key) {
+      Ok(call) => self.inside(crate::op::actor(&sub_call), call, sub_call.input.clone(), Some(sub_call), reply),
       Err(error) => reply(Err(error)),
     }
   }
@@ -197,7 +213,8 @@ impl ServiceCall {
       return reply(Err(forbidden(format!("Only a local service calls into another space or as another actor, not {}", self.call.key()))));
     }
     if Rc::ptr_eq(space, &self.space) && call.writes() {
-      return self.inside(actor, call, input, Within::OwnOp, reply);
+      let own_op = self.carbon.stamp(&actor, &call, &input);
+      return self.inside(actor, call, input, Some(own_op), reply);
     }
     self.pending.set(self.pending.get() + 1);
     let caller = Rc::clone(self);
@@ -212,13 +229,12 @@ impl ServiceCall {
   }
 
   // A call inside this one's transaction: under a savepoint when it writes, in
-  // the same op or as a sub-call stamped as an op of its own.
-  fn inside(self: &Rc<Self>, actor: Actor, call: Call, input: Value, within: Within, reply: Reply) {
+  // the same op, or as a sub-call with an op of its own.
+  fn inside(self: &Rc<Self>, actor: Actor, call: Call, input: Value, own_op: Option<Op>, reply: Reply) {
     let guarded = self.call.writes();
     if guarded && let Err(error) = self.space.store().savepoint() {
       return reply(Err(error));
     }
-    let own_op = (within == Within::OwnOp).then(|| self.carbon.stamp(&actor, &call, &input));
     let op = own_op.clone().or_else(|| self.op.clone());
     self.pending.set(self.pending.get() + 1);
     let caller = Rc::clone(self);

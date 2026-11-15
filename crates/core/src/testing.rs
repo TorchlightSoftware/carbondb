@@ -7,6 +7,11 @@
 //! does as data:
 //!
 //!   {"insert": "a"}                                insert a note, its id drawn from the op
+//!   {"replace": ["a", "b"]}                        change note a's text to b, or fail with a 404
+//!   {"set": ["k", "b"]}                            set the text of the note keyed k to b, looking it up
+//!                                                  by its key and inserting it when there is none
+//!   {"delete": "a"}                                delete note a, or fail with a 404
+//!   {"unless": "a", "do": [..]}                    run the steps in `do` only when no note says a
 //!   {"read": true}                                 add the texts this handler sees to the output
 //!   {"call": "POST [notes]/run", "input": {..}}    make a call, adding its answer to the output
 //!   {"call": .., "catch": true}                    the same, adding a failure's status instead of failing
@@ -24,7 +29,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::error::{Result, conflict, internal, unknown};
+use crate::error::{Result, conflict, internal, not_found, unknown};
 use crate::carbon::Schedule;
 use crate::{Actor, Call, Carbon, Db, HandlerContext, Identity, Routing, Service, Settled, Space};
 
@@ -186,6 +191,21 @@ fn seen(db: &dyn Db) -> Result<Value> {
   Ok(Value::Array(rows.into_iter().map(|row| row["text"].clone()).collect()))
 }
 
+// A step that changes a note, which fails when there is no such note.
+fn changed(rows: Result<u64>, text: &Value) -> Result<()> {
+  match rows? {
+    0 => Err(not_found(format!("No note {text}"))),
+    _ => Ok(()),
+  }
+}
+
+// Set a note's text by its key, as an edit looks up the one row it changes.
+fn set(db: &dyn Db, key: &Value, text: &Value) -> Result<()> {
+  let found = db.all("SELECT id FROM note WHERE id = ?", std::slice::from_ref(key))?;
+  let sql = if found.is_empty() { "INSERT INTO note (text, id) VALUES (?, ?)" } else { "UPDATE note SET text = ? WHERE id = ?" };
+  db.run(sql, &[text.clone(), key.clone()]).map(|_| ())
+}
+
 // Run the rest of a script, then settle with what it gathered.
 fn step(context: Context, mut script: VecDeque<Value>, mut output: Vec<Value>) {
   let Some(next) = script.pop_front() else {
@@ -196,6 +216,19 @@ fn step(context: Context, mut script: VecDeque<Value>, mut output: Vec<Value>) {
     // A GET has no op to draw an id from, and its `run` refuses before the id matters.
     let id = context.op().map(|op| op.id()).unwrap_or_default();
     context.run("INSERT INTO note (id, text) VALUES (?, ?)", &[json!(id), text.clone()]).map(|_| ())
+  } else if let Some([from, to]) = next["replace"].as_array().map(Vec::as_slice) {
+    changed(context.run("UPDATE note SET text = ? WHERE text = ?", &[to.clone(), from.clone()]), from)
+  } else if let Some([key, text]) = next["set"].as_array().map(Vec::as_slice) {
+    set(context.as_ref(), key, text)
+  } else if let Some(text) = next.get("delete") {
+    changed(context.run("DELETE FROM note WHERE text = ?", std::slice::from_ref(text)), text)
+  } else if let Some(text) = next.get("unless") {
+    let steps = next["do"].as_array().cloned().unwrap_or_default();
+    seen(context.as_ref()).map(|texts| {
+      if !texts.as_array().is_some_and(|texts| texts.contains(text)) {
+        steps.into_iter().rev().for_each(|step| script.push_front(step));
+      }
+    })
   } else if next.get("read").is_some() {
     seen(context.as_ref()).map(|texts| output.push(texts))
   } else if let Some(why) = next["fail"].as_str() {

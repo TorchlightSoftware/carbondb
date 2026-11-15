@@ -8,7 +8,9 @@ The op log records each op as it arrives, and an op without a result runs again 
 
 ## Idea
 
-A space's id is the hash of the op that creates it, so a call that runs again reaches the same space. Each step of a multi-step call finds what an earlier run already built and carries on, rather than refusing. The result is the same whether or not the call was interrupted.
+Each step of a multi-step call finds what an earlier run already built and carries on, rather than refusing. The result is the same whether or not the call was interrupted.
+
+A space's id can no longer name it in advance: in replicated mode it is the id p2panda assigns when the space is created ([Creating a space](../implementation.md#creating-a-space)), so a call that runs again cannot derive the id an earlier run reached.
 
 ## To decide
 

@@ -1195,7 +1195,7 @@ That's fair...  Do we need to protect these system calls in any way against repl
 5) are you proposing to record sub-calls for all calls, universally, not just local ones?
 6) and was that already happening?
 
-    Still open: does every replay of a local op, including rewind on the device that ran it, run its recorded sub-calls the same way? 
+    Still open: does every replay of a local op, including rewind on the device that ran it, run its recorded sub-calls the same way?
 
 Yes, and the question feels redundant.  If the answer were "no" then we would be abandoning eventual consistency gaurantees that are fundamental to the whole system we're designing.
 
@@ -1529,6 +1529,796 @@ Proceed.  Get everything ready to publish, and then make a one time throw away s
 
 ---
 
-You just wrote a mixture of Apache and MIT licenses, and didn't ask me about any of that.  That's very dumb Claude.
+    carbondb-node stays unpublished
+
+Is that used internally in the package that's published to NPM?  So doesn't need to be published bceause it's intermediary?
+
+    carbondb on npm still contains only the Linux binary
+
+Elaborate?
+
+---
+
+    Checking loginRedirect belongs in identity, against a trust list we already keep
+
+Yes, sure.  I was only saying candle-connect gives you the service registry to do it with.  Although maybe we should rely on the service registration process instead?  Where the public keys of the services are registered?  That seems like a stronger cryptographic gaurantee than the service map itself.
+
+    Yes, what I built breaks the intended flow.
+
+Yeah, don't do that.  You don't have the authority to arbitrarilly break working functionality because you decided it was for the best.
+
+    For a deleted tenant I'd answer 401 with its own error code, TENANT_NOT_FOUND
+
+Shouldn't that be a 404?  You literally put NOT_FOUND in the code.  It just needs proper metadata on it so it can be detected distinctly.  Tell me if I'm wrong about this... 401 just doesn't feel like it describes the situation.
+
+Oh, but also why does ANYTHING retry infinitely?  It could retry a few times, or with an exponential backoff loop.
+
+1: agree with what you're saying but it's pretty verbose.  I don't need to get into the weeds with you here.
+
+2: I disagree with your decision, let's fix it
+
+3: A missing login domain is the same kind of problem — is it the same answer?
+
+Yes. But...
+
+    issueToken also fails with 500 when the tenant has no tenant_domain row
+
+That's not the error code you should be returning for that.  500 means something blew up.  Something didn't blow up.  That tenant just doesn't exist.  404 is what I have my money on, but you could also argue for 401.  And TENANT_NOT_FOUND should be the error type for them both.
+
+    getTenantLoginUrl takes the first tenant_domain row, in no fixed order. Torchlight has many rows, so tenantLoginUrl could be any of its service hosts, and that's where DataAccess sends someone whose session is over
+
+That's wrong.  I think login expiration/redirect to the same app was working before, and may have been modified adversely after the fact.  Regardless, I don't need you to do a historical dive on that, I just need you to fix it.
+
+    @tlsft/service-error and candle-env's ApiError have the same shape. Worth merging
+
+Yes, do that too.  That's annoying that you did not do that when service-error was written.
+
+Update the agenda, adding any new topics that are necessary.  Then address only one with me.
+
+---
+
+    For deciding where a session may be sent, service registration adds nothing over the service map
+
+Ok.  I'll concede this, and I actually don't think it's important what we do right now as long as it doesn't leave the system completely open to fraud.
+
+    My proposal: use the service map plus the tenant's tenant_domain rows
+
+Yes.  So tenant_domain could potentially override the service map.  I think that complies with our actual current semantics and would involve reusing the existing logic, yes?
+
+---
+
+    1. One function in candle-service decides who owns an origin: the platform, a specific tenant, or nobody. Three checks use it:
+       - CORS: any owner.
+       - Handoff sender: any owner.
+       - Handoff destination: the platform, or the session's own tenant.
+
+That's clear, and I agree with that.
+
+    2. POST [identity]/person/auth refuses a loginRedirect outside that set.
+
+Yes.
+
+    3. GET [identity]/person/launcher checks a loginRedirect it is given.
+
+Yes.
 
 
+---
+
+    It's agreed that a missing tenant answers 404 with code TENANT_NOT_FOUND
+
+Yes.
+
+    Does the client treat every 4xx answer from renewal as "session over", except 429 and 408? Then the 404 ends the session without the client checking for that code.
+
+You need to be more explicit about the consequences of that in terms of the specific use cases we've laid out.  You're waffling all over in terms of the way you're presenting this.  But I think the answer is yes.
+
+    If identity is unreachable, the client retries a few times with backoff, then shows Try again.
+
+Yes.
+
+    - Do you agree it should never send the person to login during an outage?
+
+What problem are you trying to solve?  Does it result in improved user experience?
+
+Be concise in your response.  Let's wrap this up.
+
+---
+
+┌────────────────────────────┬──────────────────┬───────────────────┐
+│            Case            │      Today       │       After       │
+├────────────────────────────┼──────────────────┼───────────────────┤
+│ Tenant deleted (404        │ Stuck on "Can't  │ Sent to the login │
+│ TENANT_NOT_FOUND)          │ reach sign-in"   │  page             │
+│                            │ forever          │                   │
+├────────────────────────────┼──────────────────┼───────────────────┤
+│ Tenant lost its login      │ Stuck the same   │ Sent to the login │
+│ domain (404                │ way              │  page             │
+│ TENANT_NOT_FOUND)          │                  │                   │
+
+You can't send to "the login page" because there is no "login page" defined if there is no tenant record.
+
+You need to display an error; whatever the user formatted version of TENANT_NOT_FOUND is.
+
+│ Session revoked or         │ Sent to the      │                   │
+│ expired, person deleted    │ login page       │ Unchanged         │
+│ (401)                      │                  │                   │
+
+Fine.
+
+├────────────────────────────┼──────────────────┼───────────────────┤
+│ Garbled token (400)        │ Stuck            │ Sent to the login │
+│                            │                  │  page             │
+├────────────────────────────┼──────────────────┼───────────────────┤
+
+How do you know what tenant this is for, or what login page to send them to if the token is garbled?
+
+│ Rate limited (429) or      │ Retry            │ Unchanged: retry  │
+│ request timeout (408)      │                  │                   │
+├────────────────────────────┼──────────────────┼───────────────────┤
+│ Identity down (5xx or      │ "Can't reach     │ Retries with      │
+│ network)                   │ sign-in" at once │ backoff, then Try │
+│                            │                  │  again            │
+└────────────────────────────┴──────────────────┴───────────────────┘
+
+These should all have the same behavior, with the exception that if you're getting rate limited, then you should start at the bottom end of the exponential backoff.
+
+Is this clear?  Do you know what to do now?
+
+---
+
+    This organization's account no longer exists. Contact your administrator.
+
+No.
+
+    Your account cannot be found.  Please contact your administrator.
+
+2, 3, 4: fine
+
+    does "the bottom end" of the backoff mean its shortest delay or its longest?
+
+Does a bear shit in the woods?
+
+Ok, please implement all 5, including consolidating the errors to use service-error.
+
+---
+
+     0.8 no longer lets us choose a space's id
+
+Ok.  I'm not sure we needed to do that to begin with.
+
+    its high-level Space API won't let a device write through its identity group
+
+Meaning that it will write as the device?  I'm not sure that I care... yes it's an implementation detail that changes, but we should still be able to map our own identity abstraction over the device/space semantics.
+
+    I recommend building rewind first, with no network involved, then wiring in p2panda
+
+That's fine by me.
+
+    1. Should a space's id be p2panda's id
+
+Sure.
+
+    2. Should a device write through its identity's group, or be added to each space directly?
+
+We need to add the devices directly.  However, you need to understand that:
+
+- CarbonDB's API should encapsulate this
+- CarbonDB should operate in terms of identity
+- under the hood we will wire up devices
+- an identity should have the capacity to "tag" its devices
+- a service should "tag" its operational requirements
+- an identity should provide an assignment policy which looks at the tags on `devices` and `services inside a space` and assigns which devices should hold [pull, read, write, manage]
+- carbondb core could provide a default implementation of this policy
+- we could backlog for now the ability for individual identities to override it (need to understand use cases better, which we will only get from testing)
+- this works similarly to the way Kubernetes assigns pods to available nodes in accordance with tags on each.  Don't do a deep dive into Kubernetes or stretch this metaphor too far, but both involve some sense of "jobs" being allocated to the appropriate "hardware"
+
+    Our design says "an identity is a p2panda group of its devices" (stories/implementation.md:224). That model is blocked
+
+No, it's not blocked.  The way you need to implement it has changed.
+
+    file the bug upstream
+
+You can backlog that.  I would like to build a sensible implementation of CarbonDB first, so that we can share more about our use case if and when we request any changes.
+
+    3. Should we build rewind before any network code?
+
+Sure.
+
+Please create the agenda with the goal of implementing sync using p2panda.
+
+---
+
+    Open questions (3 here; 18 more across the agenda):
+    1. Where is each op's changeset and read set kept? Beside its result (which a rewind replaces), or somewhere else?
+
+I don't understand why you're asking this.  The changeset and readset come from the SQLite extensions that we're applying.  If I remember correctly we need to store the readset to understand what state was "observed" when the Op occurred, which helps us to build CRDT semantics.  And the changeset gives us our actual database mutations to apply or rewind.  Is that accurate?
+
+It seems like you might need the readset on the Op, because doesn't it need to be replicated in order to power the CRDT semantics?  And the changeset feels more appropriate as part of the result.  But please tell me if this is making sense.
+
+    2. How does an op from another device enter the op log? The OpWriter is meant to take synced ops, but no call delivers one from outside yet.
+
+I think this is obvious given the context; we're using p2panda spaces to replicate the Ops.  The Op is just a message in a p2panda space.  Is there something non-obvious in your question that I'm missing?
+
+    3. How is a hybrid-logical-clock time stored in the op's time field so that the existing sort (time, then device, then op hash) still orders ops correctly?
+
+Again... it sounds like you should have an obvious answer to this question.  Please try, and let me know if you have an actual difficulty or conflict.
+
+Please just talk to me about item 1.  Set 2 and 3 aside as separate topics.
+
+---
+
+    - It isn't "what state the author observed". It's the tables and columns a handler read, which the SQLite authorizer reports
+
+It sounds like you're splitting hairs with me, and what you just described is 99% the same.
+
+    When a late op lands, rewind re-runs the later ops that read what the late op wrote
+
+Ok... and the way it determines that they are "late" is because they are observing earlier state than more recent local ops.  Right?  Or area you able to determine that independently from a clock?
+
+    Why I'd keep it off the op:
+    - Redundant
+    - Wrong after a rewind
+    - Untrusted
+
+Ok, valid.  Seems like you're heading in the right direction but I'd still like clarity on the above.  And this needs to be documented precisely by the way.  Other people will have questions about how the replication works.
+
+    Our design deliberately left that out: ops relate through the clock, not through lists of other ops
+
+Ok, that probably answers my earlier question.
+
+    p2panda tracks causal dependencies internally, but we don't use them
+
+It's a little bit strange to me that we're discarding both `p2panda` and `authorizer` tracking in preference for our own method.  In particular I would lean towards using p2panda's existing mechanism unless we have a good reason for inventing our own.
+
+
+---
+
+    - The design says a late op that doesn't overlap any later op applies in place. Otherwise only the overlapping later ops are undone and re-run (stories/implementation.md:189-190).
+    - But the late op's read set and changeset only exist once it has run.
+    - Running it on today's state gives the wrong answer. That state already includes later ops the late op should never see.
+
+It sounds like you can't apply an op in place without causing a cascade of reapplication of ops afterwards.  I don't understand.  Can you show me an example?
+
+
+---
+
+    No: a late op can almost always be applied in place with no cascade. I overstated the problem last time.  A rewind happens only when the late op actually conflicts with something after it.
+
+Ok.  I didn't review your examples, because the way you're framing this seems more clear now.
+
+    When the check fails, how far back do we undo?
+    - Option A, every later op:
+    - Option B, only the overlapping ops:
+
+How about C, only ops from the affected service?  State isolation is achieved within service boundaries.  The services follow "actor model" rules.
+
+I don't like the idea of B: that sounds like it could lead to some really nasty edge cases based on an innocuous programmer putting some if statements in a service call.
+
+Of course, services can call each other, and can call out to the web at large.  Do we need to tag side effects so they can be prevented during replay?  Do we need to memoize outside responses so they don't give inconsistent results with the replay?  Is it acceptable that consistency is only gauranteed at the single-service boundary?
+
+---
+
+    the design already keeps outside calls out of replicated handlers
+
+Hmm... describe that further.
+
+    a single op can span services, because a call runs inside the calling op's transaction. So "affected" has to grow.
+
+So you're proposing to basically track transactional state, ensure consistency across services.  Sounds feasible from what you're describing but let me see where this goes.
+
+    before the late op runs at its true place, we must already know every service it might call
+
+In the Otto framework, when the UI code instantiates an API client through candle-connect, it registers the service calls that it will be making.  This serves as a sort of pre-flight authorization check: if the user's JWT doesn't have access then the Javascript knows that this UI route is forbidden; it doesn't need to query the backend to find out.
+
+We could require something similar for the service-to-service calls.  They could declare their subservice calls within the route definition.  This would determine what keys get registered.  And anything not registered would be denied.
+
+This decision could percolate into the CarbonDB service definitions.
+
+Although; I must say that this would be a transgression from our previous domain boundaries.  We have been saying up to this point that CarbonDB doesn't know anything about the internal implementation of services: the routes they support, their input/output schemas, etc.  Requiring services to provide a declaration of the service-to-service dependency tree would cross that boundary.
+
+Maybe for this reason it would be better to detect it through the observed call tree rather than requiring an explicit registry.
+
+---
+
+    I agree with you that the observed call tree is better than a registry. It works, but only if rewind is allowed to retry
+
+I'm fine with that.  We should document it, and if at some point we need to change these semantics we can revisit.
+
+    What is only implied: that a replicated handler must not call the web.
+
+It doesn't just break determinism, it reveals something deeper: that by replicating a call that does "GET google.com" you would be calling that N times.  We need a deeper way of separating [dependencies, side effects] from [pure function, SQLite state mutations].  The former are outside our replication model's concerns, capabilities, and responsibilities.
+
+This may be why Holochain's "Zome" semantics feel so bizarre coming from a REST API developer perspective: they had to separate state operations into a different layer from side effects and dependencies.
+
+    The pattern for outside calls:
+    - A local service such as [@weather] runs once, on one device, fetches the forecast, then calls POST [garden]/forecast {temp}.
+
+I see what you're doing in terms of trying to work with our existing model.  And placing "dependencies and side effects that are outside our replication model" into @-prefixed services is an idea I'm willing to try on.
+
+Where I would disagree: Services need to be defined in a way where they can function somewhat normally.  In node.js, it's natural to call `fetch()`.  You could maybe make the argument that "this environment is special, we need you to call GET [@web]/fetch instead of fetch()" and get away with that.  But I don't think you're going to get away with inverting the entire call paradigm, and saying services can never call the web.  That cripples the service environment to the degree that no one would want to use our software.
+
+So at most I would consider bundling dependencies and side effects with local calls like `GET [@web]/fetch`, and incorporating some kind of semantics where it's possible to call them from normal services (run once, memoized result in the Op).
+
+But it's also worth considering whether even that move is too much friction - you're literally saying that anything with side effects or dependencies must be rewritten into a local service call, and that's going to massively disrupt someone's ability to use existing ecosystems like NPM.
+
+Something else worth considering: we want to shoot for WASM services.  So maybe the right call is to simply let the WASM environment be the place where this is enforced, measured, and reasoned about.
+
+Let's just talk about this, and set other agenda items aside for now.
+
+---
+
+    Your "run once, memoize the result in the op" idea is the right model. It works because an outside response can be treated as more input from the author's device, and replication already carries input. WASM is where it can be enforced completely; Node can only do it best-effort. None of this blocks rewind on a single device, so I recorded it as an open question rather than something to build now.
+
+Thanks.  That sounds clear.
+
+    The model: outside responses are author input
+
+Agreed, but I think we have significant challenges to doing this outside a WASM environment.
+
+    Why WASM is the place to enforce it
+
+    - WASM: a module reaches the outside world only through host imports. The host sees every call, so recording and replay are complete.
+    - Node: CarbonDB can wrap fetch for each handler. But npm packages that use http, net or sockets directly escape the wrapper.
+
+Yes, exactly.  I think we will find ourselves moving away from non WASM services very shortly because of this.
+
+    Limits we'd have to accept
+
+    1. A rewind can change which outside calls a handler makes. Replicas can't fetch something new, so an op whose calls no longer match its recording would be refused identically everywhere.
+
+Well, you can just call the outside system exactly once.  If the inputs are different, then the memoization doesn't apply, and you need to call it.  Which means we need a way of providing only-once semantics for local calls, even when they are triggered through replication.  But I think it's possible for us to do that deterministically.
+
+    2. Side effects such as POST or email happen once, on the first run. If the op is later refused after merge, the effect can't be undone.
+
+Sure.  This is the unavoidable and obvious consequence of being connected to the real world.
+
+    3. Awaiting the network blocks the space.
+
+Create a topic for that and set it aside.
+
+    4. A recorded response is trusted the way the author's input is.
+
+Record this topic as dropped.  All of these transactions involve cryptographic signatures.  We know who made the claim, and we can layer on fraud detection and reputation.  But that is so far down the road right now, not anything I want even in the backlog.
+
+So to summarize:
+
+1) Should we add WASM implementation of the builtins to our immediate target alongside the rewind/replay?
+2) Should @carbon also be WASM, or we just don't care/trust it because we implemented it ourselves.
+3) Should we/can we support NPM modules at all?  What do we do with [chat]?  Do we include it as a Javascript example, but compile it to WASM too?
+
+Respond only to these three questions and just quietly update the agenda with anything else you need to.
+
+---
+
+    build rewind first, then the WASM host, before any p2panda work.
+
+That's different, but not in a way that I care about.  WASM is still coming before p2panda, so you agree with me that far.
+
+    The builtins gain nothing from WASM for the outside-world problem.
+
+No, but we intended to implement them as WASM anyway, for other reasons, and it would give us some examples and let us validate the WASM runtime.
+
+    Doing both at once doubles the moving parts in the apply path
+
+I didn't literally mean at the same time.
+
+    My recommendation: yes, but only as a tier for services whose handlers just read and write their own SQLite.
+
+That's not useful Claude.  You just took an intention - to convert Otto services to CarbonDB - and rendered it so impotent as to be meaningless.
+
+    [chat] already fits that tier
+
+That's fine, but it's literally an arbitrarilly simplistic example app right now.  It's not the measure of what is possible.
+
+    A JS service compiled to WASM can still bundle pure-JS npm libraries. The only libraries that break are those needing Node built-ins like http, net and fs.
+
+Yes.  I'm just saying that the WASM compile tools handle that for us, rather than us implementing our own detection/interpretation system based on a target for which it's not feasible to accomplish the goal.
+
+I think I would lean towards not supporting NPM/Node, but requiring that everything be converted to WASM.  We need a way of analyzing, approving, and shimming the dependencies and side effects with single-run and memoization gaurantees, and it doesn't make sense to allow an NPM module into the system which very easily could result in spamming duplicate reads and writes out to systems that are unprepared for that.
+
+Ok, so to recap: You can build rewind first, and then WASM, but put both on the critical path.
+
+And let's drop NPM as a viable target, unless you have a good argument for why not.
+
+---
+
+    My proposal:
+    - Rust services: the builtins compile as components for the wasm32-wasip2 target.
+    - JavaScript services: compile with ComponentizeJS. [chat] would be the first.
+
+Sure, let's try it.
+
+    - One typed interface for every language, instead of an encoding we'd maintain ourselves.
+
+Not sure what you mean by this.
+
+    - WASI's standard HTTP interface later becomes the single point where outside calls are recorded
+
+Yes.
+
+    - Cost: large modules for JS, because ComponentizeJS embeds a JS engine (StarlingMonkey) in each one.
+
+Is there a better alternative?
+
+    The alternative: plain WASM modules with our own JSON-in, JSON-out encoding, and Javy (QuickJS) for JS. Modules are smaller, but we'd maintain the encoding for every language, and there'd be no standard hook for outside calls.
+
+I like what sounds like small modules and a simpler implementation with less moving parts.  Are there disadvantages in terms of portability of code?
+
+    call doesn't need async in either option.
+
+I don't follow your logic on that at all.  You're going to take services which could have arbitrary IO inside of them, and force them to be synchronous?  I don't think you're anywhere near hitting the target.
+
+---
+
+    Refactor opportunity: once the core is async, callback chains like crates/core/src/services/carbon/steps.rs:706-739 become straight-line code
+
+That file is only 80 lines long.  Say what?
+
+    WIT is a single file that describes the contract between the host and a service
+
+Is that a part of Componentize?  Or WASM components?
+
+    With plain modules, we'd hand-write that glue for every language ourselves
+
+We're obviously not going to do that; it's way outside scope.
+
+    Is there something smaller than ComponentizeJS?
+    Yes, probably: componentize-qjs
+
+What makes it so much smaller?  Does the author comment anywhere on their intentions, why they wrote it, how they themselves intend to use it?
+
+    ComponentizeJS is mature, but its imports can only be synchronous
+
+That might totally kill ComponentizeJS for us right there.
+
+---
+
+    - Who: Tomasz Andrzejak, a Microsoft engineer. He's also a regular contributor to StarlingMonkey (33 commits) and jco (82).
+
+That's good enough for me.  At the very least it seems like if it's retired there will be commentary and alternatives proposed.  And he can probably be relied upon to maintain an API that's not fundamentally different from the original.
+
+    No fetch and no console built in
+
+That seems doable, right?
+
+    Async imports are still settling.
+
+Mmm... I think we should go down this implementation path, but add a docs/wasm-services.md with things to watch in terms of how the ecosystem evolves.
+
+    Your call: try componentize-qjs through jco for [chat]
+
+Yes.
+
+    , and accept writing a fetch over WASI HTTP when outside calls arrive?
+
+Implement it and test it along with our WASM implementation.
+
+---
+
+    Should the core move off Node's JS thread?
+
+Yes.
+
+    - Async components need something to drive them, and later so does p2panda's tokio runtime.
+
+Yes.  And it makes the core more focused and fully implemented in Rust, with JS as a thin wrapper, as intended.
+
+What else do we need to discuss?
+
+---
+
+You also need topics for:
+
+- Update existing builtin services to use the new WASM format
+- Include the builtin services in the binary
+
+    The op's author device owns its outside calls. On a re-run, a call whose inputs aren't in the recording is made only by the author's device.
+
+What happens if the author device is offline when the re-run is occuring?  There must be a device that triggered the re-run chain in the first place, and that device must be online.  It seems like we could make that device responsible for the call.
+
+I think this would give us more reliable oplog semantics.  But would also necessitate that these calls do not rely upon which node they are fired from.  Which may not be a constraint we are willing to accept.
+
+    - The response travels on the op's log row, keyed by the call's inputs. That's the same way a local op already carries its sub-calls.
+
+Double checking: we're preserving the atomicity of Ops, correct?  sub-calls were embedded in the parent call, and now IO dependencies and side effects will be embedded.
+
+    - Other replicas that need that response pause the space, following the timeout precedent, and resume when it arrives.
+
+This is a weird thing to say.  The op is atomic, yes?  You shouldn't be awaiting some other state in order to apply an op.
+
+---
+
+    It also means a re-run can't make a new outside call in the middle of replay
+
+Why not?  I feel like we're going around in circles here.  But I don't see why the atomicity of an op is contradictory with: you replay it, it now sends a different GET request, which therefore must be rerun.
+
+    My new proposal is that the op is refused on every replica, and its author re-issues it.
+
+This breaks fundamental expectations that users have: they don't expect something that went through to retroactively be refused.  And that really defeats the whole purpose of using CRDTs: you can't just say we made everything consistent: by destroying the data we didn't like.
+
+I think what we're most concerned about is scenarios cause "eventual consistency" to result in multiple calls, even after memoization is applied.
+
+    Why "the device that triggered the re-run" doesn't work
+
+I mean the jerk that was sitting offline and originated the Op that triggered the replay on other peers.  Make that guy responsible for new calls.  In git, if you try to push and the main has moved on, it makes you pull first.  In that sense the peer wanting to rejoin could be responsible for catching up.
+
+I suppose this could also result in multiple replays: who's to say there aren't multiple people sitting offline, and when they come back online each of them will have to replay side effects. (I'm just going to call them side effects from now on.)
+
+---
+
+"Rolling wave rejoin": Can a rejoining node first publish a REJOIN op, then pull, then catch up, then complete the REJOIN?  That way other peers would be aware that someone else is behind, and could wait for state resolution on the peer before initiating their own sync...
+
+To criticize my own idea, seems a bit clever, but maybe naively doing things that we shouldn't have to with CRDTs?  I think we shouldn't need to coordinate or serialize our rejoining...
+
+    You're right, and atomicity isn't the obstacle
+
+Hmm.  But it also seems that whoever reruns the side effect needs to publish a new op.  Maybe the right answer is to deny the old op initially as you say, but then support an auto-resolution where the original device (or any other, as long as it's deterministic) can run the side effect and issue a new op, pointing at the old.
+
+Problems:
+
+1) violates atomicity of ops
+2) could still cause amplification effects, or be unstable in potentially "normal" operating conditions
+
+How does Holochain deal with side effects?
+
+---
+
+    How Holochain handles side effects
+
+    - The author's code runs once, on the author's own node. Its result is data: entries committed to the author's chain.
+    - Other peers never re-run that code. They only run validation over the data, and validation must be deterministic. It can't read the time, randomness, the node's own state or other cells (validation docs (https://developer.holochain.org/build/validation/)).
+    - Side effects go in post_commit, which runs on the author's node after the commit, outside its transaction (zome functions (https://developer.holochain.org/build/zome-functions/)).
+    - Outbound HTTP: I didn't find a host function for it. As far as I can tell, apps make external calls outside the DNA, but I haven't confirmed that.
+
+---
+
+    How Holochain handles side effects
+
+Roger that.  So you replicate database state, not the entire application state.  I think this gives us a clue as to where we're going astray here: we're drawing the box too wide about what CarbonDB assumes responsibility for.
+
+I think what that would point us towards recording the database changes in the op, and then replicating those database changes rather than replaying the service.  This gives CarbonDB a more focused scope, which I like.
+
+    replay what a handler wrote, not the handler itself
+
+Yes, although I disagree on some of the details...
+
+    - Scope: only ops whose handler made side effects. Pure ops are still re-run, exactly as agreed.
+
+There's no point in making this distinction.
+- A POST with no database mutations gets recorded as a no-op (still may have returned valuable data from side effects)
+- should we include output in the op, not in a separate results table?
+
+    - What the op's row carries: its recorded responses and its changeset.
+    - On a rewind: replicas re-apply that changeset instead of re-running the handler.
+
+Sure.
+
+    A pure validation hook can check the result against the new state.
+
+We don't have validations in the same way that Holochain does, and I don't know that I want them.  We have input/output validations (serve a different purpose) and Otto specifically has database schemas and perhaps some additional validations that get applied over top in Javascript.  So in some sense you could apply schema validations to this purpose.  But I don't think either of those get at what you would really want.
+
+You would really want a validation that looks at the op inputs, and validates that the database ops which occurred are a plausible result of the op (fall within its expected parameters).  To write that code independently of the implementation itself is... I think a bit nutty and redundant, and speaks to why I don't use Holochain.
+
+I think at some point, you're going to great lengths to rerun the service and... maybe you should just rerun the service.
+
+Let's say the side effect we're talking about is:
+
+    GET google.com?s=foo
+
+And the replay changes it to:
+
+    GET google.com?s=bar
+
+The Holochain approach would say that it doesn't matter: you may reorder the database ops, but you're going to retain the original search as it was run.
+
+Wouldn't we accomplish the same thing with our WASM sandboxing and memoizing side effects?  But with more deterministic and consistent internal application state?
+
+    - What it costs:
+      - the handler's business rules aren't re-run against the new state;
+
+Which is a problem because they don't get applied at all unless you rewrite them in a pure function validator format ala Holochain.  I'm trying to shoot for an application writing experience that feels less foreign.
+
+I see another downside to this approach: as a result of this change, the state of peers can now diverge significantly due to any accidental storage of state.  If I make disk access, or even create some state in memory, then my original peer who ran the code now has different state than all the other peers.  Running the handlers on each peer has its own dangers, but might be less of a footgun than local state getting lost entirely.
+
+So... I lean towards:
+
+1) keeping our originally intended semantics and run conditions for services
+2) leveraging the WASM boundary for awareness and control of side effects
+3) side effects only apply on initial run, never on replays
+4) perhaps side effects can be tagged as safe to rerun, such as a cache?
+
+---
+
+    Your ?s=foo / ?s=bar example is exactly how memoizing works
+
+Well no, it's not how memoization works in the traditional sense.  You only get the same result if you provide the same input.  I'm saying: you may change what you want to search google with, but this system will NOT re-query google.  It will leave the database holding the answer of the old search result:
+
+    DB: topic: ducks
+    GET ?s=ducks
+    DB: result: flapping winged creatures
+
+Replay:
+
+    DB: topic: porcupines
+    GET ?s=ducks
+    DB: result: flapping winged creatures
+
+This could be default behavior.  Maybe you can configure the side effect calls you're binding to WASM to set different policy though.
+
+    - Disk: a component gets no filesystem unless the host grants one
+    - Memory: Giving each call a fresh instance closes that leak.
+
+Sure but does it also close down application development in a way that feels restrictive, and will make it difficult to port existing apps?
+
+    On tagging some side effects as safe to repeat
+
+    It only works for effects whose response never feeds the database or the output,
+
+Hmm.
+
+    Open questions on "Replicated handlers reach the outside world through recorded calls"
+
+Can you rename that to "Replicated handlers' side effects are mediated by WASM boundary"?
+
+    1. How is a replay's call matched to the recording?
+
+I don't know what problem you're trying to solve.  You're not using any terms that we've agreed upon.
+
+    2. Should each call get a fresh component instance with no filesystem? That would stop handlers keeping state outside the database.
+
+Feels very limiting and restrictive to impose this on all application developers.
+
+    3. Should we allow a "safe to repeat" tag? My lean is to wait.
+
+This needs test scenarios attached to it in order to sensibly discuss it.  But set it aside as its own topic, we don't need to discuss now.
+
+---
+
+    Module-level caches and set-up state, which existing apps rely on, would reset on every call, so porting would get harder
+
+Mmm... on the other hand the existing Otto services are meant to run on Cloudflare workers, which also has similar restrictions.  You can't expect it to stay running between calls, and you have to declare all your side effects as bindings in wrangler.toml.
+
+So I'm just saying: I don't want to deny these things, but they must be declared and mediated by the WASM boundary.
+
+    Moved the safe-to-repeat tag to its own topic, off the critical path
+
+That's kind of annoying, feels like you're playing whack-a-mole with me.
+
+    - My proposal: the call fails the way an unreachable network would, identically on every replica. The handler can catch that failure like any network error.
+
+I think we might need to do that for now.
+
+But:
+
+1) we need to document and extensively test these scenarios
+2) should have a table explaining consequences in different scenarios
+3) I don't think you can just push safe-to-repeat under the rug, that's very relevant and intertwined; it's how the application developer answers "how do I get the behavior that I want from the WASM bindings"
+
+---
+
+    A received op's time is completely unchecked.
+
+Can't you just fix by rejecting as out of bounds?
+
+    Every op now computes its changeset twice
+
+What?  Why?  I don't remember agreeing to that.
+
+    Changesets are stored as hex text, because the core's Db binding only binds JSON values.
+
+Do you have a suggestion for something better, or do you think that's fine?
+
+     - Concurrent inserts into one table always rewind, because the append tag isn't built yet.
+
+Can you build it?
+
+    A replica assumes a space's origin arrives first
+
+That's fine.
+
+---
+
+    An insert can fail on a taken key, a unique value or a missing foreign-key parent
+
+That's something well known that we've discussed before.  It's why services must be provided with an ID generator function (implemented by core and passed through the WASM boundary), and the schema constraints you are mentioning should be a part of the documentation for service writers.
+
+    Comparing writes by row only makes sense once this is fixed
+
+So... what are you waiting on?
+
+    how should a write's dependence on existing rows count as a read?
+
+Can you explain with an example?  You're using a whole bunch of jargon.
+
+---
+
+    An edit or delete looks up its row first, and reads are only known per table, so a late insert still rewinds any later edit to the same table.  Recording reads per row, or the append tag, would close that gap
+
+Ok, and I think I already approved and in fact asked you to implement recording reads per row.  So what's holding you back on that?
+
+---
+
+    I found only your "writes by row is fine for now"
+
+Yes Claude, that's a clear approval, is it not?  I expected you to act on that.
+
+    When a query looks up one row by its full key, the core records a read of that row instead of the whole table.  Anything else (joins, subqueries, WHERE text = ?) stays a read of the whole table.
+
+Agreed.  Should be documented for service authors.
+
+My only concern: is parsing SQL a reliable way of getting this information?
+
+---
+
+    Parsing alone isn't reliable, but it can be made safe. The parse may only narrow a read from the whole table to one row. Anything it doesn't fully recognise stays a read of the whole table
+
+Ok.  Safe is good, and you're saying the consequence of a failure is performance, not incorrect behavior.
+
+    Every service statement goes through sqlparser for the table-name rewrite
+
+Yeah... let's just be sure we document every instance.  This might be the target of a refactor later on if we determine a better method.
+
+    Where SQLite would read more rows than the query text shows, and the check for each
+
+Write tests for all conditions.
+
+    A second witness, used in tests only: SQLite's query plan states its access path, e.g. SEARCH note USING PRIMARY KEY (id=?).
+
+Can you dejargonize this and explain what you mean?  By second witness do you mean another SQLite connection open in parallel?
+
+---
+
+    Reads are recorded per row
+
+Should be on critical path.  It's literally the thing that we're about to do next, and I'm requiring you to do it before we proceed with WASM implementation.
+
+    - What the planner can vouch for is reach: that a given query reads one row by key.
+
+Would it therefore be a better implementation of the "row reads" rather than parsing SQL?
+
+---
+
+    Each statement an op runs is compiled twice
+
+Can you cache this, storing a shorthand version of only the attributes we care about?  Maybe as a tag system, or a short JSON metadata field?  Then we only have to ask for the plan again on queries that we've never seen before.
+
+---
+
+    It lives in memory, one cache per space, not on disk. After a restart each statement is planned once more, which is cheap. A stored copy would have to be invalidated when SQLite is upgraded or the schema changes, and the saving isn't worth that.
+
+I completely agree.
+
+    only the second compile, the one that asks for the plan, goes away
+
+Cool.
+
+Consolidate this into the "Reads are recorded by row" topic, and get rid of topic 7.
+
+---
+
+implement per-row reads
+
+---
+
+    New crates/core/src/statements.rs: a per-space, in-memory cache keyed by statement text, cleared whenever SQLite's schema version changes
+
+Nowhere were you authorized to create a new crate.
+
+#---
+
+    Still open: Replicated handlers' side effects are mediated by the WASM boundary:
+    - Which replay policies a side-effect binding can declare, with a table of consequences for each. Proposed so far:
+      - record, the default: the side effect happens on the first run only, and replays get the recorded responses;
+
+"once" would be a clearer name.  "record" doesn't tell me anything about what it does.
+
+      - repeat: made again on every run on every replica, which is safe only when the response feeds neither the database nor the output.
+
+"replicate" lets say.  But aren't once and replicate mutually exclusive?  So are these tags, or are they an enum for a setting?
+
+And do we imagine there being other configurations?  Whether we use enums or a tagging system, I want to ensure that we leave room for additions down the road and we don't back ourselves into a corner.
+
+    - Whether a failed side effect is recorded like a response, so every replay sees the same failure the first run saw.
+
+The outputs of the side effects have to be memoized and transmitted with the Op: I think we've already established that in our other discussions, yes?  The service itself is responsible for interpreting this and deciding whether it's a failure condition for the business logic.  Core's job is just to record it and provide it to the replicated services, not to interpret it.

@@ -17,10 +17,12 @@ pub mod op;
 pub mod op_writer;
 pub mod oplog;
 pub mod results;
+pub mod rewind;
 pub mod schema;
 pub mod service_call;
 pub mod services;
 pub mod space;
+pub mod statements;
 pub mod store;
 pub mod watch;
 #[cfg(test)]

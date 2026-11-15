@@ -26,7 +26,7 @@ CarbonDB is an experiment in creating a general purpose framework for applicatio
 
 ## Status
 
-The core API currently runs in single-node mode (no replication). Next step is to build replication with p2panda (on iroh). The design is in [stories/](stories/README.md).
+The core API currently runs in single-node mode (no network). Rewind and replay are built and tested on a single device: ops received from other devices apply in one shared order, and a late op rewinds only what it must ([docs/replication.md](docs/replication.md)). Next step is to carry ops between devices with p2panda (on iroh). The design is in [stories/](stories/README.md).
 
 This should be considered a first draft that shows you what the API surface looks like, and what it looks like to build an app on top of CarbonDB.
 

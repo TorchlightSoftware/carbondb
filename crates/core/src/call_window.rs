@@ -6,8 +6,12 @@
 //! refuses anything outside it, and `op_id()` draws from the window's op. The
 //! core's own statements run outside any window, with neither.
 //!
-//! The authorizer also records what a GET's statements read, the read set
-//! `watch` re-runs on. What an op writes comes from its changeset, in `store`.
+//! The authorizer also records what statements read: a GET's read set, which
+//! `watch` re-runs on, and an op's, which rewind checks. It reports tables,
+//! so each statement's reads are settled once it has run: a statement that
+//! `statements` finds looking up one row by its key, and that read only that
+//! row's table, read that row; any other read the tables it read. What an op
+//! writes comes from its changeset, in `store`.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -15,11 +19,12 @@ use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Result, sqlite};
-use crate::namespace::rewrite;
-use crate::store::{Failure, all, run};
+use crate::statements::Statements;
+use crate::store::{Failure, Row, all, run};
 use crate::{Db, Op};
 
 // The service namespace and op a statement runs within. The core's own
@@ -30,13 +35,33 @@ pub struct CallWindow {
   pub op: Option<Op>,
 }
 
-// What the statements on one connection may touch, and what they have read.
-// SQLite's authorizer and functions must be Send, so it sits behind a mutex.
+// What a statement read: a whole table, or the one row of it looked up by its whole key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Read {
+  Table(String),
+  Row(Row),
+}
+
+impl Read {
+  pub fn table(&self) -> &str {
+    match self {
+      Read::Table(table) => table,
+      Read::Row(row) => &row.table,
+    }
+  }
+}
+
+// What the statements on one connection may touch, and what they have read:
+// the tables the statement running now has read, and what the statements
+// settled since recording started read. SQLite's authorizer and functions
+// must be Send, so it sits behind a mutex.
 #[derive(Default)]
 pub(crate) struct Access {
   window: CallWindow,
   reading: bool,
-  read: BTreeSet<String>,
+  statement: BTreeSet<String>,
+  read: BTreeSet<Read>,
 }
 
 pub(crate) type Shared = Arc<Mutex<Access>>;
@@ -67,21 +92,52 @@ pub fn op_id(op: &Op) -> i64 {
 pub(crate) fn start_reading(access: &Shared) {
   let mut access = access.lock().expect("access");
   access.reading = true;
+  access.statement.clear();
   access.read.clear();
 }
 
-// Stop recording and return the tables read.
-pub(crate) fn stop_reading(access: &Shared) -> Vec<String> {
+impl Access {
+  // Settle the statement that just ran: what it read joins the record, as the
+  // one row it looked up when the only table it read is that row's, or else
+  // as the tables it read.
+  fn settle(&mut self, looked_up: Option<Row>) {
+    let tables = std::mem::take(&mut self.statement);
+    match looked_up {
+      Some(row) if tables.len() == 1 && tables.contains(&row.table) => {
+        self.read.insert(Read::Row(row));
+      }
+      _ => self.read.extend(tables.into_iter().map(Read::Table)),
+    }
+  }
+
+  // What the statements since recording started read, settling the last.
+  pub(crate) fn read(&mut self) -> &BTreeSet<Read> {
+    self.settle(None);
+    &self.read
+  }
+}
+
+// Stop recording and return what was read.
+pub(crate) fn stop_reading(access: &Shared) -> Vec<Read> {
   let mut access = access.lock().expect("access");
+  access.settle(None);
   access.reading = false;
   std::mem::take(&mut access.read).into_iter().collect()
+}
+
+// Run the core's own work on a connection without recording what it reads.
+pub(crate) fn unrecorded<T>(access: &Shared, work: impl FnOnce() -> T) -> T {
+  let reading = std::mem::replace(&mut access.lock().expect("access").reading, false);
+  let done = work();
+  access.lock().expect("access").reading = reading;
+  done
 }
 
 // Record what a statement reads, and refuse a service's statement that reaches
 // outside its namespace.
 fn authorize(access: &mut Access, action: &AuthAction<'_>) -> Authorization {
   if let Some(table) = read_table(action).filter(|_| access.reading) {
-    access.read.insert(table.to_string());
+    access.statement.insert(table.to_string());
   }
   match &access.window.prefix {
     Some(prefix) if !within(prefix, action) => Authorization::Deny,
@@ -134,30 +190,38 @@ pub struct Scoped<'a> {
   pub(crate) connection: &'a Connection,
   pub(crate) access: &'a Shared,
   pub(crate) failure: &'a Failure,
+  pub(crate) statements: &'a Statements,
   pub(crate) window: CallWindow,
 }
 
 impl Scoped<'_> {
-  // Run a statement inside the call window, then restore the window it replaced.
-  fn inside<T>(&self, sql: &str, work: impl FnOnce(&str) -> Result<T>) -> Result<T> {
-    let sql = match &self.window.prefix {
-      Some(prefix) => rewrite(sql, prefix)?,
-      None => sql.to_string(),
+  // Run a statement inside the call window, as the service's namespace has
+  // it, then restore the window it replaced and settle what it read.
+  fn inside<T>(&self, sql: &str, params: &[Value], work: impl FnOnce(&str) -> Result<T>) -> Result<T> {
+    let analysed = match &self.window.prefix {
+      Some(prefix) => Some(unrecorded(self.access, || self.statements.get(self.connection, self.failure, prefix, sql))?),
+      None => None,
     };
-    let previous = std::mem::replace(&mut self.access.lock().expect("access").window, self.window.clone());
-    let result = work(&sql);
-    self.access.lock().expect("access").window = previous;
+    let previous = {
+      let mut access = self.access.lock().expect("access");
+      access.settle(None);
+      std::mem::replace(&mut access.window, self.window.clone())
+    };
+    let result = work(analysed.as_ref().map_or(sql, |analysed| analysed.sql.as_str()));
+    let mut access = self.access.lock().expect("access");
+    access.window = previous;
+    access.settle(analysed.and_then(|analysed| analysed.looked_up(params)));
     result
   }
 }
 
 impl Db for Scoped<'_> {
   fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
-    self.inside(sql, |sql| run(self.connection, self.failure, sql, params))
+    self.inside(sql, params, |sql| run(self.connection, self.failure, sql, params))
   }
 
   fn all(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
-    self.inside(sql, |sql| all(self.connection, self.failure, sql, params))
+    self.inside(sql, params, |sql| all(self.connection, self.failure, sql, params))
   }
 }
 

@@ -34,6 +34,7 @@ use carbondb_service_bindings::migrations::Migration;
 pub const MIGRATIONS: &[Migration] = &[
   ("space/0001_oplog_and_results", include_str!("../migrations/space/0001_oplog_and_results.sql")),
   ("space/0002_sub_calls", include_str!("../migrations/space/0002_sub_calls.sql")),
+  ("space/0003_read_sets_and_changesets", include_str!("../migrations/space/0003_read_sets_and_changesets.sql")),
 ];
 
 // Where a space is in applying its ops: initializing until every service its
@@ -53,8 +54,9 @@ pub struct Space {
   pub id: String,
   root: bool,
   store: Store,
-  // The services its origin names, which a device must run to answer them here.
-  named: RefCell<Vec<String>>,
+  // The services its origin names, which a device must run to answer them
+  // here; none until its origin has applied on this device.
+  named: RefCell<Option<Vec<String>>>,
   // The services set up here, which are the ones it answers.
   running: RefCell<Vec<String>>,
   // Services waiting to be set up until the op now applying is done.
@@ -118,17 +120,22 @@ impl Space {
   }
 
   pub fn names(&self, service: &str) -> bool {
-    self.named.borrow().iter().any(|name| name == service)
+    self.named.borrow().iter().flatten().any(|name| name == service)
   }
 
   // The services its origin names, once the host has learned them.
   pub fn name(&self, services: &[String]) {
-    *self.named.borrow_mut() = services.to_vec();
+    *self.named.borrow_mut() = Some(services.to_vec());
+  }
+
+  // Whether its origin has applied here, so the host knows the services it names.
+  pub fn knows_origin(&self) -> bool {
+    self.named.borrow().is_some()
   }
 
   // The services its origin names that are not set up here yet, which hold its ops back.
   pub fn not_set_up(&self) -> Vec<String> {
-    self.named.borrow().iter().filter(|name| !self.runs(name)).cloned().collect()
+    self.named.borrow().iter().flatten().filter(|name| !self.runs(name)).cloned().collect()
   }
 
   pub fn run_state(&self) -> RunState {

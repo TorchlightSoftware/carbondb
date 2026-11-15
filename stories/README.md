@@ -91,9 +91,8 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 ## Undo, write sets and read sets
 
 - **Session extension (the target for undo).** SQLite records the rows an op wrote, with old and new values. That changeset is both the undo record (rusqlite has `Changeset::invert`) and the op's write set. rusqlite is pinned to 0.39.0, the newest version that links beside p2panda's sqlx. That has compiled and run in a scratch crate, but not yet beside a live p2panda node.
-- **Authorizer (read sets in the core).** SQLite reports every table and column a statement reads as it is prepared. That gives each op's read set at table and column level, without knowing any schema. It cannot see which rows a WHERE clause matched.
+- **Authorizer (read sets in the core).** SQLite reports every table and column a statement reads as it is prepared. That gives each op's read set at table and column level, without knowing any schema. It cannot see which rows a WHERE clause matched, so the core finds the one row a statement looks up by its whole key, confirmed by SQLite's query planner; see [reading one row](../docs/replication.md#reading-one-row-by-its-key).
 - **Why read sets.** When a late op arrives, an op after it must re-run if it read anything the late op wrote. Write sets alone cannot tell that.
-- **Finer read sets, later.** A runtime that builds queries from data knows predicates such as `year = 2025`, so it can report reads per row. A late op that writes a 2024 account then forces no rewind of an op that read 2025's accounts; with table-level read sets it would.
 
 ## Stories
 
@@ -133,6 +132,8 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 - [An app developer registers a service by its package or crate name](backlog/package-names.md)
 - [The core keeps its own timers once replication runs](backlog/core-timers.md)
 - [An app can sign a message as an identity and verify one](backlog/sign-and-verify.md)
+- [p2panda lets a device write through a group it belongs to](backlog/upstream-group-write.md)
+- [An identity can replace the default assignment policy](backlog/assignment-policy-override.md)
 
 ## API sketch
 
@@ -280,4 +281,4 @@ native.register(name, manifestPath,
 
 ## Implementation
 
-See [implementation.md](implementation.md).
+See [implementation.md](implementation.md), and [p2panda-sync.md](p2panda-sync.md) for syncing spaces over p2panda.

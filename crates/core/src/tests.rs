@@ -137,7 +137,7 @@ mod oplog_entries {
     let space = room(&carbon, &identity);
     let call = crate::Call::from_key("POST [notes]/run").unwrap();
     let op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"insert": "after a crash"}]}));
-    oplog::append(space.store(), &op).unwrap();
+    oplog::append(space.store(), &oplog::LogRow::new(op.clone())).unwrap();
     let id = space.id.clone();
     drop((space, carbon));
 
@@ -157,7 +157,7 @@ mod oplog_entries {
     let call = crate::Call::from_key("POST [notes]/run").unwrap();
     let mut op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"insert": "old"}]}));
     op = crate::Op::new(op.key, op.input, op.author, op.device, "notes-v0".into(), op.time, op.hash);
-    oplog::append(space.store(), &op).unwrap();
+    oplog::append(space.store(), &oplog::LogRow::new(op.clone())).unwrap();
     let id = space.id.clone();
     drop((space, carbon));
 
@@ -236,7 +236,7 @@ mod run_states {
     let call = crate::Call::from_key("POST [notes]/run").unwrap();
     let large = "x".repeat(64 * 1024);
     let op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"call": "POST [notes]/run", "input": insert(&large), "catch": true}]}));
-    oplog::append(space.store(), &op).unwrap();
+    oplog::append(space.store(), &oplog::LogRow::new(op.clone())).unwrap();
     let pages = space.store().get("PRAGMA page_count", &[]).unwrap()["page_count"].clone();
     space.store().run_batch(&format!("PRAGMA max_page_count = {pages}")).unwrap();
 
@@ -406,13 +406,13 @@ mod spaces {
     assert_eq!(keys[2..], ["POST [@carbon]/space", "POST [@carbon]/space"]);
     let local = &entries[2];
     assert_eq!(local.device, Some(identity.device.clone()));
-    let sub_calls = oplog::sub_calls(personal.store(), &local.hash).unwrap();
+    let sub_calls = oplog::sub_calls(personal.store(), &local.hash).unwrap().unwrap();
     let reference = &sub_calls[0];
     assert_eq!((sub_calls.len(), reference.key.as_str()), (1, "POST [space]/ref"));
     assert_eq!((&reference.author, &reference.device), (&Some(identity.id.clone()), &Some(identity.device.clone())));
     let Some(Outcome::Applied { calls, .. }) = results::of(personal.store(), &local.hash).unwrap() else { panic!("[@carbon]/space applied") };
     assert_eq!(calls[0]["op"]["hash"], json!(reference.hash));
-    assert_eq!(oplog::sub_calls(personal.store(), &entries[0].hash).unwrap(), vec![], "a replicated op carries no sub-calls");
+    assert_eq!(oplog::sub_calls(personal.store(), &entries[0].hash).unwrap(), None, "a replicated op carries no sub-calls");
     assert_eq!(local.hash, created["space"].as_str().unwrap());
 
     let room = space_now(&carbon, created["space"].as_str().unwrap()).unwrap();
@@ -558,5 +558,283 @@ mod deadlines {
     call_now(&carbon, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap();
     assert_eq!(timers.delays(), []);
     assert_eq!(texts(personal.store()).unwrap(), json!(["a"]));
+  }
+}
+
+// Replicas: the same ops delivered in different orders converge on the same
+// state, as though each had applied them in the shared order.
+mod replicas {
+  use super::*;
+  use crate::op::stamp;
+  use crate::oplog::LogRow;
+  use crate::testing::{now, register_script};
+  use crate::{Call, Carbon, Space};
+
+  const ROOM: &str = "room";
+
+  // An op in a scenario: when it was made, from which of alice's devices, and its call.
+  struct Made {
+    time: u64,
+    device: &'static str,
+    key: &'static str,
+    input: Value,
+  }
+
+  fn made(time: u64, device: &'static str, key: &'static str, input: Value) -> Made {
+    Made { time, device, key, input }
+  }
+
+  // A `[notes]` or `[todo]` script made at `time`.
+  fn script(time: u64, service: &'static str, steps: Value) -> Made {
+    let key = if service == "todo" { "POST [todo]/run" } else { "POST [notes]/run" };
+    made(time, if time.is_multiple_of(2) { "phone" } else { "laptop" }, key, json!({"do": steps}))
+  }
+
+  // The row an op travels as, stamped with the version of its service this replica runs.
+  fn row(carbon: &Carbon, made: &Made) -> LogRow {
+    let call = Call::from_key(made.key).unwrap();
+    let actor = Actor { identity: Some("alice".into()), device: Some(made.device.into()) };
+    LogRow::new(stamp(&actor, &call, &made.input, &carbon.services().version(&call.service), made.time))
+  }
+
+  // The room's origin, which every replica receives first, as p2panda's
+  // causal delivery guarantees: every op in a space follows its origin.
+  fn origin() -> Made {
+    made(1, "laptop", "POST [space]/origin", json!({"kind": "space", "name": "Room", "services": ["notes", "todo"], "manage": ["alice"]}))
+  }
+
+  // A fresh replica running `[notes]` and `[todo]`.
+  fn device() -> (tempfile::TempDir, Rc<Carbon>) {
+    let (directory, carbon) = carbon();
+    register_script(&carbon, "todo");
+    (directory, carbon)
+  }
+
+  fn receive(carbon: &Rc<Carbon>, row: LogRow) {
+    now(|received| carbon.receive(ROOM, row, received)).unwrap();
+  }
+
+  // A replica that received the room's origin, then these rows in this order.
+  fn replica(rows: &[&LogRow]) -> (tempfile::TempDir, Rc<Carbon>, Rc<Space>) {
+    let (directory, carbon) = device();
+    receive(&carbon, row(&carbon, &origin()));
+    rows.iter().for_each(|row| receive(&carbon, (*row).clone()));
+    let space = space_now(&carbon, ROOM).unwrap();
+    (directory, carbon, space)
+  }
+
+  // A service's notes, as they stand in a replica.
+  fn notes(space: &Space, service: &str) -> Value {
+    let rows = space.store().reader().unwrap().all(&format!("SELECT text FROM \"{service}/db/note\" ORDER BY text"), &[]).unwrap();
+    Value::Array(rows.into_iter().map(|row| row["text"].clone()).collect())
+  }
+
+  // What a replica holds: each service's notes, and what became of each op in the shared order.
+  fn state(space: &Space) -> Value {
+    let ops = oplog::entries(space.store()).unwrap();
+    let results: Vec<Value> = ops.iter().map(|op| json!([op.key, results::of(space.store(), &op.hash).unwrap()])).collect();
+    json!({"notes": notes(space, "notes"), "todo": notes(space, "todo"), "results": results})
+  }
+
+  // Every order of the indices 0..n.
+  fn orders(n: usize) -> Vec<Vec<usize>> {
+    match n {
+      0 => vec![vec![]],
+      n => orders(n - 1).into_iter().flat_map(|order| (0..n).map(move |at| [&order[..at], &[n - 1], &order[at..]].concat())).collect(),
+    }
+  }
+
+  // Deliver a scenario's ops to a replica in every order, and check each ends
+  // where the replica that received them in the shared order ends, holding
+  // the notes expected.
+  fn converges(name: &str, ops: &[Made], expected: Value) {
+    let (_directory, author) = device();
+    let rows: Vec<LogRow> = ops.iter().map(|made| row(&author, made)).collect();
+    let (_in_order, _carbon, in_order) = replica(&rows.iter().collect::<Vec<_>>());
+    let settled = state(&in_order);
+    assert_eq!(json!({"notes": settled["notes"], "todo": settled["todo"]}), expected, "{name}: in order");
+    for order in orders(rows.len()) {
+      let delivered: Vec<&LogRow> = order.iter().map(|at| &rows[*at]).collect();
+      let (_directory, _carbon, space) = replica(&delivered);
+      assert_eq!(state(&space), settled, "{name}: delivered in order {order:?}");
+    }
+  }
+
+  #[test]
+  fn ops_delivered_in_any_order_converge_on_the_state_of_the_shared_order() {
+    let scenarios = [
+      (
+        "an edit made after a concurrent delete is refused everywhere",
+        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "notes", json!([{"delete": "a"}])), script(30, "notes", json!([{"replace": ["a", "b"]}]))],
+        json!({"notes": [], "todo": []}),
+      ),
+      (
+        "an edit refused before the note arrived applies once it has",
+        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "notes", json!([{"replace": ["a", "b"]}]))],
+        json!({"notes": ["b"], "todo": []}),
+      ),
+      (
+        "a read sees every op before it, whenever they arrived",
+        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "notes", json!([{"insert": "b"}, {"read": true}])), script(30, "notes", json!([{"read": true}]))],
+        json!({"notes": ["a", "b"], "todo": []}),
+      ),
+      (
+        "ops on different services leave each other be",
+        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "todo", json!([{"insert": "t"}])), script(30, "notes", json!([{"read": true}]))],
+        json!({"notes": ["a"], "todo": ["t"]}),
+      ),
+      (
+        "a call into another service rewinds with both",
+        vec![
+          script(10, "todo", json!([{"insert": "t"}])),
+          script(20, "notes", json!([{"insert": "n"}, {"call": "POST [todo]/run", "input": {"do": [{"read": true}, {"insert": "from-notes"}]}}])),
+          script(30, "todo", json!([{"replace": ["t", "t2"]}])),
+        ],
+        json!({"notes": ["n"], "todo": ["from-notes", "t2"]}),
+      ),
+      (
+        "a branch that reaches another service only at its true place",
+        vec![
+          script(10, "notes", json!([{"unless": "x", "do": [{"call": "POST [todo]/run", "input": {"do": [{"insert": "early"}]}}]}])),
+          script(20, "notes", json!([{"insert": "x"}])),
+          script(30, "todo", json!([{"insert": "t"}, {"read": true}])),
+        ],
+        json!({"notes": ["x"], "todo": ["early", "t"]}),
+      ),
+      (
+        "a value kept unique by a query, never by a constraint, is inserted only by the first op",
+        vec![script(10, "notes", json!([{"unless": "a", "do": [{"insert": "a"}]}])), script(20, "notes", json!([{"unless": "a", "do": [{"insert": "a"}]}]))],
+        json!({"notes": ["a"], "todo": []}),
+      ),
+      (
+        "an insert before an edit of another row, which the edit looked up by its key",
+        vec![
+          script(5, "notes", json!([{"set": ["k", "first"]}])),
+          script(10, "notes", json!([{"insert": "a"}])),
+          script(20, "notes", json!([{"set": ["k", "second"]}])),
+        ],
+        json!({"notes": ["a", "second"], "todo": []}),
+      ),
+      (
+        "an edit of a row by its key before the insert of that row",
+        vec![script(10, "notes", json!([{"set": ["k", "edited"]}])), script(20, "notes", json!([{"set": ["k", "inserted"]}]))],
+        json!({"notes": ["inserted"], "todo": []}),
+      ),
+      (
+        "inserts of different rows into one table",
+        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "notes", json!([{"insert": "b"}])), script(30, "notes", json!([{"insert": "c"}]))],
+        json!({"notes": ["a", "b", "c"], "todo": []}),
+      ),
+    ];
+    for (name, ops, expected) in scenarios {
+      converges(name, &ops, expected);
+    }
+  }
+
+  // The refs a replica's room holds, by the space each points to, with its slug.
+  fn refs(carbon: &Rc<Carbon>, space: &Rc<Space>) -> Value {
+    let refs = call_now(carbon, space, &Actor::default(), "GET [space]/refs", Value::Null).unwrap().value;
+    Value::Object(refs.as_array().unwrap().iter().map(|reference| (reference["space"].as_str().unwrap().to_string(), reference["slug"].clone())).collect())
+  }
+
+  #[test]
+  fn a_local_op_replays_its_sub_calls_on_every_replica_and_never_runs_itself() {
+    let (_directory, author) = device();
+    let reference = |time: u64, device: &'static str, space: &str| made(time, device, "POST [space]/ref", json!({"space": space, "kind": "space", "name": "Lobby", "slug": null, "cascade": []}));
+    let direct = row(&author, &reference(10, "phone", "elsewhere"));
+    let local = LogRow { sub_calls: Some(vec![row(&author, &reference(20, "laptop", "child")).op]), ..row(&author, &made(20, "laptop", "POST [@carbon]/space", json!({"name": "Lobby"}))) };
+    for order in [[&direct, &local], [&local, &direct]] {
+      let (directory, carbon, space) = replica(&order);
+      assert_eq!(refs(&carbon, &space), json!({"elsewhere": "lobby", "child": "lobby-2"}), "delivered local op first: {}", order[0] == &local);
+      assert!(!directory.path().join("data/child.db").exists() && !directory.path().join(format!("data/{}.db", local.op.hash)).exists(), "the local op itself never ran");
+    }
+  }
+
+  #[test]
+  fn a_local_op_rewound_on_the_device_that_made_it_replays_its_sub_calls_and_never_runs_again() {
+    let (directory, carbon) = carbon();
+    let identity = alice(&carbon);
+    let space = room(&carbon, &identity);
+    let child = call_now(&carbon, &space, &actor(&identity), "POST [@carbon]/space", json!({"name": "Lobby"})).unwrap().value;
+    let local = oplog::entries(space.store()).unwrap().into_iter().find(|op| op.key == "POST [@carbon]/space").unwrap();
+    // Made on another of alice's devices at the same moment, it sorts just before the local op.
+    let late = Actor { identity: Some(identity.id.clone()), device: Some("0".into()) };
+    let input = json!({"space": "elsewhere", "kind": "space", "name": "Lobby", "slug": null, "cascade": []});
+    let reference = stamp(&late, &Call::from_key("POST [space]/ref").unwrap(), &input, &carbon.services().version("space"), local.time);
+    now(|received| carbon.receive(&space.id, LogRow::new(reference), received)).unwrap();
+
+    assert_eq!(refs(&carbon, &space), json!({"elsewhere": "lobby", child["space"].as_str().unwrap(): "lobby-2"}));
+    let databases = std::fs::read_dir(directory.path().join("data")).unwrap().filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|extension| extension == "db")).count();
+    assert_eq!(databases, 5, "the system database, alice's two spaces, the room and the child, and no second child");
+    assert_eq!(outcomes(&space), vec![Ok(()), Ok(()), Ok(())]);
+  }
+
+  #[test]
+  fn a_watch_shows_the_state_a_rewind_settles_on() {
+    let (_directory, carbon) = device();
+    receive(&carbon, row(&carbon, &origin()));
+    let seen = Rc::new(std::cell::RefCell::new(vec![]));
+    let seeing = Rc::clone(&seen);
+    carbon.watch(ROOM, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
+    receive(&carbon, row(&carbon, &script(20, "notes", json!([{"replace": ["a", "b"]}]))));
+    receive(&carbon, row(&carbon, &script(10, "notes", json!([{"insert": "a"}]))));
+    assert_eq!(seen.borrow().last(), Some(&json!(["b"])));
+  }
+
+  #[test]
+  fn a_late_insert_of_another_row_applies_in_place_and_nothing_re_runs() {
+    let (_directory, carbon) = device();
+    receive(&carbon, row(&carbon, &origin()));
+    let seen = Rc::new(std::cell::RefCell::new(vec![]));
+    let seeing = Rc::clone(&seen);
+    carbon.watch(ROOM, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
+    receive(&carbon, row(&carbon, &script(20, "notes", json!([{"insert": "b"}]))));
+    receive(&carbon, row(&carbon, &script(10, "notes", json!([{"insert": "a"}]))));
+    // A rewind would have shown the later insert undone, then applied again.
+    assert_eq!(*seen.borrow(), vec![json!([]), json!(["b"]), json!(["a", "b"])]);
+  }
+
+  #[test]
+  fn a_late_insert_applies_in_place_before_an_edit_that_looked_up_another_row_by_its_key() {
+    let (_directory, carbon) = device();
+    receive(&carbon, row(&carbon, &origin()));
+    let seen = Rc::new(std::cell::RefCell::new(vec![]));
+    let seeing = Rc::clone(&seen);
+    carbon.watch(ROOM, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
+    receive(&carbon, row(&carbon, &script(5, "notes", json!([{"set": ["k", "first"]}]))));
+    receive(&carbon, row(&carbon, &script(20, "notes", json!([{"set": ["k", "second"]}]))));
+    receive(&carbon, row(&carbon, &script(10, "notes", json!([{"insert": "a"}]))));
+    // A rewind would have shown the edit undone, then made again.
+    assert_eq!(*seen.borrow(), vec![json!([]), json!(["first"]), json!(["second"]), json!(["a", "second"])]);
+  }
+
+  #[test]
+  fn a_call_made_after_receiving_an_op_sorts_after_it() {
+    let (_directory, carbon) = device();
+    receive(&carbon, row(&carbon, &origin()));
+    // A minute ahead of this device's clock, within how far clocks drift.
+    let future = crate::clock::wall() + 60_000;
+    receive(&carbon, row(&carbon, &script(future, "notes", json!([{"insert": "a"}]))));
+    let space = space_now(&carbon, ROOM).unwrap();
+    call_now(&carbon, &space, &Actor { identity: Some("alice".into()), device: Some("pixel".into()) }, "POST [notes]/run", json!({"do": [{"read": true}]})).unwrap();
+    let ops = oplog::entries(space.store()).unwrap();
+    assert!(ops[2].time > future);
+    assert_eq!(results::of(space.store(), &ops[2].hash).unwrap(), Some(Outcome::Applied { output: json!([["a"]]), calls: json!([]) }));
+  }
+
+  #[test]
+  fn a_row_whose_time_is_too_far_ahead_or_impossible_is_refused_unlogged_and_leaves_the_clock_alone() {
+    let (_directory, carbon) = device();
+    receive(&carbon, row(&carbon, &origin()));
+    let wall = crate::clock::wall();
+    let cases = [("too far ahead, for now", wall + 3_600_000, 425), ("never", crate::clock::NEVER, 400)];
+    for (name, time, status) in cases {
+      let refused = now(|received| carbon.receive(ROOM, row(&carbon, &script(time, "notes", json!([{"insert": "a"}]))), received));
+      assert_eq!(refused.unwrap_err().status, status, "{name}");
+    }
+    let space = space_now(&carbon, ROOM).unwrap();
+    assert_eq!(oplog::entries(space.store()).unwrap().len(), 1, "only the origin was logged");
+    let next = carbon.stamp(&Actor::default(), &Call::from_key("POST [notes]/run").unwrap(), &json!({})).time;
+    assert!(next < wall + 60_000, "the clock never took in a refused time");
   }
 }

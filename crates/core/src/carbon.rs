@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::clock::Clock;
+use crate::clock::{self, Clock};
 use crate::config::{Config, SyncMode};
 use crate::error::{Result, bad_request, not_built};
 use crate::op::stamp;
@@ -27,6 +27,7 @@ use crate::services::{Service, Services};
 use crate::space::{self, RunState, Space};
 use crate::store::Store;
 use crate::watch::Watches;
+use crate::oplog::LogRow;
 use crate::{Actor, Call, Routing, Op};
 
 // How an opened space reaches whoever asked for it.
@@ -107,7 +108,7 @@ impl Carbon {
 
   // A space on this device, opened on first use: `[space]` is set up first,
   // then `GET [space]/origin` names the services it runs, and each registered
-  // there is set up too. A service this device does not run is refused when it
+  // here is set up too. A service this device does not run is refused when it
   // is called.
   pub fn with_space(self: &Rc<Self>, id: &str, opened: Opened) {
     let cached = self.spaces.borrow().get(id).cloned();
@@ -123,40 +124,72 @@ impl Carbon {
       Err(error) => return opened(Err(error)),
     };
     let carbon = Rc::clone(self);
+    self.learn(&Rc::clone(&space), Box::new(move |learned| opened(learned.map(|_| carbon.keep_open(space)))));
+  }
+
+  // Learn the services a space's origin names and set up those this device
+  // runs. A space whose origin has not applied here yet names none.
+  pub(crate) fn learn(self: &Rc<Self>, space: &Rc<Space>, learned: Box<dyn FnOnce(Result<()>)>) {
     let origin = Call::from_key("GET [space]/origin").expect("a builtin key parses");
-    self.submit(&Rc::clone(&space), Actor::default(), origin, Value::Null, Box::new(move |origin| {
-      let named = match origin {
-        Ok(origin) => serde_json::from_value(origin.value["services"].clone()).unwrap_or_default(),
-        Err(error) if error.status == 404 => vec![],
-        Err(error) => return opened(Err(error)),
-      };
-      opened(carbon.keep_open(space, &named))
+    let (carbon, here) = (Rc::clone(self), Rc::clone(space));
+    self.submit(space, Actor::default(), origin, Value::Null, Box::new(move |origin| {
+      learned(match origin {
+        Ok(origin) => serde_json::from_value(origin.value["services"].clone()).map_err(Into::into).and_then(|named: Vec<String>| carbon.name(&here, &named)),
+        Err(error) if error.status == 404 => Ok(()),
+        Err(error) => Err(error),
+      })
     }));
   }
 
-  // Name a space's services, set up those this device runs, and keep it open.
-  fn keep_open(self: &Rc<Self>, space: Rc<Space>, named: &[String]) -> Result<Rc<Space>> {
+  // Name a space's services and set up those this device runs.
+  fn name(&self, space: &Rc<Space>, named: &[String]) -> Result<()> {
     space.name(named);
-    for service in named.iter().filter_map(|name| self.services.find(name)) {
-      space.set_up(&service)?;
-    }
+    named.iter().filter_map(|name| self.services.find(name)).try_for_each(|service| space.set_up(&service))
+  }
+
+  // Set up the services a new space's origin names, once that origin applies,
+  // for the device that created it: every one must run on this device, and a
+  // set-up that fails refuses the call that created the space.
+  pub(crate) fn set_up(self: &Rc<Self>, space: &Rc<Space>, names: &[String]) -> Result<()> {
+    self.services.require_registered(names)?;
+    self.name(space, names)
+  }
+
+  // Keep a space open, and apply what is pending in it.
+  fn keep_open(self: &Rc<Self>, space: Rc<Space>) -> Rc<Space> {
     self.spaces.borrow_mut().insert(space.id.clone(), Rc::clone(&space));
     self.drain(&space);
-    Ok(space)
+    space
   }
 
   // A new space, running only `[space]` until its origin op names the rest.
   pub(crate) fn create_space(self: &Rc<Self>, id: &str) -> Result<Rc<Space>> {
     let created = Rc::new(Space::create(&self.space_path(id), id)?);
     created.set_up(&self.services.get("space")?)?;
-    self.keep_open(created, &[])
+    Ok(self.keep_open(created))
   }
 
-  // Set up the services a new space's origin names, once that origin applies:
-  // every one must run on this device.
-  pub(crate) fn set_up(self: &Rc<Self>, space: &Rc<Space>, names: &[String]) -> Result<()> {
-    self.services.require_registered(names)?;
-    self.keep_open(Rc::clone(space), names).map(|_| ())
+  // A row another device sent for a space: once its time is admitted and its
+  // space accepts ops, the time moves this device's clock past it, and it is
+  // logged like any other op and applied in the shared order. The space is
+  // created here when its first row arrives, and learns its services once its
+  // origin applies, which every row follows.
+  pub fn receive(self: &Rc<Self>, id: &str, row: LogRow, received: Box<dyn FnOnce(Result<()>)>) {
+    if let Err(refused) = clock::admit(row.op.time, clock::wall()) {
+      return received(Err(refused));
+    }
+    let carbon = Rc::clone(self);
+    let logged: Opened = Box::new(move |space| {
+      let accepted = space.and_then(|space| crate::dispatch::accepting(&space).map(|_| space));
+      received(accepted.map(|space| {
+        carbon.clock.observe(row.op.time);
+        carbon.log(&space, row)
+      }))
+    });
+    match self.space_path(id).exists() {
+      true => Rc::clone(self).with_space(id, logged),
+      false => logged(self.create_space(id)),
+    }
   }
 
   pub fn identity(&self, slug: &str) -> Result<Identity> {

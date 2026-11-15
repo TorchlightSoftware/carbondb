@@ -1,6 +1,6 @@
 # CarbonDB first draft: implementation notes
 
-Status: agreed — single-node built (build steps 1 and 2): the whole app interface, the op log and results kept apart, per-service namespacing and init(), watches in the core, call timeouts, and a local op carrying its sub-calls on its log row; replicated mode (step 4) is next, so nothing replays sub-calls or rewinds yet
+Status: agreed — single-node built (build steps 1 and 2): the whole app interface, the op log and results kept apart, per-service namespacing and init(), watches in the core, call timeouts, and a local op carrying its sub-calls on its log row; rewind and replay built on a single device (step 4, first half): the hybrid logical clock, rows received from other devices, the in-place check, rewind by service and local ops replayed from their sub-calls, described in [docs/replication.md](../docs/replication.md); p2panda is next
 
 This is everything we agreed that the code has to honour, gathered in one place for whoever builds the first draft. The nine numbered stories say what a person can do, [services.md](services.md) lists the builtin calls, and [oplog-examples.md](oplog-examples.md) shows them in use. This file covers what happens underneath. Where older notes disagree with it, this file wins.
 
@@ -11,7 +11,7 @@ The spec is the app interface: what an app calls and what CarbonDB guarantees in
 1. **Single-node CarbonDB:** the Rust core behind napi-rs, with no p2panda, delivering the whole app interface below. Ops already go through each space's OpWriter, op log, pending ops and results, the same path synced ops will take, and each op's session changeset already says which tables it wrote.
 2. **[chat] on it:** `main()` loads CarbonDB, registers [chat] with `carbon.services.add('chat', chat)` and reaches its space through refs. [chat] stays small, resembling an ordinary backend service with minimal dependencies, with plain SQL and no build step.
 3. **A small JS HTTP adapter** in front of [chat]. Not built: the tests call a space handle directly, and an adapter is app code (see [Remote access stays outside CarbonDB](#remote-access-stays-outside-carbondb)).
-4. **Replicated mode:** rewind and p2panda spaces, switched on by config with no change to the app.
+4. **Replicated mode:** rewind and p2panda spaces, switched on by config with no change to the app. Rewind and replay are built on a single device ([docs/replication.md](../docs/replication.md)); syncing over p2panda is planned in [p2panda-sync.md](p2panda-sync.md).
 
 The hello world is create a space, post, edit, delete, list and watch, on single-node CarbonDB. Adding a member and joining (story 7) arrive with replicated mode. Richer service runtimes come later on the same app interface.
 
@@ -101,7 +101,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 
 1. `POST [@carbon]/space` runs in the context of the handle it is called on, so the new space is nested there.  This is facilitated by a `ref` record in the current space.
 2. Validity of `refs` is checked before creating the space.  If the permissions of any space reject the `ref` then the space will not be created.  In essence this means that you cannot create child spaces unless you have "manage" permission on the current space.
-3. The `[@carbon]` handler creates the space in p2panda. The space id is the hash of the local op, so a retry after a crash reaches the same space. `create_space` accepts any hash as an id.
+3. The `[@carbon]` handler creates the space in p2panda, and the space's id is the id p2panda assigns; CarbonDB does not choose it. Single-node mode, with no p2panda, assigns ids itself. Recognising a space an interrupted call already created is left to [resuming after a crash](backlog/resume-after-crash.md).
 4. The new space's first op is `POST [space]/origin`, carrying its kind, name, services and manage list. It repeats the create call's fields because the space's members may not be able to read the log it was created from.
 
 Creating a space cannot be undone. If a rewind rejects a parent's ref, the space stays, unattached. The [security review](backlog/security-review.md) revisits this.
@@ -178,20 +178,19 @@ GETs and watch re-runs use a second read-only connection in WAL mode, so they se
 
 ## Late ops and rewind
 
-- Each op's writes are recorded as a SQLite session changeset, which is both its undo record and its write set. The authorizer gives its read set, by table and column.
-- Rewind lives in its own module beside dispatch: it chooses the re-run set, inverts changesets newest first and re-runs. Inverting one changeset is a store primitive.
+- Each op's writes are recorded as a SQLite session changeset, which is both its undo record and its write set. The authorizer gives its read set by table, narrowed to one row when a statement looks it up by its whole key ([docs/replication.md](../docs/replication.md#reading-one-row-by-its-key)).
+- Rewind lives in its own module beside dispatch: it decides whether a late op fits in place and which later ops to undo; undoing a changeset is a store primitive. Each op's read set and changeset are kept with its result, never sent. How it works, precisely, is in [docs/replication.md](../docs/replication.md).
 - Taking the write set from the changeset, in single-node mode too, was chosen over the authorizer's record of written tables:
   - It is exact. The authorizer counts a table as written when a statement naming it is prepared, even one that changes no rows; a changeset holds only net row changes, so a no-op update or an insert deleted again re-runs no watch.
   - It is one record. What a watch treats as written is exactly what rewind undoes and checks for overlap, so they cannot disagree.
   - It costs a session on every op in single-node mode too, recording old values and reading each changed table's columns once per op. This is to be measured, not estimated.
   - The core's own tables, the op log and results, leave the write set, since the session leaves them out. No watch reads them.
   - A savepoint rolled back inside the transaction leaves nothing in the changeset, as the [session spike](../spikes/session-rowid/README.md) shows, so a failed nested call neither re-runs watches nor reaches rewind.
-- A late op whose reads and writes do not overlap later ops applies in place, with no rewind.
-- Otherwise the re-run set is the transitive closure: every later op that read or wrote what the late op, or an op already in the set, wrote. Those changesets are inverted newest first, the late op applies, and the set re-runs in order. A local op in the set re-runs as its sub-calls, in one transaction, never as itself (see Local ops).
-- The `append` tag is an author's promise that no handler depends on the row being absent. A late tagged op applies in place and re-runs nothing.
+- A late op is tried in place: it keeps that run when no later op wrote a table it read and no later op read or wrote a table it wrote.
+- Otherwise its run rolls back, and the later ops that touched the services it touched, widened to every service those ops touched, are undone newest first and their results forgotten; the late op applies at its place and they re-run in order, each tried in place. When the late op at its true place touches a service a remaining later op changed, the space rewinds again, wider. A local op re-runs as its sub-calls, in one transaction, never as itself (see Local ops).
+- The `append` tag is an author's promise that no handler depends on the row being absent. A late tagged op applies in place and re-runs nothing. Not built: inserts of different rows already apply in place by themselves, and today an insert still rewinds the later ops that read its table.
 - The core treats tags as opaque flags. A tagged op whose changeset holds anything but inserts is rejected on every replica. A wrong promise about reads is not detected at runtime; the test harness catches it.
 - A row's key comes from the op that creates it, never from the rows already in the table: a key SQLite assigns, a rowid or an AUTOINCREMENT id, depends on those rows, so after a rewind it can move under the row's author. After a service's `init`, the core checks every table it owns has a primary key that is not SQLite's rowid, and refuses the service with an error naming the table, what to change and why. Handlers take keys from `op.id()`, or an integer key from `DEFAULT (op_id())`, a SQL function every runtime registers that draws below 2^53. Sessions do not record schema changes, so schema changes only in `init`, outside any op.
-- A later refinement can narrow read sets to rows through QueryRunner predicates.
 
 ## Publishing
 
@@ -220,6 +219,8 @@ Every state change belongs to one class, as in the table in [README.md](README.m
 A test harness runs the same ops on two fresh databases in different delivery orders and compares state. There is no runtime detection.
 
 ## Identity and devices
+
+Being revised: devices are now added to each space directly, placed by their identity's assignment policy, so the statements below about an identity as a p2panda group change once that policy is settled (see [p2panda-sync.md](p2panda-sync.md)).
 
 - An identity is a p2panda group of its devices, so giving the identity access gives all its devices access.
 - p2panda does not implement Manage for a group, so we implement our own Manage for Identities which maps it onto each Device within the Identity.

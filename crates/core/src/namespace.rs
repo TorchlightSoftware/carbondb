@@ -10,6 +10,12 @@
 //! ships keep their names. SQLite's own tables and pragma functions describe
 //! the whole file, every service in it, so a statement naming one is refused;
 //! the authorizer refuses whatever else reaches outside the service's prefix.
+//!
+//! sqlparser is used in two modules. `parse`, here, is the one place a
+//! statement is parsed, and it has two readers: the rewrite here, and
+//! `statements`, which also tokenizes the statement to number its parameters,
+//! finds the one row it looks up by its key, and caches both per statement
+//! text. A better way to read SQL replaces only this module and `statements`.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -42,9 +48,22 @@ pub fn check_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Result<()> {
 // SQL as SQLite should run it: its text with every name the service owns
 // moved into its namespace.
 pub fn rewrite(sql: &str, prefix: &str) -> Result<String> {
-  let statements = Parser::parse_sql(&SQLiteDialect {}, sql).map_err(|error| unparsed(sql, error))?;
+  rename(sql, &parse(sql)?, prefix)
+}
+
+// A service's SQL as sqlparser reads it: the one place CarbonDB parses SQL.
+// Its two readers are `rename`, here, and `statements`, which finds the row a
+// statement looks up by its key. SQL it cannot read is refused.
+pub fn parse(sql: &str) -> Result<Vec<Statement>> {
+  Parser::parse_sql(&SQLiteDialect {}, sql).map_err(|error| unparsed(sql, error))
+}
+
+// The text of parsed SQL with every name the service owns moved into its namespace.
+pub fn rename(sql: &str, statements: &[Statement], prefix: &str) -> Result<String> {
   let mut names = Names::default();
-  let _ = statements.visit(&mut names);
+  for statement in statements {
+    let _ = statement.visit(&mut names);
+  }
   let renames = names.renames()?;
   Ok(splice(sql, &renames, prefix))
 }
