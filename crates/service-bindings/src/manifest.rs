@@ -1,13 +1,14 @@
-//! A package's `service.toml`, CarbonDB's own manifest, and the package's
-//! version, behind the `manifest` feature: a Rust package's build reads them
-//! at build time, and the core reads an npm package's when it is registered.
+//! A package's `service.toml`, CarbonDB's own manifest, behind the `manifest`
+//! feature: the core reads the one a package carries when it is registered,
+//! and packaging checks it. Also the hash of the sources a package was built
+//! from, which tells when a committed package is stale.
 //!
 //! ```toml
 //! name = "space"     # its canonical name; the name a host registers it under overrides it
 //! timeout = 200      # milliseconds every call to it must settle within; the core defaults it
 //!
 //! [[sql]]
-//! binding = "db"     # the storage it asks for; how it shapes it is its own `init`'s concern
+//! binding = "db"     # the storage it asks for; how it shapes it is its own `setup`'s concern
 //!
 //! [effects.fetch]
 //! replicate = "never" # an effect it makes: "never", the default, makes it on an op's first
@@ -17,8 +18,9 @@
 //! An effect left out of the manifest takes the defaults. A setting or a value
 //! this CarbonDB does not know is refused, so a later one is an addition.
 //!
-//! The version is the hash of every file in the package, so different code,
-//! migrations or manifest is a different version.
+//! A package's version is the hash of its bytes (`hash::of_bytes`); `version`
+//! here hashes every file in a directory, so different code, migrations or
+//! manifest hash differently.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -115,8 +117,8 @@ fn gather(root: &Path, directory: &Path, found: &mut Vec<String>) -> Result<(), 
   Ok(())
 }
 
-// The package's version: the BLAKE3 hash of each of its files, its path and
-// its bytes, in path order.
+// The hash of a directory's files: the BLAKE3 hash of each, its path and its
+// bytes, in path order.
 pub fn version(root: &Path) -> Result<String, String> {
   let mut hasher = blake3::Hasher::new();
   for file in files(root)? {
@@ -127,6 +129,13 @@ pub fn version(root: &Path) -> Result<String, String> {
     }
   }
   Ok(to_hex(hasher.finalize().as_bytes()))
+}
+
+// The hash of several directories' files: of the sources a package was built
+// from, such as a service and the bindings it builds with.
+pub fn sources(roots: &[impl AsRef<Path>]) -> Result<String, String> {
+  let versions = roots.iter().map(|root| version(root.as_ref())).collect::<Result<Vec<_>, _>>()?;
+  Ok(to_hex(blake3::hash(versions.join("\n").as_bytes()).as_bytes()))
 }
 
 #[cfg(test)]

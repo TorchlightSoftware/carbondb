@@ -1,0 +1,74 @@
+// [chat]: messages in a channel. A service is its package's service.toml,
+// its schema, set up by its `setup`, and the handlers that read and write it.
+// `carbondb-build` builds it, with its dependencies, into a component carrying
+// its service.toml, `chat.wasm`; the app names it when it registers it,
+// overriding the name in its service.toml:
+//
+//   carbon.services.add('chat', component)
+//
+// Handlers take time and ids from the op, never from the clock or a random
+// source, so every replica computes the same rows.
+
+import {z} from 'zod'
+import {forbidden, notFound, validationError} from '@tlsft/service-error'
+import {applyMigrations} from 'carbondb/migrations'
+import createMessage from '../migrations/0001_create_message.sql'
+
+// Its migrations, D1-style files in migrations/, applied by `setup` on every open.
+const migrations = [{name: '0001_create_message', sql: createMessage}]
+
+export function setup(db) {
+  applyMigrations(db, migrations)
+}
+
+// What a message call takes. Validating input is the service's own business.
+const MessageInput = z.object({text: z.string().trim().min(1).max(4000)}).strict()
+
+function parse(schema, input) {
+  const result = schema.safeParse(input)
+  if (!result.success) throw validationError('Invalid message', result.error.issues.map(({path, message}) => ({path, message})))
+  return result.data
+}
+
+// The live message an op may change: only its author may.
+function ownMessage(db, id, author) {
+  const message = db.get('SELECT author FROM message WHERE id = ? AND deleted_at IS NULL', [id])
+  if (!message) throw notFound('No such message', {id})
+  if (message.author !== author) throw forbidden('Only the author may change a message', {id})
+  return message
+}
+
+export const calls = {
+  // Posting only adds a message, so it never forces a rewind.
+  'POST [chat]/messages': {
+    tags: ['append'],
+    handler: ({input, op, env: {db}}) => {
+      const {text} = parse(MessageInput, input)
+      const id = op.id()
+      db.run('INSERT INTO message (id, author, text, sent_at) VALUES (?, ?, ?, ?)', [id, op.author, text, op.time])
+      return {id}
+    }
+  },
+
+  'PUT [chat]/messages/:id': {
+    handler: ({path, input, op, env: {db}}) => {
+      const {text} = parse(MessageInput, input)
+      ownMessage(db, path.id, op.author)
+      db.run('UPDATE message SET text = ?, edited_at = ? WHERE id = ?', [text, op.time, path.id])
+      return {id: path.id}
+    }
+  },
+
+  'DELETE [chat]/messages/:id': {
+    handler: ({path, op, env: {db}}) => {
+      ownMessage(db, path.id, op.author)
+      db.run('UPDATE message SET deleted_at = ? WHERE id = ?', [op.time, path.id])
+      return {id: path.id, deleted: true}
+    }
+  },
+
+  // A read, answered from this device's copy; never an op.
+  'GET [chat]/messages': {
+    handler: ({env: {db}}) => db.all('SELECT id, author, text, sent_at, edited_at FROM message WHERE deleted_at IS NULL ORDER BY sent_at, id')
+  }
+}

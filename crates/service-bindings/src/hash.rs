@@ -22,6 +22,11 @@ pub fn hash(value: &Value) -> String {
   blake3::hash(canonical(value).as_bytes()).to_hex().to_string()
 }
 
+// The hex BLAKE3 hash of bytes, such as a package's: its version.
+pub fn of_bytes(bytes: &[u8]) -> String {
+  blake3::hash(bytes).to_hex().to_string()
+}
+
 pub fn to_hex(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

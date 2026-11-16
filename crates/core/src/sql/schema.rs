@@ -1,4 +1,4 @@
-//! The check every service's schema passes after its `init`: each of its
+//! The check every service's schema passes after its `setup`: each of its
 //! tables takes its rows' keys from the op that creates them, never from the
 //! rows already in the table.
 //!

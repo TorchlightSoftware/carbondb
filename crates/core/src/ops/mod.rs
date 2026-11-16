@@ -3,11 +3,13 @@
 //! `oplog`), applied in the shared order with what became of it kept as its
 //! result (`results`), and undone and re-run when an op arrives late
 //! (`rewind`). What an op does outside its service's own tables are its
-//! effects (`effects`), made on its first run and replayed after. How replicas
+//! effects (`effects`), made on its first run and replayed after, an HTTP request
+//! to the outside world among them (`fetch`). How replicas
 //! order, rewind and replay ops is told in docs/replication.md.
 
 pub mod clock;
 pub mod effects;
+pub mod fetch;
 pub mod op;
 pub mod op_writer;
 pub mod oplog;

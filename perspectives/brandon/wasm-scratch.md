@@ -57,4 +57,12 @@ Yep.
 
 ---
 
-Update docs for 7 and 8.  Put 5 on the backlog.
+    The cleanup is not crash-safe
+
+Backlog it.
+
+Update docs for 7 and 8.  Put 5 and 6 on the backlog.
+
+---
+
+Recording fetch doesn't fit the effect log as it stands.

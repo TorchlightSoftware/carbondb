@@ -1,6 +1,6 @@
 # Services ship as hashed packages that declare their bindings
 
-Status: agreed — the builtins and [chat] are packages with their own service.toml and package hash, the builtins linked natively and [chat] on npm; every service table is namespaced by service and binding; the WASM host is not built
+Status: parked — superseded by the channel model's [packages.md](channels/packages.md); the WASM host and the builtins as committed components are built ([docs/wasm-services.md](../docs/wasm-services.md))
 
 ## Why
 

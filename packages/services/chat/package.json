@@ -1,7 +1,7 @@
 {
   "name": "@tlsft/carbondb-svc-chat",
   "version": "0.1.0",
-  "description": "[chat]: post, edit, delete and list messages in a space",
+  "description": "[chat]: post, edit, delete and list messages in a channel, as a CarbonDB service component",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/TorchlightSoftware/carbondb.git",
@@ -10,15 +10,29 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
+    "build": "carbondb-build src/index.js service.toml chat.wasm",
+    "pretest": "npm run build",
     "test": "node --test test/*.test.js"
-  },
-  "dependencies": {
-    "@tlsft/service-error": "^0.1.0",
-    "carbondb": "^0.1.0",
-    "zod": "^4.1.12"
   },
   "license": "MIT OR Apache-2.0",
   "publishConfig": {
     "access": "public"
+  },
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "chat.wasm",
+    "src",
+    "migrations",
+    "service.toml",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "devDependencies": {
+    "@tlsft/service-error": "^0.1.0",
+    "carbondb": "^0.1.0",
+    "zod": "^4.1.12"
   }
 }

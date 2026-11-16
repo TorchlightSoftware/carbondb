@@ -15,3 +15,7 @@ Finish the initial prototype first, then carefully consider and revise its secur
 - Dev and test mode, which keep keys in SQLite in plaintext, and the secure secret storage that production requires.
 - Adversarial members, which the design does not yet war-game.
 - Creating a space cannot be undone, and if a rewind rejects a parent's ref the space stays, unattached. Who can create spaces that outlive their attachment, and what that leaves behind.
+
+## Other Questions
+
+We now have a multi-threaded app, which compiles and caches WASM on the fly, and runs potentially untrusted service code.  This was meant to run on mobile phones, among other things.  What do we need to do to thoroughly test, so that there are no performance or security bugs that would compromise the environments we run in?

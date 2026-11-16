@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::steps::{self, Step};
-use crate::services::channel::names::slugify;
-use crate::services::identity::id_of;
+use carbondb_svc_channel::names::slugify;
+use carbondb_svc_identity::id_of;
 
 use crate::error::{Result, bad_request, conflict, internal, not_found, single_node};
 use crate::hash::hash;

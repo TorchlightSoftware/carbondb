@@ -595,8 +595,8 @@ mod effects {
   #[test]
   fn a_refused_founding_leaves_no_channel_or_service_behind() {
     let (directory, carbon) = carbon();
-    let init = Rc::new(|db: Rc<dyn Db>| db.run("CREATE TABLE IF NOT EXISTS hit (id INTEGER PRIMARY KEY)", &[]).map(|_| ()));
-    carbon.register(crate::Service::replicated("counter", "counter-v1", Some("db"), crate::testing::NOTES_TIMEOUT, init, Rc::new(|_| {}))).unwrap();
+    let setup = Rc::new(|db: Rc<dyn Db>| db.run("CREATE TABLE IF NOT EXISTS hit (id INTEGER PRIMARY KEY)", &[]).map(|_| ()));
+    carbon.register(crate::Service::replicated("counter", "counter-v1", Some("db"), crate::testing::NOTES_TIMEOUT, setup, Rc::new(|_| {}))).unwrap();
     let input = json!({"slug": "alice", "device": "Pixel9", "services": ["counter"]});
     let refused = call_now(&carbon, carbon.system(), &Actor::default(), "POST [@carbon]/identity", input).unwrap_err();
     assert_eq!(refused.details, Some(json!({"table": "hit"})));
@@ -656,6 +656,20 @@ mod deadlines {
   }
 
   #[test]
+  fn a_get_reads_committed_state_while_a_write_is_still_running() {
+    let (_directory, carbon, _timers) = timed();
+    let identity = alice(&carbon);
+    let personal = personal_notes(&carbon, &identity);
+    hung();
+    let write = later(|reply| carbon.submit(&personal, actor(&identity), crate::Call::from_key("POST [notes]/run").unwrap(), json!({"do": [{"insert": "a"}, {"hang": true}]}), reply));
+    assert_eq!(call_now(&carbon, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap().value, json!([]));
+    let [writing] = hung().try_into().ok().unwrap();
+    writing.settle(Ok(json!("done"))).unwrap();
+    assert!(write.borrow_mut().take().unwrap().is_ok());
+    assert_eq!(call_now(&carbon, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap().value, json!(["a"]));
+  }
+
+  #[test]
   fn a_call_that_settles_cancels_its_deadline() {
     let (_directory, carbon, timers) = timed();
     let identity = alice(&carbon);
@@ -665,6 +679,250 @@ mod deadlines {
     call_now(&carbon, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap();
     assert_eq!(timers.delays(), []);
     assert_eq!(texts(personal.store()).unwrap(), json!(["a"]));
+  }
+}
+
+// Components: every service but `[@carbon]` runs on the WASM host. `[probe]`
+// is a fixture component that reports what it sees of its host.
+mod components {
+  use super::*;
+  use crate::testing::{NOTES_TIMEOUT, later, timed};
+  use crate::wasm::{self, Package};
+  use carbondb_service_bindings::manifest::sources;
+  use std::path::Path;
+
+  const PROBE: &[u8] = include_bytes!("../fixtures/probe.wasm");
+
+  // A personal channel running `[probe]` beside `[notes]`.
+  fn probed() -> (tempfile::TempDir, Rc<crate::Carbon>, crate::testing::Timers, crate::Identity) {
+    let (directory, carbon, timers) = timed();
+    carbon.register(Package::read(PROBE).unwrap().service("probe")).unwrap();
+    let identity = alice(&carbon);
+    on(&carbon, &identity.personal, &identity, "POST [channel]/services", json!({"name": "probe"})).unwrap();
+    (directory, carbon, timers, identity)
+  }
+
+  fn probe(carbon: &Rc<crate::Carbon>, identity: &crate::Identity, key: &str, input: Value) -> crate::Result<Value> {
+    on(carbon, &identity.personal, identity, key, input)
+  }
+
+  #[test]
+  fn every_committed_component_was_built_from_its_sources_as_they_are() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let bindings = [root.join("crates/service-bindings/src"), root.join("crates/service-bindings/wit")];
+    for (name, directory) in [("channel", "builtins"), ("identity", "builtins"), ("probe", "fixtures")] {
+      let roots: Vec<_> = std::iter::once(root.join("crates/services").join(name)).chain(bindings.iter().cloned()).collect();
+      let built = std::fs::read_to_string(root.join("crates/core").join(directory).join(format!("{name}.source"))).unwrap();
+      assert_eq!(built.trim(), sources(&roots).unwrap(), "{name} is stale: run scripts/build-components");
+    }
+  }
+
+  #[test]
+  fn a_package_is_a_component_carrying_its_service_toml_and_versioned_by_its_bytes() {
+    let package = Package::read(PROBE).unwrap();
+    assert_eq!((package.manifest.name.as_str(), package.manifest.timeout), ("probe", Some(100)));
+    assert_eq!(package.version, crate::hash::of_bytes(PROBE));
+    let refused = [("not a component", b"plain text".to_vec()), ("a component without a service.toml", b"\0asm\x0d\x00\x01\x00".to_vec())];
+    for (why, bytes) in refused {
+      assert_eq!(Package::read(&bytes).err().map(|error| error.status), Some(400), "{why}");
+    }
+  }
+
+  #[test]
+  fn a_component_sets_up_its_tables_and_reads_and_writes_them_through_its_binding() {
+    let (_directory, carbon, _timers, identity) = probed();
+    for text in ["b", "a"] {
+      probe(&carbon, &identity, "POST [probe]/note", json!({"text": text})).unwrap();
+    }
+    assert_eq!(probe(&carbon, &identity, "GET [probe]/notes", Value::Null).unwrap(), json!([{"text": "a"}, {"text": "b"}]));
+    assert_eq!(wasm::running(), 0, "nothing is left running once calls settle");
+  }
+
+  #[test]
+  fn a_write_sees_its_ops_time_and_randomness_and_never_draws_the_same_id_twice() {
+    let (_directory, carbon, _timers, identity) = probed();
+    let seen = probe(&carbon, &identity, "POST [probe]/seen", json!({"inner": true})).unwrap();
+    let (outer, inner) = (&seen["outer"], &seen["inner"]);
+    let op = oplog::entries(service(&carbon, &identity.personal, "probe").store()).unwrap().pop().unwrap();
+    assert_eq!((&outer["clock"], &inner["clock"]), (&json!(op.time), &json!(op.time)), "every clock reads the op's time");
+    assert_eq!(outer["random"], inner["random"], "randomness is drawn from the op, the same in every instance");
+    let ids = [&outer["first"], &inner["first"], &seen["last"]].map(|id| id.as_str().unwrap().to_string());
+    assert_eq!(ids.iter().collect::<std::collections::BTreeSet<_>>().len(), 3, "draws continue across a call inside the op: {ids:?}");
+    let again = probe(&carbon, &identity, "POST [probe]/seen", json!({})).unwrap();
+    assert_ne!(again["random"], outer["random"], "another op draws other randomness");
+  }
+
+  #[test]
+  fn a_get_sees_this_devices_clock_and_draws_nothing() {
+    let (_directory, carbon, _timers, identity) = probed();
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let seen = probe(&carbon, &identity, "GET [probe]/seen", json!({})).unwrap();
+    assert!(seen["clock"].as_u64().unwrap() >= before);
+    assert_eq!(seen["first"], Value::Null);
+  }
+
+  #[test]
+  fn a_trap_refuses_its_op_and_the_next_call_runs_in_a_fresh_instance() {
+    let (_directory, carbon, _timers, identity) = probed();
+    let error = probe(&carbon, &identity, "POST [probe]/trap", json!({})).unwrap_err();
+    assert_eq!(error.status, 500);
+    assert_eq!(outcomes(&service(&carbon, &identity.personal, "probe")).last(), Some(&Err(500)));
+    probe(&carbon, &identity, "POST [probe]/note", json!({"text": "after"})).unwrap();
+    assert_eq!(probe(&carbon, &identity, "GET [probe]/notes", Value::Null).unwrap(), json!([{"text": "after"}]));
+  }
+
+  #[test]
+  fn a_component_calls_inside_its_op_and_messages_another_service_and_a_loop_back_is_refused() {
+    let (_directory, carbon, _timers, identity) = probed();
+    let inside = json!({"key": "POST [probe]/note", "input": {"text": "inside"}});
+    probe(&carbon, &identity, "POST [probe]/call", inside).unwrap();
+    let message = json!({"key": "POST [notes]/run", "input": {"do": [{"insert": "n"}, {"read": true}]}});
+    assert_eq!(probe(&carbon, &identity, "POST [probe]/call", message).unwrap(), json!([["n"]]));
+    let back = json!({"key": "POST [notes]/run", "input": {"do": [{"call": "POST [probe]/note", "input": {"text": "x"}, "catch": true}]}});
+    assert_eq!(probe(&carbon, &identity, "POST [probe]/call", back).unwrap(), json!([{"error": 508}]));
+    assert_eq!(probe(&carbon, &identity, "GET [probe]/notes", Value::Null).unwrap(), json!([{"text": "inside"}]));
+  }
+
+  #[test]
+  fn a_call_that_outlives_its_deadline_abandons_its_instance() {
+    let (_directory, carbon, timers, identity) = probed();
+    let waiting = json!({"key": "GET [notes]/hang", "input": null});
+    let answer = later(|reply| carbon.call(Some(&identity.personal), Some(&identity.id), "POST [probe]/call", waiting, reply));
+    assert!(answer.borrow().is_none());
+    assert_eq!(wasm::running(), 1);
+    assert!(timers.delays().contains(&std::time::Duration::from_millis(100)), "the probe's own timeout, beside [notes]' {NOTES_TIMEOUT:?}");
+    timers.run();
+    assert_eq!(answer.borrow_mut().take().unwrap().unwrap_err().status, 504);
+    assert_eq!(wasm::running(), 0, "the instance was dropped with its call");
+  }
+}
+
+// A service reaches the outside world over wasi:http, every request the
+// `fetch` effect: made once in a write and replayed after, made every time in
+// a GET.
+mod fetch {
+  use super::*;
+  use crate::ops::effects::Made;
+  use crate::testing::{Outside, awaited, hanging_up, timed, until};
+  use crate::wasm::Package;
+  use std::net::TcpListener;
+
+  const PROBE: &[u8] = include_bytes!("../fixtures/probe.wasm");
+
+  // A personal channel running `[probe]`, which sends requests over wasi:http.
+  fn probed() -> (tempfile::TempDir, Rc<crate::Carbon>, crate::Identity, Rc<crate::Space>) {
+    let (directory, carbon, _timers) = timed();
+    carbon.register(Package::read(PROBE).unwrap().service("probe")).unwrap();
+    let identity = alice(&carbon);
+    on(&carbon, &identity.personal, &identity, "POST [channel]/services", json!({"name": "probe"})).unwrap();
+    let probe = service(&carbon, &identity.personal, "probe");
+    (directory, carbon, identity, probe)
+  }
+
+  // `[probe]` sending these requests, all at once, in a write or a GET.
+  fn fetch(carbon: &Rc<crate::Carbon>, identity: &crate::Identity, method: &str, requests: Value) -> crate::Result<Value> {
+    let key = format!("{method} [probe]/fetch");
+    awaited(|answer| carbon.call(Some(&identity.personal), Some(&identity.id), &key, json!({"requests": requests}), answer))
+  }
+
+  // An op from alice's other device arriving late, before everything here,
+  // with the effects its first run recorded, once every op has run again: a
+  // probe that reads the notes its fetches are noted beside rewinds and runs
+  // again.
+  fn late(carbon: &Rc<crate::Carbon>, probe: &crate::Space, key: &str, input: Value, effects: Vec<Made>) {
+    let actor = Actor { identity: Some("alice".into()), device: Some("laptop".into()) };
+    let op = crate::ops::op::stamp(&actor, &crate::Call::from_key(key).unwrap(), &input, &carbon.services().version(&probe.runs.package), 1);
+    awaited(|received| carbon.receive(&probe.id, oplog::LogRow { op, effects: Some(effects) }, received)).unwrap();
+    until(|| !outcomes(probe).contains(&Err(0)));
+  }
+
+  // What the last op made of its run, and the fetches it recorded.
+  fn last(probe: &crate::Space) -> (Value, Vec<Made>) {
+    let op = oplog::entries(probe.store()).unwrap().pop().unwrap();
+    let Some(Outcome::Applied { output, .. }) = results::of(probe.store(), &op.hash).unwrap() else { panic!("applied") };
+    (output, oplog::effects(probe.store(), &op.hash).unwrap().unwrap_or_default())
+  }
+
+  fn early_note(carbon: &Rc<crate::Carbon>, probe: &crate::Space) {
+    late(carbon, probe, "POST [probe]/note", json!({"text": "early"}), vec![]);
+  }
+
+  #[test]
+  fn a_write_fetches_once_and_its_replay_after_a_rewind_gets_the_recorded_response() {
+    let (_directory, carbon, identity, probe) = probed();
+    let outside = Outside::start();
+    let answered = fetch(&carbon, &identity, "POST", json!([{"url": outside.url("/echo"), "method": "POST", "body": "sent"}])).unwrap();
+    assert_eq!(answered, json!([{"status": 200, "body": "sent"}]));
+    let (_, recorded) = last(&probe);
+    let fetched: Vec<(&str, Value, Value)> = recorded.iter().map(|made| (made.name.as_str(), made.input["body"].clone(), made.output.clone().unwrap()["body"].clone())).collect();
+    assert_eq!(fetched, [("fetch", json!("c2VudA=="), json!("c2VudA=="))], "the whole request and response, its body written after it was sent");
+
+    early_note(&carbon, &probe);
+    assert_eq!(outcomes(&probe), vec![Ok(()), Ok(())], "the rewound op ran again at its place");
+    assert_eq!(last(&probe).0, answered, "its replay got the recorded response");
+    assert_eq!(outside.asked(), ["POST /echo"], "and sent nothing");
+  }
+
+  #[test]
+  fn requests_sent_at_once_are_recorded_in_the_order_sent_whatever_order_they_answer_in() {
+    let (_directory, carbon, identity, probe) = probed();
+    let outside = Outside::start();
+    let answered = fetch(&carbon, &identity, "POST", json!([{"url": outside.url("/slow")}, {"url": outside.url("/fast")}])).unwrap();
+    assert_eq!(answered, json!([{"status": 200, "body": "slow"}, {"status": 200, "body": "fast"}]));
+    let bodies: Vec<Value> = last(&probe).1.iter().map(|made| made.output.clone().unwrap()["body"].clone()).collect();
+    assert_eq!(bodies, [json!("c2xvdw=="), json!("ZmFzdA==")], "slow, then fast, though fast answered first");
+
+    early_note(&carbon, &probe);
+    assert_eq!(last(&probe).0, answered, "the replay hands each request its own response");
+    assert_eq!(outside.asked().len(), 2);
+  }
+
+  #[test]
+  fn a_request_that_fails_is_recorded_failing_and_every_replay_meets_the_same_failure() {
+    let (_directory, carbon, identity, probe) = probed();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let answered = fetch(&carbon, &identity, "POST", json!([{"url": format!("http://{closed}/gone")}])).unwrap();
+    assert!(answered[0]["error"].as_str().unwrap().contains("connection"), "{answered}");
+    assert_eq!(last(&probe).1[0].output.clone().unwrap_err().code, "FETCH_FAILED");
+    early_note(&carbon, &probe);
+    assert_eq!(last(&probe).0, answered);
+  }
+
+  #[test]
+  fn a_replay_sending_a_request_its_first_run_never_made_finds_it_unreachable() {
+    let (_directory, carbon, _identity, probe) = probed();
+    let outside = Outside::start();
+    late(&carbon, &probe, "POST [probe]/fetch", json!({"requests": [{"url": outside.url("/hello")}]}), vec![]);
+    let (output, _) = last(&probe);
+    assert!(output[0]["error"].as_str().unwrap().contains("cannot be reached from this device"), "{output}");
+    assert_eq!(outside.asked(), Vec::<String>::new());
+  }
+
+  #[test]
+  fn an_https_request_goes_over_tls() {
+    let (_directory, carbon, identity, _probe) = probed();
+    let answered = fetch(&carbon, &identity, "GET", json!([{"url": format!("https://{}/", hanging_up())}])).unwrap();
+    assert!(answered[0]["error"].as_str().unwrap().contains("TLS error"), "a server that hangs up fails the TLS handshake: {answered}");
+  }
+
+  // The bundled root certificates verify a real server's; it needs the internet.
+  #[test]
+  #[ignore = "reaches the internet"]
+  fn an_https_request_reaches_a_server_on_the_internet() {
+    let (_directory, carbon, identity, _probe) = probed();
+    let answered = fetch(&carbon, &identity, "GET", json!([{"url": "https://example.com/"}])).unwrap();
+    assert_eq!(answered[0]["status"], json!(200), "{answered}");
+    assert!(answered[0]["body"].as_str().unwrap().contains("Example Domain"));
+  }
+
+  #[test]
+  fn a_get_fetches_every_time_and_records_nothing() {
+    let (_directory, carbon, identity, _probe) = probed();
+    let outside = Outside::start();
+    for _ in 0..2 {
+      assert_eq!(fetch(&carbon, &identity, "GET", json!([{"url": outside.url("/hello")}])).unwrap(), json!([{"status": 200, "body": "hello"}]));
+    }
+    assert_eq!(outside.asked(), ["GET /hello", "GET /hello"]);
   }
 }
 

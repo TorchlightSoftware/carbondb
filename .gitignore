@@ -3,3 +3,7 @@ target/
 .claude/scheduled_tasks.lock
 node_modules/
 publish.sh
+# Built: the WIT the carbondb package ships, and JavaScript services' components.
+packages/carbondb/wit/
+packages/carbondb/fixtures/*/*.wasm
+packages/services/*/*.wasm

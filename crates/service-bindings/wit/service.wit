@@ -1,0 +1,63 @@
+/// A CarbonDB service as a WebAssembly component: what it may ask of the
+/// core, and the calls the core makes to it. Values cross as JSON text: a
+/// query's parameters and rows, a call's input and answer, and a service
+/// error, `{status, code, message, details}`, as every failure's text.
+package carbondb:service@0.1.0;
+
+/// What a service reaches of the core, for the call it is handling.
+interface host {
+  /// How loud a message logged by the service is.
+  enum level { debug, info, warn, error }
+
+  /// A statement on the service's `sql` binding, inside the op's transaction;
+  /// `params` is a JSON array. Answers the rows it changed. A GET may not run
+  /// one. With no parameters it may hold several statements, as a migration does.
+  run: func(sql: string, params: string) -> result<u64, string>;
+
+  /// The rows a query answers, a JSON array of objects, from the op's
+  /// transaction or, for a GET, its snapshot of committed state.
+  all: func(sql: string, params: string) -> result<string, string>;
+
+  /// The next value drawn from the op the call writes within: a 64-character
+  /// hex hash, the same on every replica, never the same twice within one op.
+  /// An id is its first 32 characters; a number in [0, 1) its first 13 over 2^52.
+  draw: func() -> result<string, string>;
+
+  /// A call by service key, as the same actor: to this service, inside the
+  /// op; to another the channel names, a message to it, made as the `call`
+  /// effect. Answers the callee's answer.
+  call: async func(key: string, input: string) -> result<string, string>;
+
+  /// An effect by name, made on an op's first run and its output recorded;
+  /// every replay gets the recorded output, unless the service declares the
+  /// effect `replicate = "always"`.
+  effect: async func(name: string, input: string) -> result<string, string>;
+
+  /// A message for whoever runs this device, never part of the op.
+  log: func(level: level, message: string);
+}
+
+world service {
+  import host;
+
+  /// HTTP, the one way a service reaches the outside world, over WASI 0.2
+  /// or 0.3: Rust's HTTP libraries mostly use 0.2's outgoing handler, and
+  /// JavaScript's `fetch` 0.3's async client. The core makes each request,
+  /// whichever it came through, as the `fetch` effect: in a write, once, on
+  /// the op's first run, recording the whole response, which every replay
+  /// gets instead; in a GET, every time. The WASI interfaces are in `deps/`.
+  import wasi:http/outgoing-handler@0.2.12;
+  import wasi:http/client@0.3.0;
+
+  /// Set up the service's schema on its `sql` binding, inside a transaction
+  /// of its own, on every open: the service's `setup`. It runs to completion
+  /// before it returns.
+  export setup: func() -> result<_, string>;
+
+  /// Handle one call. `request` is `{method, resource, input, actor, op,
+  /// binding}`: `actor` is `{identity, device}`; `op`, present when the call
+  /// writes, is `{key, input, author, device, version, time, hash}`; and
+  /// `binding` is the name the service's service.toml gives its `sql`
+  /// binding. Answers the call's value, settling it once.
+  export handle: async func(request: string) -> result<string, string>;
+}

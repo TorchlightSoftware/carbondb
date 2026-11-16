@@ -3,7 +3,8 @@
 //!
 //! Every replica re-runs each op's handler, but an effect happens once: on the
 //! op's first run, on the device that made it. Its output, success or
-//! failure, is recorded in order on the op's log row, and travels with the op;
+//! failure, is recorded on the op's log row in the order the handler asked for
+//! it, whatever order the outputs came back in, and travels with the op;
 //! every later run, a replay on another device or after a rewind here, gets
 //! the recorded outputs in order instead, even when the handler now asks for
 //! something different. A replay asking for more effects than the first run
@@ -16,8 +17,8 @@
 //! recorded.
 //!
 //! The registry holds the handler for each effect by name. Single-node, this
-//! device carries out what it can alone (`call`, `create`); an effect that
-//! needs peers has no handler, and fails as unreachable.
+//! device carries out what it can alone (`call`, `create`, `fetch`); an
+//! effect that needs peers has no handler, and fails as unreachable.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -66,7 +67,8 @@ impl<'de> Deserialize<'de> for Made {
   }
 }
 
-// The effects of one op's run: on a first run, those made so far; on a
+// The effects of one op's run: on a first run, those asked for so far, each
+// in the slot it took when asked, holding its output once it came back; on a
 // replay, the recorded ones still to hand back.
 #[derive(Debug, Default)]
 pub(crate) struct EffectLog {
@@ -76,8 +78,8 @@ pub(crate) struct EffectLog {
 
 // What an effect asked for gets on this run.
 pub(crate) enum Turn {
-  // Make it: this is the op's first run, or the effect is made on every run.
-  Make,
+  // Make it, keeping its output in this slot: this is the op's first run.
+  Make(usize),
   // The output its first run recorded.
   Recorded(Result<Value>),
 }
@@ -93,24 +95,35 @@ impl EffectLog {
     self.replaying.is_none()
   }
 
-  // What the next recorded effect gets: on a replay, its recorded output, or
-  // an unreachable failure past the end of the recording.
-  pub(crate) fn next(&mut self, name: &str) -> Turn {
+  // What the next recorded effect gets: on a first run, the next slot, which
+  // holds that the effect never came back until its output does; on a
+  // replay, its recorded output, or an unreachable failure past the end of
+  // the recording.
+  pub(crate) fn next(&mut self, name: &str, input: &Value) -> Turn {
     match &mut self.replaying {
-      None => Turn::Make,
+      None => {
+        self.made.push(Made { name: name.to_string(), input: input.clone(), output: Err(unfinished(name)) });
+        Turn::Make(self.made.len() - 1)
+      }
       Some(recorded) => Turn::Recorded(recorded.pop_front().map_or_else(|| Err(beyond(name)), |made| made.output)),
     }
   }
 
-  // An effect the first run made, kept for its row.
-  pub(crate) fn keep(&mut self, made: Made) {
-    self.made.push(made);
+  // What the effect asked for in this slot was made with, and its output, kept for its row.
+  pub(crate) fn keep(&mut self, slot: usize, input: Value, output: Result<Value>) {
+    self.made[slot] = Made { input, output, ..self.made[slot].clone() };
   }
 
-  // What the first run made, in order, to write onto its row; none on a replay.
+  // What the first run made, in the order it was asked for, to write onto its row; none on a replay.
   pub(crate) fn made(&self) -> Option<&[Made]> {
     self.first_run().then_some(self.made.as_slice())
   }
+}
+
+// What an effect still out when its op's row was written records: the op
+// ended, failing or timing out, before its output came back.
+fn unfinished(name: &str) -> ServiceError {
+  ServiceError::new(503, "UNFINISHED", format!("The effect {name} had not answered when its op ended"))
 }
 
 // What a replay asking for an effect its first run never made gets.
@@ -168,18 +181,29 @@ mod tests {
   }
 
   #[test]
-  fn a_first_run_makes_its_effects_and_a_replay_hands_back_the_recorded_outputs_in_order() {
+  fn a_first_run_records_its_effects_in_the_order_it_asked_for_them() {
     let mut first = EffectLog::of(None);
-    assert!(matches!(first.next("call"), Turn::Make));
-    first.keep(made("call", Ok(json!(1))));
-    assert_eq!(first.made().unwrap().len(), 1);
+    let slots: Vec<usize> = ["call", "create", "fetch"]
+      .iter()
+      .map(|name| match first.next(name, &json!({"n": 1})) {
+        Turn::Make(slot) => slot,
+        Turn::Recorded(_) => panic!("a first run makes its effects"),
+      })
+      .collect();
+    first.keep(slots[1], json!({"n": 2}), Ok(json!("second")));
+    first.keep(slots[0], json!({"n": 1}), Ok(json!("first")));
+    let outputs: Vec<std::result::Result<Value, String>> = first.made().unwrap().iter().map(|made| made.output.clone().map_err(|error| error.code)).collect();
+    assert_eq!(outputs, [Ok(json!("first")), Ok(json!("second")), Err("UNFINISHED".to_string())], "in asked order, whatever order they came back in");
+  }
 
+  #[test]
+  fn a_replay_hands_back_the_recorded_outputs_in_order() {
     let mut replay = EffectLog::of(Some(vec![made("call", Ok(json!(1))), made("create", Err(conflict("no")))]));
     let outputs: Vec<std::result::Result<Value, u16>> = ["fetch", "call", "call"]
       .iter()
-      .map(|name| match replay.next(name) {
+      .map(|name| match replay.next(name, &Value::Null) {
         Turn::Recorded(output) => output.map_err(|error| error.status),
-        Turn::Make => panic!("a replay makes nothing"),
+        Turn::Make(_) => panic!("a replay makes nothing"),
       })
       .collect();
     assert_eq!(outputs, [Ok(json!(1)), Err(409), Err(503)], "by order, whatever the name, and unreachable past the end");

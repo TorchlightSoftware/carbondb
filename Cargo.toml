@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/node", "crates/service-bindings"]
+members = ["crates/core", "crates/node", "crates/service-bindings", "crates/services/channel", "crates/services/identity", "crates/services/probe"]
 # Spikes are standalone experiments with their own lockfiles.
 exclude = ["spikes"]
 
@@ -15,6 +15,23 @@ repository = "https://github.com/TorchlightSoftware/carbondb"
 # these with [workspace.package] version.
 carbondb = { path = "crates/core", version = "0.1.0" }
 carbondb-service-bindings = { path = "crates/service-bindings", version = "0.1.0" }
+carbondb-svc-channel = { path = "crates/services/channel" }
+carbondb-svc-identity = { path = "crates/services/identity" }
 rusqlite = { version = "=0.39.0", features = ["bundled", "hooks", "functions", "session"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Services built as WebAssembly components: small, since the core embeds the
+# builtins and every device loads each package.
+[profile.component]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Dependencies build optimized even in dev and test builds: compiling and
+# instantiating components in an unoptimized wasmtime makes every test slow.
+[profile.dev.package."*"]
+opt-level = 2

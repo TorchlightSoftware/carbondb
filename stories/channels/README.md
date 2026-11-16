@@ -77,7 +77,7 @@ The core routes every call to a service by the name its channel gives it and han
 
 - **Routing:** a service key to its handler, within the service. Validating input is the service's own business.
 - **The handler context:** the call's input and path parameters, its `sql` binding under `env`, `call` for calls of its own and `effect` for other effects, and the op, with its author and time, and ids and randomness drawn from it so every replica computes the same values.
-- **Schema:** the service's own `init` sets up its tables, for example by applying its migrations.
+- **Schema:** the service's own `setup` sets up its tables, for example by applying its migrations.
 - **Access:** whether this author may make this call. Not built: today a service checks it in its handlers.
 - **Later:** richer service runtimes, such as one that derives schema defaults from the op and builds queries from data, run on the same core.
 
@@ -148,7 +148,7 @@ Names come from the stories; the shape is what we are agreeing on.
 
 ### A service
 
-A service is a package: its `service.toml`, its schema, set up by its own `init`, and the handlers that read and write it.
+A service is a package: its `service.toml`, its schema, set up by its own `setup`, and the handlers that read and write it.
 
 ```toml
 # services/chat/service.toml
@@ -172,10 +172,10 @@ import {applyMigrations, readMigrations} from 'carbondb/migrations'
 // Its manifest, which CarbonDB reads when the app registers it.
 export const manifest = new URL('./service.toml', import.meta.url)
 
-// Its migrations are its own: D1-style files in migrations/, applied by init on every open.
+// Its migrations are its own: D1-style files in migrations/, applied by setup on every open.
 const migrations = readMigrations(new URL('./migrations/', import.meta.url))
 
-export function init(db) {
+export function setup(db) {
   applyMigrations(db, migrations)
 }
 
@@ -282,7 +282,7 @@ What the runtime registers with the core for a service, and the only shape the c
 // The core reads and validates the service.toml at manifestPath, versions the
 // package by hashing its files, and refuses a service without one.
 native.register(name, manifestPath,
-  // init(db): runs on every open, inside a transaction the core holds.
+  // setup(db): runs on every open, inside a transaction the core holds.
   initOf(chat),
   // entry(context): every call routed to the service. The context carries the
   // request {method, resource, input, op, binding} and is settled once, with

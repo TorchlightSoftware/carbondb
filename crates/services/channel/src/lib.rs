@@ -19,14 +19,15 @@ use names::{slugify, unique_slug};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-include!(concat!(env!("OUT_DIR"), "/channel_package.rs"));
+pub const PACKAGE: Package = Package { setup, entry };
 
-pub const PACKAGE: Package = Package { name: NAME, version: VERSION, binding: BINDING, timeout: TIMEOUT, always: ALWAYS, init, entry };
+#[cfg(target_arch = "wasm32")]
+carbondb_service_bindings::serve!(PACKAGE);
 
-// Its tables, set up by `init` on every open.
-const MIGRATIONS: &[migrations::Migration] = &[("0001_channel", include_str!("migrations/0001_channel.sql"))];
+// Its tables, set up by `setup` on every open.
+const MIGRATIONS: &[migrations::Migration] = &[("0001_channel", include_str!("../migrations/0001_channel.sql"))];
 
-fn init(db: &dyn Db) -> Result<()> {
+fn setup(db: &dyn Db) -> Result<()> {
   migrations::apply(db, "d1_migrations", MIGRATIONS)
 }
 

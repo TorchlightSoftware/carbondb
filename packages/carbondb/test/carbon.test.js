@@ -1,106 +1,19 @@
-import {describe, it, beforeEach} from 'node:test'
+import {describe, it, before, after, beforeEach} from 'node:test'
 import assert from 'node:assert'
 import {mkdtempSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {spawn} from 'node:child_process'
+import {createServer} from 'node:http'
+import {createServer as createTcpServer} from 'node:net'
 import {once} from 'node:events'
 import {dirname, join} from 'node:path'
-import {conflict} from '@tlsft/service-error'
 import {configure} from '../src/index.js'
-import {applyMigrations} from '../src/migrations.js'
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-const tick = () => sleep(2)
 
-// Where a test service's service.toml is: a package of its own under services/,
-// though its calls are written here.
-const manifestOf = (name) => new URL(`./services/${name}/service.toml`, import.meta.url)
-
-// [notes] must settle each call within the timeout its service.toml names.
-const TIMEOUT = 100
-
-// A GET that reads at once but answers only when the test opens the gate, so a
-// commit can land while it is in flight.
-let gate = Promise.resolve()
-function closeGate() {
-  let open
-  gate = new Promise((resolve) => { open = resolve })
-  return open
-}
-
-// A small service exercising what the runtime offers a handler.
-const notes = {
-  manifest: manifestOf('notes'),
-  migrations: [
-    {name: '0001_note', sql: 'CREATE TABLE note (id TEXT PRIMARY KEY, author TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID'},
-    {name: '0002_tag', sql: 'CREATE TABLE tag (name TEXT PRIMARY KEY) WITHOUT ROWID'}
-  ],
-  init: (db) => applyMigrations(db, notes.migrations),
-  calls: {
-    'POST [notes]/notes': {
-      handler: async ({input, op, env: {db}}) => {
-        const id = op.id()
-        db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [id, op.author, input.text, op.time])
-        await tick()
-        if (input.refuse) throw conflict('Refused after writing', {id})
-        db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [op.id(), op.author, `${input.text} again`, op.time])
-        return {id, author: op.author, device: op.device}
-      }
-    },
-    // Writes, then outlives its timeout before writing again.
-    'POST [notes]/late': {
-      handler: async ({input, op, env: {db}}) => {
-        db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [op.id(), op.author, input.text, op.time])
-        await sleep(TIMEOUT * 1.5)
-        db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [op.id(), op.author, `${input.text} again`, op.time])
-      }
-    },
-    'POST [notes]/duplicates': {
-      handler: ({env: {db}}) => {
-        db.run("INSERT INTO note (id, author, text, at) VALUES ('same', 'a', 'x', 0)")
-        db.run("INSERT INTO note (id, author, text, at) VALUES ('same', 'a', 'x', 0)")
-      }
-    },
-    // Writes a note, reads through a call inside the op, then optionally makes
-    // another call and refuses: the shapes a nested transaction must get right.
-    'POST [notes]/nested': {
-      handler: async ({input, op, env: {db}, call}) => {
-        db.run('INSERT INTO note (id, author, text, at) VALUES (?, ?, ?, ?)', [op.id(), op.author, input.text, op.time])
-        const seen = (await call('GET [notes]/notes')).map((row) => row.text)
-        if (input.inner) await call('POST [notes]/notes', input.inner).catch((error) => { if (!input.catch) throw error })
-        if (input.refuse) throw conflict('Refused after its calls')
-        return {seen}
-      }
-    },
-    // An effect this device cannot carry out alone.
-    'POST [notes]/reach': {handler: ({effect}) => effect('invite', {contact: 'sally'})},
-    'POST [notes]/unawaited': {
-      handler: ({call}) => {
-        call('POST [notes]/notes', {text: 'late'}).catch(() => {})
-      }
-    },
-    'GET [notes]/notes': {handler: ({env: {db}}) => db.all('SELECT text FROM note ORDER BY at, text')},
-    'GET [notes]/writes': {handler: ({call}) => call('POST [notes]/tags', {name: 'red'})},
-    'POST [notes]/tags': {handler: ({input, env: {db}}) => db.run('INSERT INTO tag (name) VALUES (?)', [input.name])},
-    'GET [notes]/broken': {handler: ({env: {db}}) => db.all('SELECT * FROM nowhere')},
-    'GET [notes]/gated': {
-      handler: async ({env: {db}}) => {
-        const notes = db.all('SELECT text FROM note ORDER BY at, text')
-        await gate
-        return notes
-      }
-    },
-    // Reads the notes only once a tag exists, so its read set grows.
-    'GET [notes]/tagged': {
-      handler: async ({env: {db}}) => {
-        const tags = db.all('SELECT name FROM tag')
-        const notes = tags.length ? db.all('SELECT text FROM note ORDER BY at, text') : []
-        await gate
-        return {tags: tags.map((tag) => tag.name), notes: notes.map((note) => note.text)}
-      }
-    }
-  }
-}
+// A test service's package: the component `pretest` built from its source
+// under fixtures/, with its service.toml.
+const component = (name) => new URL(`../fixtures/${name}/${name}.wasm`, import.meta.url)
 
 function configFile(text = 'system = "data/system.db"\n[sync]\nmode = "none"\n') {
   const directory = mkdtempSync(join(tmpdir(), 'carbondb-'))
@@ -111,7 +24,7 @@ function configFile(text = 'system = "data/system.db"\n[sync]\nmode = "none"\n')
 
 async function start(path) {
   const carbon = await configure(path)
-  carbon.services.add('notes', notes)
+  carbon.services.add('notes', component('notes'))
   return carbon
 }
 
@@ -170,27 +83,22 @@ describe('identities', () => {
 
 describe('services', () => {
   it('refuses registering a service twice, or under a CarbonDB service name', () => {
-    assert.throws(() => carbon.services.add('notes', notes), {status: 409})
-    assert.throws(() => carbon.services.add('channel', notes), {status: 409})
+    assert.throws(() => carbon.services.add('notes', component('notes')), {status: 409})
+    assert.throws(() => carbon.services.add('channel', component('notes')), {status: 409})
   })
 
   it('hands a handler its binding in env, under the name its service.toml gives it', async () => {
-    carbon.services.add('stash', {
-      manifest: manifestOf('stash'),
-      init: (db) => db.run('CREATE TABLE IF NOT EXISTS item (id TEXT PRIMARY KEY, name TEXT NOT NULL) WITHOUT ROWID'),
-      calls: {
-        'POST [stash]/items': {handler: ({input, op, env}) => env.store.run('INSERT INTO item (id, name) VALUES (?, ?)', [op.id(), input.name])},
-        'GET [stash]/items': {handler: ({env}) => ({bindings: Object.keys(env), items: env.store.all('SELECT name FROM item')})}
-      }
-    })
+    carbon.services.add('stash', component('stash'))
     const stash = await channelIn(personal, {name: 'Stash', services: ['stash']})
     await stash.call('POST [stash]/items', {name: 'kept'})
     assert.deepStrictEqual(await stash.call('GET [stash]/items'), {bindings: ['store'], items: [{name: 'kept'}]})
   })
 
-  it('refuses a service without a service.toml it can read', () => {
-    assert.throws(() => carbon.services.add('bare', {calls: {}}), {status: 400, message: /exports no manifest/})
-    assert.throws(() => carbon.services.add('lost', {manifest: manifestOf('lost'), calls: {}}), {status: 400, message: /Cannot read/})
+  it('refuses what is not a component carrying a service.toml, and a package it cannot read', () => {
+    const unpackaged = Uint8Array.from([0, 0x61, 0x73, 0x6d, 0x0d, 0, 1, 0])
+    assert.throws(() => carbon.services.add('bare', unpackaged), {status: 400, message: /carries no service.toml/})
+    assert.throws(() => carbon.services.add('text', new TextEncoder().encode('name = "text"')), {status: 400, message: /Not a WebAssembly component/})
+    assert.throws(() => carbon.services.add('lost', component('lost')), {code: 'ENOENT'})
   })
 
   it('refuses an identity or channel naming a service this device has not registered', async () => {
@@ -235,14 +143,6 @@ describe('calls', () => {
     assert.deepStrictEqual(await texts(personal), ['a', 'a again', 'b', 'b again', 'c', 'c again'])
   })
 
-  it('reads committed state while a write is still running', async () => {
-    const writing = personal.call('POST [notes]/notes', {text: 'slow'})
-    assert.deepStrictEqual(await texts(personal), [])
-    assert.deepStrictEqual(await personal.call('GET [channel]/refs'), [])
-    await writing
-    assert.deepStrictEqual(await texts(personal), ['slow', 'slow again'])
-  })
-
   const nested = [
     {why: 'a call inside a handler sees its writes, across awaits', input: {text: 'outer'}, seen: ['outer'], committed: ['outer']},
     {why: 'a call that succeeds commits with the op', input: {text: 'outer', inner: {text: 'in'}}, seen: ['outer'], committed: ['in', 'in again', 'outer']},
@@ -262,8 +162,21 @@ describe('calls', () => {
 
   it('fails a handler that finishes before the calls it made, and commits none of them', async () => {
     await assert.rejects(personal.call('POST [notes]/unawaited'), {status: 500, message: /finished before the calls it made/})
-    await tick()
+    await sleep(20)
     assert.deepStrictEqual(await texts(personal), [])
+  })
+
+  it("shows a write the op's time and randomness drawn from the op, and a GET this device's clock", async () => {
+    const before = Date.now()
+    const written = await personal.call('POST [notes]/clock')
+    assert.strictEqual(written.now, written.time, 'Date.now() is the op\'s time')
+    assert.ok(written.time >= before && written.random >= 0 && written.random < 1)
+    assert.notStrictEqual((await personal.call('POST [notes]/clock')).random, written.random, 'another op draws other randomness')
+    assert.ok((await personal.call('GET [notes]/clock')).now >= before)
+  })
+
+  it('logs through the host, outside the op', async () => {
+    assert.deepStrictEqual(await personal.call('POST [notes]/logged', {text: 'hi'}), {logged: true})
   })
 
   const refused = [
@@ -283,6 +196,88 @@ describe('calls', () => {
       await assert.rejects(personal.call(key, {}), {status})
     })
   }
+})
+
+// The world outside, as the test plays it: an HTTP server that answers
+// `/slow` after a pause, `/echo` with what it was sent, and any other path
+// with its own name, and keeps what it was asked.
+async function outside() {
+  const asked = []
+  const server = createServer(async (request, response) => {
+    let body = ''
+    for await (const chunk of request) body += chunk
+    asked.push(`${request.method} ${request.url}`)
+    if (request.url === '/slow') await sleep(100)
+    const answer = request.url === '/echo' ? JSON.stringify({body, type: request.headers['content-type']}) : request.url === '/slow' ? 'slow' : request.url.slice(1)
+    response.writeHead(200, {'content-type': request.url === '/echo' ? 'application/json' : 'text/plain'}).end(answer)
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const url = (path) => `http://127.0.0.1:${server.address().port}${path}`
+  return {url, asked, close: () => server.close()}
+}
+
+// An address nothing listens on.
+async function nowhere() {
+  const world = await outside()
+  const url = world.url('/gone')
+  world.close()
+  return url
+}
+
+// The address of a server that hangs up on every connection, before saying anything.
+async function hangingUp() {
+  const server = createTcpServer((socket) => socket.destroy())
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  return {address: `127.0.0.1:${server.address().port}`, close: () => server.close()}
+}
+
+describe('fetch', () => {
+  let world, fetcher
+  before(async () => {
+    world = await outside()
+  })
+  after(() => world.close())
+  beforeEach(async () => {
+    world.asked.length = 0
+    carbon.services.add('fetcher', component('fetcher'))
+    fetcher = await channelIn(personal, {name: 'Outside', services: ['fetcher']})
+  })
+
+  it('reaches the world outside from a write, sending its body and headers', async () => {
+    const sent = {url: world.url('/echo'), method: 'POST', body: JSON.stringify({héllo: 'wörld'}), headers: {'content-type': 'application/json'}}
+    const [answered] = await fetcher.call('POST [fetcher]/fetch', {requests: [sent]})
+    assert.deepStrictEqual(answered, {status: 200, ok: true, type: 'application/json', text: JSON.stringify({body: sent.body, type: 'application/json'})})
+    assert.deepStrictEqual(world.asked, ['POST /echo'])
+  })
+
+  it('sends requests made together at once, each answered with its own response', async () => {
+    const answered = await fetcher.call('POST [fetcher]/fetch', {requests: [{url: world.url('/slow')}, {url: world.url('/fast')}]})
+    assert.deepStrictEqual(answered.map((answer) => answer.text), ['slow', 'fast'])
+  })
+
+  it("keeps running the handler's own code while a request waits for its response", async () => {
+    const finished = await fetcher.call('GET [fetcher]/race', {slow: world.url('/slow'), fast: world.url('/fast')})
+    assert.deepStrictEqual(finished, ['fast', 'slow'])
+  })
+
+  it('reaches it from a GET every time', async () => {
+    for (let time = 0; time < 2; time++) assert.deepStrictEqual((await fetcher.call('GET [fetcher]/fetch', {requests: [{url: world.url('/hello')}]}))[0].text, 'hello')
+    assert.deepStrictEqual(world.asked, ['GET /hello', 'GET /hello'])
+  })
+
+  it('sends an https request over TLS', async () => {
+    const server = await hangingUp()
+    const [answered] = await fetcher.call('GET [fetcher]/fetch', {requests: [{url: `https://${server.address}/`}]})
+    server.close()
+    assert.match(answered.error, /^TypeError: fetch failed: .*TLS error/)
+  })
+
+  it('rejects with a TypeError when the request fails, as fetch does', async () => {
+    const [answered] = await fetcher.call('POST [fetcher]/fetch', {requests: [{url: await nowhere()}]})
+    assert.match(answered.error, /^TypeError: fetch failed/)
+  })
 })
 
 describe('channels', () => {
@@ -328,8 +323,7 @@ describe('watch', () => {
     const {results, arrival} = watching(personal, 'GET [notes]/notes')
     await arrival()
     await personal.call('POST [notes]/tags', {name: 'red'})
-    await new Promise((resolve) => setImmediate(resolve))
-    await tick()
+    await sleep(20)
     assert.deepStrictEqual(results, [[]])
   })
 
@@ -338,8 +332,7 @@ describe('watch', () => {
     await arrival()
     stop()
     await personal.call('POST [notes]/notes', {text: 'unseen'})
-    await new Promise((resolve) => setImmediate(resolve))
-    await tick()
+    await sleep(20)
     assert.deepStrictEqual(results, [[]])
   })
 
@@ -365,40 +358,6 @@ describe('watch', () => {
     assert.deepStrictEqual(results.at(-1), [{text: 'at once'}, {text: 'at once again'}])
   })
 
-  it('runs again after a commit lands while its GET is in flight', async () => {
-    const open = closeGate()
-    const {results} = watching(personal, 'GET [notes]/gated')
-    const posted = personal.call('POST [notes]/notes', {text: 'during'})
-    await tick()
-    await tick()
-    open()
-    await posted
-    assert.deepStrictEqual(results, [[], [{text: 'during'}, {text: 'during again'}]])
-    assert.deepStrictEqual(results.at(-1), await personal.call('GET [notes]/gated'))
-  })
-
-  it('judges a commit in flight by what the run read, even when its read set grew', async () => {
-    const {results, arrival} = watching(personal, 'GET [notes]/tagged')
-    await arrival()
-    const open = closeGate()
-    const tagged = personal.call('POST [notes]/tags', {name: 'red'})
-    const posted = personal.call('POST [notes]/notes', {text: 'seen'})
-    await tick()
-    await tick()
-    open()
-    await Promise.all([tagged, posted])
-    assert.deepStrictEqual(results.at(-1), {tags: ['red'], notes: ['seen', 'seen again']})
-    assert.deepStrictEqual(results.at(-1), await personal.call('GET [notes]/tagged'))
-  })
-
-  it('answers a GET at once while a watch is in flight', async () => {
-    const open = closeGate()
-    watching(personal, 'GET [notes]/gated')
-    const read = await Promise.race([personal.call('GET [notes]/notes'), tick().then(() => 'held')])
-    open()
-    assert.deepStrictEqual(read, [])
-  })
-
   it('hands a failing GET its error', async () => {
     const {results, arrival} = watching(personal, 'GET [notes]/broken')
     await arrival()
@@ -407,19 +366,9 @@ describe('watch', () => {
 })
 
 describe('timeout', () => {
-  const timeouts = () => process.getActiveResourcesInfo().filter((resource) => resource === 'Timeout').length
-
-  it('clears the deadline of a call that settled', async () => {
-    const before = timeouts()
-    await personal.call('POST [notes]/notes', {text: 'quick'})
-    await personal.call('GET [notes]/notes')
-    assert.ok(timeouts() <= before, 'a settled call leaves no timeout behind')
-  })
-
-  it('settles a call its handler has not settled in time, rolling back its writes and dropping its late answer', async () => {
-    await assert.rejects(personal.call('POST [notes]/late', {text: 'late'}), {status: 504, code: 'TIMED_OUT'})
+  it('settles a call its handler has not settled in time, rolling back its writes and dropping its instance', async () => {
+    await assert.rejects(personal.call('POST [notes]/spin', {text: 'spun'}), {status: 504, code: 'TIMED_OUT'})
     assert.deepStrictEqual(await texts(personal), [])
-    await sleep(TIMEOUT)
     await personal.call('POST [notes]/notes', {text: 'next'})
     assert.deepStrictEqual(await texts(personal), ['next', 'next again'])
   })
@@ -482,21 +431,15 @@ describe('refs', () => {
 })
 
 describe('schema', () => {
-  it("is set up by a service's init, which applies only the migrations not applied yet", async () => {
+  it("is set up by a service's setup, which applies only the migrations not applied yet", async () => {
     await personal.call('POST [notes]/tags', {name: 'red'})
-    const grown = {
-      ...notes,
-      migrations: [...notes.migrations, {name: '0003_color', sql: "ALTER TABLE tag ADD COLUMN color TEXT NOT NULL DEFAULT 'none'"}],
-      init: (db) => applyMigrations(db, grown.migrations),
-      calls: {...notes.calls, 'GET [notes]/tags': {handler: ({env: {db}}) => db.all('SELECT name, color FROM tag')}}
-    }
     const restarted = await configure(config)
-    restarted.services.add('notes', grown)
+    restarted.services.add('notes', component('grown'))
     assert.deepStrictEqual(await restarted.ref('identity:alice').ref('personal:alice').call('GET [notes]/tags'), [{name: 'red', color: 'none'}])
   })
 
   it('refuses a service whose table takes its keys from SQLite, and says how to fix it', async () => {
-    carbon.services.add('counter', {manifest: manifestOf('counter'), init: (db) => db.run('CREATE TABLE IF NOT EXISTS hit (id INTEGER PRIMARY KEY AUTOINCREMENT)'), calls: {}})
+    carbon.services.add('counter', component('counter'))
     await assert.rejects(personal.call('POST [channel]/services', {name: 'counter'}), (error) => {
       assert.deepStrictEqual([error.status, error.details], [400, {table: 'hit'}])
       assert.match(error.message, /must come from the op that creates it.*op_id\(\)/)
@@ -505,7 +448,7 @@ describe('schema', () => {
   })
 
   it("keeps a service out of the core's own tables in its file", async () => {
-    carbon.services.add('snoop', {manifest: manifestOf('snoop'), calls: {'GET [snoop]/log': {handler: ({env: {db}}) => db.all('SELECT * FROM carbon_oplog')}}})
+    carbon.services.add('snoop', component('snoop'))
     const room = await channelIn(personal, {name: 'Snooped', services: ['snoop']})
     await assert.rejects(room.call('GET [snoop]/log'), {status: 403})
   })

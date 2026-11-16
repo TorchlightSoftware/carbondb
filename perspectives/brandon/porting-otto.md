@@ -37,6 +37,10 @@ Otto is a private service platform of ours, on Cloudflare Workers. It is what Ca
 
 Otto's `Service.fetch(request, ctx)` in `core/candle-service/src/service.ts` is a request-to-response function, and Cloudflare or host-node does the listening. A CarbonDB HTTP adapter has the same shape.
 
+## No Node inside the boundary
+
+To explore: a JavaScript service runs in QuickJS inside a WebAssembly component, not in Node. It has no Node built-ins (`http`, `undici`, `node:crypto`, `Buffer`, streams) and no web APIs of its own (`URL`, `TextEncoder`, `Request`), only the globals `carbondb/service` installs: `console`, `fetch` with small `Headers` and `Response`, and `Math.random` drawn from the op. Workers run on V8 with web APIs and partial Node compatibility, so each Otto service needs an audit of what it imports, directly and through its dependencies, and of which gaps `carbondb/service` should fill, which should be bundled shims, and which code must change.
+
 ## Offline cutoffs
 
 Otto's `audit.ts` had a 90-day drop window measured by the receiver's clock. Clocks differ between replicas, so on CarbonDB that window would make them disagree about which ops to refuse.

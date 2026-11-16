@@ -65,9 +65,11 @@ export class ChannelHandle {
     return () => this.#native.unwatch(id)
   }
 
-  // Resume a service once the system failure that stopped it is fixed by hand.
+  // Resume a service once the system failure that stopped it is fixed by
+  // hand; resolves once the watches on it have run again.
   resume(service = 'channel') {
-    core(() => this.#native.resume(this.#service(service)))
+    const space = this.#service(service)
+    return answered((reply) => this.#native.resume(space, reply))
   }
 
   // The id of a service this channel names, by its name.

@@ -19,6 +19,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -49,10 +51,18 @@ pub type Schedule = Rc<dyn Fn(Duration, Box<dyn FnOnce()>) -> Cancel>;
 // Cancels something scheduled, if it has not run yet.
 pub type Cancel = Box<dyn FnOnce()>;
 
+// Something the core runs to completion on its thread, such as a component's call.
+pub type Task = Pin<Box<dyn Future<Output = ()>>>;
+
+// How the host runs a task on the core's thread, handing back a way to drop it
+// before it finishes.
+pub type Spawn = Rc<dyn Fn(Task) -> Cancel>;
+
 pub struct Carbon {
   config: Config,
   clock: Clock,
   schedule: Schedule,
+  spawn: Spawn,
   services: Services,
   effects: Effects,
   system: Rc<Space>,
@@ -61,20 +71,21 @@ pub struct Carbon {
 }
 
 impl Carbon {
-  pub fn open(config_path: &Path, schedule: Schedule) -> Result<Rc<Carbon>> {
+  pub fn open(config_path: &Path, schedule: Schedule, spawn: Spawn) -> Result<Rc<Carbon>> {
     let config = Config::load(config_path)?;
     if config.sync != SyncMode::None {
       return Err(not_built("Replicated mode"));
     }
     std::fs::create_dir_all(config.directory()).map_err(|error| bad_request(format!("Cannot create {}: {error}", config.directory().display())))?;
-    let services = Services::builtin();
+    let services = Services::builtin()?;
     let system = Rc::new(Space::root(Store::open(&config.system)?, local::SYSTEM_MIGRATIONS, services.get("carbon")?)?);
     let carbon = Rc::new(Carbon {
       config,
       clock: Clock::default(),
       schedule,
+      spawn,
       services,
-      effects: Effects::default().with("call", Rc::new(call_effect)).with("create", Rc::new(create_effect)),
+      effects: Effects::default().with("call", Rc::new(call_effect)).with("create", Rc::new(create_effect)).with("fetch", Rc::new(crate::ops::fetch::fetch_effect)),
       system,
       spaces: RefCell::default(),
       watches: Watches::default(),
@@ -105,6 +116,11 @@ impl Carbon {
       self.drain(&space);
     }
     Ok(())
+  }
+
+  // Run a task on the core's thread, unless dropped first.
+  pub(crate) fn spawn(&self, task: Task) -> Cancel {
+    (self.spawn)(task)
   }
 
   // Run something once a delay has passed, unless cancelled first.

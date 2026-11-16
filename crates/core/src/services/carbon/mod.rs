@@ -34,7 +34,7 @@ pub fn service() -> Service {
     binding: None,
     timeout: crate::services::DEFAULT_TIMEOUT,
     always: vec![],
-    init: Rc::new(|_: Rc<dyn Db>| Ok(())),
+    setup: Rc::new(|_: Rc<dyn Db>| Ok(())),
     entry: Rc::new(entry),
   }
 }

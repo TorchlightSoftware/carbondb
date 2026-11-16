@@ -220,18 +220,22 @@ impl Carbon {
 
   // Move a space to a RunState and tell whoever listens. Stopping or resuming
   // changes what every GET answers, so every watch on it runs again.
-  pub(crate) fn set_run_state(self: &Rc<Self>, space: &Space, state: RunState) {
+  // Returns the watches it ran again.
+  pub(crate) fn set_run_state(self: &Rc<Self>, space: &Space, state: RunState) -> Vec<WatchId> {
     let stopping_or_resuming = is_stopped(&space.run_state()) != is_stopped(&state);
     space.set_run_state(state.clone());
     for listener in self.watches.listening(&space.id) {
       listener(&state);
     }
-    if stopping_or_resuming {
-      for (_, watch) in self.watches.on(&space.id) {
-        watch.reads.replace_with(|reads| reads.outdated());
-        self.rerun(&watch);
-      }
+    if !stopping_or_resuming {
+      return vec![];
     }
+    let watches = self.watches.on(&space.id);
+    for (_, watch) in &watches {
+      watch.reads.replace_with(|reads| reads.outdated());
+      self.rerun(watch);
+    }
+    watches.into_iter().map(|(id, _)| id).collect()
   }
 
   // Run a watch's GET when a commit since its last run started wrote what it read.

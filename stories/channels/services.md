@@ -1,6 +1,8 @@
 # Channels and services
 
-How apps and services talk to CarbonDB: the things they reach, and the calls each builtin service answers. Every output shown is provisional.
+The goal is to make setting up a project planning board, a CRM, or bookkeeping, as easy as starting a group chat.
+
+In order to accomplish this: CarbonDB's runs "services" which implement application functionality.  Services exist in "channels" together where they can communicate with each other.  Services can be accessed by any members in the channel.
 
 ## Concepts
 
@@ -22,7 +24,7 @@ await foocorp.call('POST [chat]/messages', {text: 'hi'})
 
 ## [@carbon]
 
-This device's own service: what needs this device's keys or its own settings. It founds and lists identities on `carbon`; on a channel's handle, acting as that handle's identity, it reads the status of, syncs, or deletes this device's copy of the channel, or of one `service` the channel names.
+A local builtin service that manages cryptographic identities and system calls.
 
 | Call | Input | Output |
 |---|---|---|
@@ -34,7 +36,7 @@ This device's own service: what needs this device's keys or its own settings. It
 
 ## [identity]
 
-Called on an identity's handle, by its own devices.
+A replicated service shared between all the devices that belong to an identity.
 
 | Call | Input | Output |
 |---|---|---|
@@ -45,7 +47,7 @@ Called on an identity's handle, by its own devices.
 
 ## [channel]
 
-Called on a channel's handle. Any member may make its GETs; its POSTs need `manage` on the channel. An identity's own channel is sealed when it is founded, holding only its pointer to the personal channel, and refuses every POST after that.
+Channels create shared spaces that mediate access to services.  [channel] itself is a replicated service which offers controls and information pertaining to the channel it is hosted in.
 
 | Call | Input | Output |
 |---|---|---|

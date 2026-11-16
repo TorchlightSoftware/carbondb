@@ -10,18 +10,25 @@ keywords = ["carbondb", "local-first", "sqlite", "service"]
 categories = ["database"]
 
 [features]
-# A package's service.toml and version, for the core, which reads an npm
-# package's at registration.
+# A package's service.toml and the hash of its sources, for the core, which
+# reads a package's manifest at registration, and for packaging.
 manifest = ["dep:toml"]
-# Packaging, for a service's build script: list the crate under
-# [build-dependencies] with this feature, so toml stays out of its runtime.
-build = ["manifest"]
+# Exporting a Rust service as a WebAssembly component, for a service crate
+# built for wasm32-wasip2. Its world's WASI imports are the `wasip2` crate's,
+# which Rust HTTP libraries on wasi:http build on.
+guest = ["dep:wit-bindgen", "dep:wasip2"]
 
 [dependencies]
 blake3 = "1.8.7"
 serde.workspace = true
 serde_json.workspace = true
 toml = { version = "1.1.8", optional = true }
+wit-bindgen = { version = "0.63.0", optional = true, features = ["async-spawn"] }
+wasip2 = { version = "1.0.4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bin]]
+name = "carbondb-package"
+required-features = ["manifest"]

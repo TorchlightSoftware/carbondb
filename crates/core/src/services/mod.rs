@@ -3,44 +3,42 @@
 //! services the runtime registers at startup. A service is its name, whether
 //! it is local (`[@name]`, run once on this device) or replicated, its
 //! version, its `sql` binding, the time every call to it must settle within,
-//! the effects it makes again on every run, the `init` that sets up its
+//! the effects it makes again on every run, the `setup` that sets up its
 //! schema, and its entry point. Each space runs one service; CarbonDB routes a
 //! call to that service's entry point, which routes method and resource itself.
 //!
-//! An npm service is registered from its package's `service.toml`, under the
-//! name the app gives it, which overrides the canonical name in the manifest.
+//! Every service but `[@carbon]` is a package, a component the WASM host runs
+//! (`crate::wasm`), registered under the name the app gives it, which
+//! overrides the canonical name in its service.toml.
 
 pub mod carbon;
-pub mod channel;
-pub mod identity;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use carbondb_service_bindings::manifest::{self, Manifest};
 use serde_json::json;
 
 use crate::error::{Result, bad_request, conflict, not_found};
 use crate::service_call::ServiceCall;
-use crate::{Db, HandlerContext, Package};
+use crate::wasm::Package;
+use crate::{Db, HandlerContext};
 
-// The packages CarbonDB ships, linked into the library. Each is a directory of
-// this module, with its own service.toml and migrations, written against
-// ServiceBindings alone as a package of its own would be; the build script
-// packages each.
-const BUILTINS: [Package; 2] = [channel::PACKAGE, identity::PACKAGE];
+// The packages CarbonDB ships, embedded in the library as the components
+// `scripts/build-builtins` built and packaged from `crates/services/`. Each
+// is versioned by the hash of its bytes, so devices on different releases of
+// CarbonDB agree whenever a builtin is unchanged.
+pub const BUILTINS: [(&str, &[u8]); 2] = [("channel", include_bytes!("../../builtins/channel.wasm")), ("identity", include_bytes!("../../builtins/identity.wasm"))];
 
 // How long a call to a service may take to settle when its service.toml names no timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
 
 // What sets up a service's schema, given its `db` binding.
-pub type Init = Rc<dyn Fn(Rc<dyn Db>) -> Result<()>>;
+pub type Setup = Rc<dyn Fn(Rc<dyn Db>) -> Result<()>>;
 
-// An entry point written against ServiceBindings: a package linked into the
-// library, or one hosted by a runtime, such as npm.
+// An entry point written against ServiceBindings, running here as host code,
+// as the core's tests run theirs; a package's runs on the WASM host.
 pub type Entry = Rc<dyn Fn(Rc<dyn HandlerContext>)>;
 
 pub struct Service {
@@ -54,13 +52,13 @@ pub struct Service {
   // The effects it makes again on every run of an op, by name; every other is
   // made on an op's first run only.
   pub always: Vec<String>,
-  pub init: Init,
+  pub setup: Setup,
   // Every service but `[@carbon]` sees its service call only as a handler context.
   pub(crate) entry: Rc<dyn Fn(Rc<ServiceCall>)>,
 }
 
 impl Service {
-  pub fn replicated(name: &str, version: &str, binding: Option<&str>, timeout: Duration, init: Init, entry: Entry) -> Service {
+  pub fn replicated(name: &str, version: &str, binding: Option<&str>, timeout: Duration, setup: Setup, entry: Entry) -> Service {
     Service {
       name: name.into(),
       local: false,
@@ -68,42 +66,9 @@ impl Service {
       binding: binding.map(str::to_string),
       timeout,
       always: vec![],
-      init,
+      setup,
       entry: Rc::new(move |call: Rc<ServiceCall>| entry(call)),
     }
-  }
-
-  fn package(package: &Package) -> Service {
-    let (init, entry) = (package.init, package.entry);
-    let service = Service::replicated(package.name, package.version, package.binding, timeout(package.timeout), Rc::new(move |db: Rc<dyn Db>| init(db.as_ref())), Rc::new(entry));
-    Service { always: package.always.iter().map(|name| name.to_string()).collect(), ..service }
-  }
-
-  // An npm package's service, registered under `name`.
-  pub fn npm(name: &str, package: &NpmPackage, init: Init, entry: Entry) -> Service {
-    let service = Service::replicated(name, &package.version, package.binding.as_deref(), package.timeout, init, entry);
-    Service { always: package.always.clone(), ..service }
-  }
-}
-
-// An npm package as the core reads it, from the service.toml its module points
-// to: the binding its handlers receive, its timeout, the effects it makes
-// again on every run, and its version, the hash of every file beside its
-// service.toml.
-pub struct NpmPackage {
-  pub binding: Option<String>,
-  pub timeout: Duration,
-  pub always: Vec<String>,
-  pub version: String,
-}
-
-impl NpmPackage {
-  // The package of the service registered as `name`, refused when it exports no manifest.
-  pub fn read(name: &str, manifest: Option<&Path>) -> Result<NpmPackage> {
-    let path = manifest.ok_or_else(|| bad_request(format!("Service '{name}' exports no manifest, the URL of its service.toml")))?;
-    let read = Manifest::read(path).map_err(bad_request)?;
-    let version = manifest::version(path.parent().unwrap_or(path)).map_err(bad_request)?;
-    Ok(NpmPackage { binding: read.binding().map(str::to_string), timeout: timeout(read.timeout), always: read.replicated_always(), version })
   }
 }
 
@@ -114,12 +79,13 @@ pub struct Services {
 
 impl Services {
   // The services every CarbonDB starts with.
-  pub fn builtin() -> Services {
+  pub fn builtin() -> Result<Services> {
     let services = Services::default();
-    for service in std::iter::once(carbon::service()).chain(BUILTINS.iter().map(Service::package)) {
-      services.register(service).expect("builtin names are distinct");
+    services.register(carbon::service())?;
+    for (name, bytes) in BUILTINS {
+      services.register(Package::read(bytes)?.service(name))?;
     }
-    services
+    Ok(services)
   }
 
   pub fn register(&self, service: Service) -> Result<Rc<Service>> {
@@ -159,7 +125,7 @@ impl Services {
 }
 
 // A service's timeout, from the milliseconds its service.toml names.
-fn timeout(milliseconds: Option<u64>) -> Duration {
+pub(crate) fn timeout(milliseconds: Option<u64>) -> Duration {
   milliseconds.map_or(DEFAULT_TIMEOUT, Duration::from_millis)
 }
 
@@ -187,7 +153,7 @@ mod tests {
 
   #[test]
   fn starts_with_the_builtins_and_registers_each_name_once() {
-    let services = Services::builtin();
+    let services = Services::builtin().unwrap();
     let builtins: Vec<(String, bool, Option<String>)> =
       ["carbon", "channel", "identity"].iter().map(|name| services.get(name).unwrap()).map(|service| (service.name.clone(), service.local, service.binding.clone())).collect();
     let db = || Some("db".to_string());
@@ -201,43 +167,10 @@ mod tests {
 
   #[test]
   fn names_what_is_missing() {
-    let services = Services::builtin();
+    let services = Services::builtin().unwrap();
     assert!(services.require_registered(&["channel".into()]).is_ok());
     let error = services.require_registered(&["channel".into(), "crm".into()]).unwrap_err();
     assert_eq!((error.status, error.details), (400, Some(json!({"services": ["crm"]}))));
     assert_eq!(services.get("crm").err().unwrap().details, Some(json!({"service": "crm"})));
-  }
-
-  // An npm package on disk: its service.toml and a handler file.
-  fn package(manifest: &str) -> tempfile::TempDir {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("service.toml"), manifest).unwrap();
-    std::fs::write(root.path().join("index.js"), "export const calls = {}").unwrap();
-    root
-  }
-
-  fn npm(name: &str, manifest: Option<&Path>) -> Result<Service> {
-    Ok(Service::npm(name, &NpmPackage::read(name, manifest)?, Rc::new(|_: Rc<dyn Db>| Ok(())), Rc::new(|_| {})))
-  }
-
-  #[test]
-  fn registers_an_npm_service_from_its_service_toml_under_the_name_the_app_gives_it() {
-    let chat = package("name = \"chat\"\ntimeout = 50\n[[sql]]\nbinding = \"db\"\n[effects.fetch]\nreplicate = \"always\"\n");
-    let manifest = chat.path().join("service.toml");
-    let service = npm("lobby", Some(&manifest)).unwrap();
-    assert_eq!((service.name.as_str(), service.binding.as_deref(), service.timeout), ("lobby", Some("db"), Duration::from_millis(50)));
-    assert_eq!(service.always, ["fetch"]);
-    assert_eq!(service.version, manifest::version(chat.path()).unwrap());
-    let plain = package("name = \"plain\"\n");
-    assert_eq!(npm("plain", Some(&plain.path().join("service.toml"))).unwrap().timeout, DEFAULT_TIMEOUT);
-  }
-
-  #[test]
-  fn refuses_an_npm_service_without_a_service_toml_it_can_read() {
-    let unknown = package("name = \"chat\"\nenv = \"production\"\n");
-    let cases = [("no manifest", None), ("a manifest that is not there", Some(unknown.path().join("missing.toml"))), ("a field it does not know", Some(unknown.path().join("service.toml")))];
-    for (why, manifest) in cases {
-      assert_eq!(npm("chat", manifest.as_deref()).err().unwrap().status, 400, "{why}");
-    }
   }
 }

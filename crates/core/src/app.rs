@@ -60,6 +60,19 @@ fn about(channel: &str, input: Value) -> Result<Value> {
 }
 
 impl Carbon {
+  // Resume a service a system failure stopped, once the failure is fixed;
+  // answers once the watches on it have run again.
+  pub fn resume_space(self: &Rc<Self>, space: &str, answer: Answer) {
+    let carbon = Rc::clone(self);
+    Rc::clone(self).with_space(space, Box::new(move |opened| match opened {
+      Ok(space) => {
+        let rerun = carbon.resume(&space);
+        carbon.when_run(rerun, Box::new(move || answer(Ok(Value::Null))));
+      }
+      Err(error) => answer(Err(error)),
+    }));
+  }
+
   // Who acts for a call from the app: an identity on this device, from the
   // device it holds here; or no one.
   pub fn actor(&self, identity: Option<&str>) -> Result<Actor> {

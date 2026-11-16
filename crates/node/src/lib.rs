@@ -1,352 +1,161 @@
 //! Node bindings for the CarbonDB core. This is the internal seam between the
 //! core and the JS runtime; apps never call it.
 //!
-//! The core routes every call; the binding only translates. Everything runs on
-//! the JS thread, in callback style:
+//! The core runs on a thread of its own (`carbondb::Runtime`), and every
+//! service runs inside it as a WebAssembly component, so no service code runs
+//! on Node's thread. The binding only passes work and answers across:
 //!
 //! - JS makes a call with `call`, by its service key and as an identity, and
-//!   the core answers through the callback it was given, `(error, value)`,
-//!   once the op applies and the watches it touched have run again.
+//!   the core answers it once the op applies and the watches it touched have
+//!   run again.
 //! - JS watches a GET or a space's RunState with `watch` and `watchRunState`,
-//!   and the core calls the listener it was given with each answer, until
-//!   `unwatch`. The core keeps every watch; JS only hands answers to the app.
-//! - JS registers an npm service with `register`: the path of its package's
-//!   `service.toml`, which the core reads; its `init`, which the core calls
-//!   with the service's `sql` binding to set up its schema; and its entry point,
-//!   which the core calls with a `HandlerContext` for each call to it.
-//!   The entry point settles that context once, when its handler's Promise
-//!   settles. Until then the handler's synchronous `run`, `get` and `all`
-//!   re-enter the core inside the open transaction or snapshot.
+//!   and the core answers each run, until `unwatch`. The core keeps every
+//!   watch; JS only hands answers to the app.
+//! - JS registers a service with `register`: the bytes of its package, a
+//!   component carrying its service.toml.
 //!
-//! The core's timers are Node's: it schedules on `setTimeout`.
+//! Every later answer crosses back to Node's thread through one courier, a
+//! thread-safe function JS gave at open, in the order the core gave them, with
+//! the id JS gave the call or watch it answers. JS refs the courier while it
+//! is owed an answer, so Node keeps running for it. What JS reads at once,
+//! such as a ref or a RunState, waits for the core's thread to answer.
 //!
-//! Every error crosses as a JSON service error: from the core, in an Error's
-//! message or a callback's first argument; from JS, as the data `settle` or
-//! `init` hands back.
+//! Every error crosses as a JSON service error: in an Error's message, or a
+//! callback's first argument.
 
-use std::cell::RefCell;
 use std::path::Path;
-use std::rc::Rc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use carbondb as core;
-use napi::UnknownRef;
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use serde_json::{Value, json};
 
 fn to_napi(error: core::ServiceError) -> Error {
-  Error::from_reason(serde_json::to_string(&error).expect("a service error serializes"))
+  Error::from_reason(error.to_text())
 }
 
-fn to_json(value: impl serde::Serialize) -> Result<Value> {
-  serde_json::to_value(value).map_err(|error| to_napi(core::error::internal(error.to_string())))
+fn to_json(value: impl serde::Serialize) -> core::Result<Value> {
+  serde_json::to_value(value).map_err(|error| core::error::internal(error.to_string()))
 }
 
-// A service error JS handed back as data, or an internal error if it is not one.
-fn service_error(data: Value) -> core::ServiceError {
-  serde_json::from_value(data.clone()).unwrap_or_else(|_| core::error::internal(format!("Malformed service error: {data}")))
-}
+// The courier every later answer crosses back through, in order: a JS
+// function called with `(id, error, value)`, the id naming the call or watch
+// it answers. JS refs it while it is owed an answer.
+type Courier = ThreadsafeFunction<(u32, Value, Value), (), FnArgs<(u32, Value, Value)>, Status, false>;
 
-type Callback<'a> = Function<'a, FnArgs<(Value, Value)>, ()>;
-
-// A JS callback, `(error, value)`, as the core's answer to a call or a watch:
-// called on the JS thread whose env it was given on.
-fn answering(env: &Env, callback: Callback<'_>) -> Result<Rc<dyn Fn(core::Result<Value>)>> {
-  let callback = callback.create_ref()?;
-  let raw = env.raw();
-  Ok(Rc::new(move |result| {
-    let env = Env::from_raw(raw);
-    let args = match result {
-      Ok(value) => (Value::Null, value),
-      Err(error) => (json!(error), Value::Null),
-    };
-    // The runtime's callbacks only settle a Promise or queue a delivery; they never throw.
-    if let Ok(callback) = callback.borrow_back(&env) {
-      let _ = callback.call(args.into());
-    }
-  }))
-}
-
-// Node's `setTimeout(handler, delay)` and `clearTimeout(timeout)`.
-type SetTimeout<'a> = Function<'a, FnArgs<(Function<'a, (), ()>, f64)>, Unknown<'a>>;
-type ClearTimeout<'a> = Function<'a, Unknown<'a>, ()>;
-
-// A timeout set on Node, held until it fires or is cleared, then let go.
-type Timer = Rc<RefCell<Option<UnknownRef>>>;
-
-// The core's timers, on Node's `setTimeout` and `clearTimeout`, run on the JS
-// thread whose env they were made on. Setting or clearing a timeout fails only
-// while Node shuts down, when nothing is left to expire.
-fn node_timers(env: &Env) -> core::Schedule {
-  let raw = env.raw();
-  Rc::new(move |delay: Duration, then: Box<dyn FnOnce()>| {
-    let timer = set_timeout(&Env::from_raw(raw), delay, then);
-    Box::new(move || {
-      if let Ok(timer) = timer {
-        let _ = clear_timeout(&Env::from_raw(raw), &timer);
-      }
-    })
-  })
-}
-
-// Run `then` once `delay` has passed, keeping the timeout so it can be cleared.
-fn set_timeout(env: &Env, delay: Duration, then: Box<dyn FnOnce()>) -> Result<Timer> {
-  let (timer, raw) = (Timer::default(), env.raw());
-  let (fired, then) = (Rc::clone(&timer), RefCell::new(Some(then)));
-  let expire = env.create_function_from_closure::<(), (), _>("expire", move |_| {
-    release(&Env::from_raw(raw), &fired)?;
-    if let Some(then) = then.borrow_mut().take() {
-      then()
-    }
-    Ok(())
-  })?;
-  let set: SetTimeout = env.get_global()?.get_named_property_unchecked("setTimeout")?;
-  let timeout = set.call(FnArgs { data: (expire, delay.as_millis() as f64) })?;
-  timer.replace(Some(timeout.create_ref()?));
-  Ok(timer)
-}
-
-// Clear a timeout that has not fired, and let go of it.
-fn clear_timeout(env: &Env, timer: &Timer) -> Result<()> {
-  let timeout = timer.borrow().as_ref().map(|timeout| timeout.get_value(env)).transpose()?;
-  if let Some(timeout) = timeout {
-    let clear: ClearTimeout = env.get_global()?.get_named_property_unchecked("clearTimeout")?;
-    clear.call(timeout)?;
-  }
-  release(env, timer)
-}
-
-// Let go of a timeout, once it has fired or been cleared.
-fn release(env: &Env, timer: &Timer) -> Result<()> {
-  match timer.take() {
-    Some(timeout) => timeout.unref(env),
-    None => Ok(()),
-  }
+// Hand the answer to `id` to JS, on Node's thread.
+fn deliver(courier: &Mutex<Courier>, id: u32, result: core::Result<Value>) {
+  let (error, value) = match result {
+    Ok(value) => (Value::Null, value),
+    Err(error) => (json!(error), Value::Null),
+  };
+  courier.lock().expect("never poisoned").call((id, error, value), ThreadsafeFunctionCallMode::NonBlocking);
 }
 
 #[napi]
 pub struct Carbon {
-  inner: Rc<core::Carbon>,
+  runtime: core::Runtime,
+  courier: Arc<Mutex<Courier>>,
 }
 
 #[napi]
 impl Carbon {
+  // Open CarbonDB from its config, on a thread of its own, answering later
+  // through `courier`, which keeps Node running only while JS says so.
   #[napi(factory)]
-  pub fn open(env: Env, config: String) -> Result<Carbon> {
-    Ok(Carbon { inner: core::Carbon::open(Path::new(&config), node_timers(&env)).map_err(to_napi)? })
+  pub fn open(env: Env, config: String, courier: Function<'_, FnArgs<(u32, Value, Value)>, ()>) -> Result<Carbon> {
+    let mut courier = courier.build_threadsafe_function::<(u32, Value, Value)>().callee_handled::<false>().build_callback(|context| Ok(FnArgs::from(context.value)))?;
+    #[allow(deprecated)]
+    courier.unref(&env)?;
+    Ok(Carbon { runtime: core::Runtime::start(Path::new(&config)).map_err(to_napi)?, courier: Arc::new(Mutex::new(courier)) })
   }
 
-  // Register an npm service under a name: the path of its package's
-  // service.toml, none when it exports none; its `init`, which answers null or
-  // a service error's data; and its entry point, which the core calls with a
-  // HandlerContext for each call to the service.
+  // Whether Node keeps running for answers still owed: JS says so as it owes them.
   #[napi]
-  pub fn register(
-    &self,
-    env: Env,
-    name: String,
-    manifest: Option<String>,
-    init: Function<'_, Db, Value>,
-    entry: Function<'_, HandlerContext, ()>,
-  ) -> Result<()> {
-    let raw = env.raw();
-    let init = init.create_ref()?;
-    let set_up: core::Init = Rc::new(move |db: Rc<dyn core::Db>| {
-      let env = Env::from_raw(raw);
-      let returned = init.borrow_back(&env).and_then(|init| init.call(Db { inner: db }));
-      match returned {
-        Ok(Value::Null) => Ok(()),
-        Ok(error) => Err(service_error(error)),
-        Err(error) => Err(core::error::internal(error.reason.clone())),
-      }
-    });
-    let package = core::NpmPackage::read(&name, manifest.as_deref().map(Path::new)).map_err(to_napi)?;
-    let binding = package.binding.clone();
-    let entry = entry.create_ref()?;
-    let run: core::Entry = Rc::new(move |context: Rc<dyn core::HandlerContext>| {
-      let env = Env::from_raw(raw);
-      let handed = HandlerContext { inner: Rc::clone(&context), binding: binding.clone() };
-      let called = entry.borrow_back(&env).and_then(|entry| entry.call(handed));
-      if let Err(error) = called {
-        let _ = context.settle(Err(core::error::internal(error.reason.clone())));
-      }
-    });
-    self.inner.register(core::Service::npm(&name, &package, set_up, run)).map_err(to_napi)
+  #[allow(deprecated)]
+  pub fn keep(&self, env: Env, keep: bool) -> Result<()> {
+    let mut courier = self.courier.lock().expect("never poisoned");
+    match keep {
+      true => courier.refer(&env),
+      false => courier.unref(&env),
+    }
+  }
+
+  // Register a service under a name: the bytes of its package.
+  #[napi]
+  pub fn register(&self, name: String, package: Buffer) -> Result<()> {
+    let bytes = package.to_vec();
+    self.runtime.ask(move |carbon| carbon.register(core::wasm::Package::read(&bytes)?.service(&name))).map_err(to_napi)
   }
 
   // Make a call by its service key on a channel, or on the system handle when
-  // none is named, as the identity named or as no one. `reply` is called with (error, value).
+  // none is named, as the identity named or as no one; its answer goes to `id`.
   #[napi]
-  pub fn call(&self, env: Env, space: Option<String>, identity: Option<String>, key: String, input: Value, reply: Callback<'_>) -> Result<()> {
-    let reply = answering(&env, reply)?;
-    self.inner.call(space.as_deref(), identity.as_deref(), &key, input, Box::new(move |answer| reply(answer)));
-    Ok(())
+  pub fn call(&self, channel: Option<String>, identity: Option<String>, key: String, input: Value, id: u32) {
+    let courier = Arc::clone(&self.courier);
+    self.runtime.with(move |carbon| carbon.call(channel.as_deref(), identity.as_deref(), &key, input, Box::new(move |answer| deliver(&courier, id, answer))));
   }
 
-  // Run a GET on a space now and after every commit that writes what it read,
-  // as the identity named; `listener` is called with (error, value) each time.
-  // Returns the id that stops it.
+  // Run a GET on a channel now and after every commit that writes what it
+  // read, as the identity named; each answer goes to `id`. Returns the id
+  // that stops it.
   #[napi]
-  pub fn watch(&self, env: Env, space: String, identity: Option<String>, key: String, listener: Callback<'_>) -> Result<u32> {
-    self.inner.watch(&space, identity.as_deref(), &key, answering(&env, listener)?).map_err(to_napi)
+  pub fn watch(&self, channel: String, identity: Option<String>, key: String, id: u32) -> Result<u32> {
+    let courier = Arc::clone(&self.courier);
+    self.runtime.ask(move |carbon| carbon.watch(&channel, identity.as_deref(), &key, std::rc::Rc::new(move |answer| deliver(&courier, id, answer)))).map_err(to_napi)
   }
 
   // The ref in a channel to `kind:slug`, found at once: the channel it points to, its kind, name and slug.
   #[napi]
   pub fn find_ref(&self, channel: String, kind: String, slug: String) -> Result<Value> {
-    self.inner.find_ref(&channel, &kind, &slug).map_err(to_napi)
+    self.runtime.ask(move |carbon| carbon.find_ref(&channel, &kind, &slug)).map_err(to_napi)
   }
 
   // The id of the service a channel names `[name]`; the channel's own for `[channel]`.
   #[napi]
   pub fn service(&self, channel: String, name: String) -> Result<String> {
-    self.inner.named(&channel, &name).map_err(to_napi)
+    self.runtime.ask(move |carbon| carbon.named(&channel, &name)).map_err(to_napi)
   }
 
   // Stop a watch or a RunState listener.
   #[napi]
   pub fn unwatch(&self, id: u32) {
-    self.inner.unwatch(id)
+    self.runtime.with(move |carbon| carbon.unwatch(id))
   }
 
   // A space's RunState: `{state: 'initializing', services}`, `{state: 'idle'}`,
   // `{state: 'applying', op}` or `{state: 'stopped', error}`.
   #[napi]
   pub fn run_state(&self, space: String) -> Result<Value> {
-    to_json(self.inner.run_state(&space))
+    self.runtime.ask(move |carbon| to_json(carbon.run_state(&space))).map_err(to_napi)
   }
 
-  // Hear every change of a space's RunState. Returns the id that stops it.
+  // Hear every change of a space's RunState, each going to `id`. Returns the id that stops it.
   #[napi]
-  pub fn watch_run_state(&self, env: Env, space: String, listener: Function<'_, Value, ()>) -> Result<u32> {
-    let listener = listener.create_ref()?;
-    let raw = env.raw();
-    Ok(self.inner.watch_run_state(&space, Rc::new(move |state: &core::RunState| {
-      let env = Env::from_raw(raw);
-      if let Ok(listener) = listener.borrow_back(&env) {
-        let _ = listener.call(json!(state));
-      }
-    })))
+  pub fn watch_run_state(&self, space: String, id: u32) -> Result<u32> {
+    let courier = Arc::clone(&self.courier);
+    self.runtime.ask(move |carbon| Ok(carbon.watch_run_state(&space, std::rc::Rc::new(move |state: &core::RunState| deliver(&courier, id, Ok(json!(state)))))))
+      .map_err(to_napi)
   }
 
-  // Resume a space a system failure stopped, once the failure is fixed.
+  // Resume a space a system failure stopped, once the failure is fixed;
+  // answered at `id` once the watches on it have run again.
   #[napi]
-  pub fn resume(&self, space: String) {
-    let carbon = Rc::clone(&self.inner);
-    Rc::clone(&self.inner).with_space(&space, Box::new(move |opened| {
-      if let Ok(space) = opened {
-        carbon.resume(&space)
-      }
-    }));
+  pub fn resume(&self, space: String, id: u32) {
+    let courier = Arc::clone(&self.courier);
+    self.runtime.with(move |carbon| carbon.resume_space(&space, Box::new(move |answer| deliver(&courier, id, answer))));
   }
 
   #[napi]
   pub fn identity(&self, slug: String) -> Result<Value> {
-    to_json(self.inner.identity(&slug).map_err(to_napi)?)
+    self.runtime.ask(move |carbon| to_json(carbon.identity(&slug)?)).map_err(to_napi)
   }
 }
 
-// A service's `sql` binding as its `init` receives it, open while `init` runs.
+// Embed a service.toml in a built component, making it a package to register.
 #[napi]
-pub struct Db {
-  inner: Rc<dyn core::Db>,
-}
-
-#[napi]
-impl Db {
-  #[napi]
-  pub fn run(&self, sql: String, params: Option<Vec<Value>>) -> Result<f64> {
-    Ok(self.inner.run(&sql, &params.unwrap_or_default()).map_err(to_napi)? as f64)
-  }
-
-  #[napi]
-  pub fn get(&self, sql: String, params: Option<Vec<Value>>) -> Result<Value> {
-    self.inner.get(&sql, &params.unwrap_or_default()).map_err(to_napi)
-  }
-
-  #[napi]
-  pub fn all(&self, sql: String, params: Option<Vec<Value>>) -> Result<Vec<Value>> {
-    self.inner.all(&sql, &params.unwrap_or_default()).map_err(to_napi)
-  }
-}
-
-// One call as an npm service's entry point receives it: its handler context,
-// and the name of the binding its handler receives, from its service.toml.
-#[napi]
-pub struct HandlerContext {
-  inner: Rc<dyn core::HandlerContext>,
-  binding: Option<String>,
-}
-
-#[napi]
-impl HandlerContext {
-  // The service call as data: method, resource, input, the op when it writes,
-  // and the name its handler receives its binding under.
-  #[napi]
-  pub fn request(&self) -> Value {
-    json!({"method": self.inner.method(), "resource": self.inner.resource(), "input": self.inner.input(), "op": self.inner.op(), "binding": self.binding})
-  }
-
-  // A write statement, inside the op's transaction.
-  #[napi]
-  pub fn run(&self, sql: String, params: Option<Vec<Value>>) -> Result<f64> {
-    Ok(self.inner.run(&sql, &params.unwrap_or_default()).map_err(to_napi)? as f64)
-  }
-
-  // The first row, or null.
-  #[napi]
-  pub fn get(&self, sql: String, params: Option<Vec<Value>>) -> Result<Value> {
-    self.inner.get(&sql, &params.unwrap_or_default()).map_err(to_napi)
-  }
-
-  #[napi]
-  pub fn all(&self, sql: String, params: Option<Vec<Value>>) -> Result<Vec<Value>> {
-    self.inner.all(&sql, &params.unwrap_or_default()).map_err(to_napi)
-  }
-
-  // An id drawn from the op.
-  #[napi]
-  pub fn id(&self) -> Result<String> {
-    self.op().map(|op| op.id())
-  }
-
-  // A number in [0, 1) drawn from the op.
-  #[napi]
-  pub fn random(&self) -> Result<f64> {
-    self.op().map(|op| op.random())
-  }
-
-  // Make a call by its service key from inside this one; `reply` is called with (error, value).
-  #[napi]
-  pub fn call(&self, env: Env, key: String, input: Value, reply: Callback<'_>) -> Result<()> {
-    let reply = answering(&env, reply)?;
-    Rc::clone(&self.inner).call(&key, input, Box::new(move |answer| reply(answer)));
-    Ok(())
-  }
-
-  // Make an effect by name: made on an op's first run and recorded, its
-  // recorded output replayed on every later run; `reply` is called with (error, value).
-  #[napi]
-  pub fn effect(&self, env: Env, name: String, input: Value, reply: Callback<'_>) -> Result<()> {
-    let reply = answering(&env, reply)?;
-    Rc::clone(&self.inner).effect(&name, input, Box::new(move |answer| reply(answer)));
-    Ok(())
-  }
-
-  // Settle the call, once: with a service error's data, or with a value.
-  #[napi]
-  pub fn settle(&self, error: Option<Value>, value: Option<Value>) -> Result<()> {
-    let result = match error {
-      Some(error) => Err(service_error(error)),
-      None => Ok(value.unwrap_or(Value::Null)),
-    };
-    self.inner.settle(result).map_err(to_napi)
-  }
-}
-
-impl HandlerContext {
-  fn op(&self) -> Result<&core::Op> {
-    self.inner.op().ok_or_else(|| to_napi(core::error::bad_request("A GET is not an op, so it draws nothing")))
-  }
+pub fn package_component(component: Buffer, manifest: String) -> Result<Buffer> {
+  core::wasm::package(&component, &manifest).map(Buffer::from).map_err(to_napi)
 }

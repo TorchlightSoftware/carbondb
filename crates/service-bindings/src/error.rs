@@ -27,6 +27,17 @@ impl ServiceError {
     self.details = Some(details);
     self
   }
+
+  // As it crosses a component's boundary: JSON text.
+  pub fn to_text(&self) -> String {
+    serde_json::to_string(self).expect("a service error serializes")
+  }
+
+  // A failure's text as it crossed the boundary, or an internal error carrying
+  // it when it is not a service error.
+  pub fn from_text(text: &str) -> ServiceError {
+    serde_json::from_str(text).unwrap_or_else(|_| internal(format!("Malformed service error: {text}")))
+  }
 }
 
 pub fn bad_request(message: impl Into<String>) -> ServiceError {

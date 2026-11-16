@@ -2,7 +2,13 @@
 //! made it, when, and the version of the service that handles it. Its hash
 //! names it on every replica, and its ids and randomness are drawn from that
 //! hash, so every replica draws the same values in the same order.
+//!
+//! The core counts an op's draws, so that every call within one op draws
+//! from one sequence. A service running as a component asks the core for
+//! each draw instead (`Op::drawn_by`), since a call within the op may run in
+//! another instance.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,10 +26,28 @@ pub struct Op {
   pub version: String,
   pub time: u64,
   pub hash: String,
-  // How many values the op's handlers have drawn. Clones share it, so the
-  // calls inside one op never draw the same value.
+  // Where its draws come from. Clones share it, so the calls inside one op
+  // never draw the same value.
   #[serde(skip)]
-  drawn: Arc<AtomicU64>,
+  draws: Draws,
+}
+
+// The next value drawn from an op, given its hash: a 64-character hex hash.
+#[derive(Clone)]
+pub struct Draws(Arc<dyn Fn(&str) -> String + Send + Sync>);
+
+// Counted here: the nth draw is the hash of the op's hash and n.
+impl Default for Draws {
+  fn default() -> Draws {
+    let drawn = AtomicU64::new(0);
+    Draws(Arc::new(move |op| hash(&json!({"op": op, "n": drawn.fetch_add(1, Ordering::SeqCst)}))))
+  }
+}
+
+impl fmt::Debug for Draws {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str("Draws")
+  }
 }
 
 impl PartialEq for Op {
@@ -34,7 +58,12 @@ impl PartialEq for Op {
 
 impl Op {
   pub fn new(key: String, input: Value, author: Option<String>, device: Option<String>, version: String, time: u64, hash: String) -> Op {
-    Op { key, input, author, device, version, time, hash, drawn: Arc::default() }
+    Op { key, input, author, device, version, time, hash, draws: Draws::default() }
+  }
+
+  // The same op, its draws asked of `draw` rather than counted here.
+  pub fn drawn_by(self, draw: impl Fn() -> String + Send + Sync + 'static) -> Op {
+    Op { draws: Draws(Arc::new(move |_| draw())), ..self }
   }
 
   // An id for something the op creates: 32 hex characters.
@@ -48,9 +77,9 @@ impl Op {
     bits as f64 / (1u64 << 52) as f64
   }
 
-  fn draw(&self) -> String {
-    let n = self.drawn.fetch_add(1, Ordering::SeqCst);
-    hash(&json!({"op": self.hash, "n": n}))
+  // The next value drawn: a 64-character hex hash.
+  pub fn draw(&self) -> String {
+    (self.draws.0)(&self.hash)
   }
 }
 
@@ -70,6 +99,16 @@ mod tests {
     assert_eq!(drawn.iter().collect::<std::collections::BTreeSet<_>>().len(), 3);
     assert_eq!(drawn, [there.id(), there.id(), there.id()]);
     assert!(drawn.iter().all(|id| id.len() == 32));
+  }
+
+  #[test]
+  fn an_op_drawn_by_another_takes_its_values_from_it() {
+    let counted = op();
+    let drawn = [counted.draw(), counted.draw()];
+    let source = op();
+    let asked = op().drawn_by(move || source.draw());
+    assert_eq!([asked.draw(), asked.draw()], drawn);
+    assert_eq!(asked.id(), counted.id());
   }
 
   #[test]

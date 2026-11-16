@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Build the Rust services as components and package them: the builtins into
+# crates/core/builtins/, which the core embeds, and the test fixtures into
+# crates/core/fixtures/. Run it after changing one of them or the bindings
+# they build with, and commit what it writes: the core's tests fail while a
+# committed component is older than its sources.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+builtins=(channel identity)
+fixtures=(probe)
+packages=$(printf -- '-p carbondb-svc-%s ' "${builtins[@]}" "${fixtures[@]}")
+cargo build --quiet --target wasm32-wasip2 --profile component $packages
+package() {
+  cargo run --quiet -p carbondb-service-bindings --features manifest --bin carbondb-package -- \
+    "target/wasm32-wasip2/component/carbondb_svc_$1.wasm" "crates/services/$1" "$2/$1.wasm" \
+    crates/service-bindings/src crates/service-bindings/wit
+}
+mkdir -p crates/core/builtins crates/core/fixtures
+for name in "${builtins[@]}"; do package "$name" crates/core/builtins; done
+for name in "${fixtures[@]}"; do package "$name" crates/core/fixtures; done
+ls -l crates/core/builtins crates/core/fixtures

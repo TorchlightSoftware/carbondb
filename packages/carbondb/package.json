@@ -11,22 +11,38 @@
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./migrations": "./src/migrations.js"
+    "./migrations": "./src/migrations.js",
+    "./service": "./src/service/index.js",
+    "./build": "./src/build.js"
   },
   "files": [
     "src",
+    "bin",
+    "wit",
     "carbondb.node",
     "README.md",
     "LICENSE-MIT",
     "LICENSE-APACHE"
   ],
   "scripts": {
-    "build": "cargo build --release -p carbondb-node && cp ../../target/release/libcarbondb_node.so carbondb.node",
+    "build": "cargo build --release -p carbondb-node && cp ../../target/release/libcarbondb_node.so carbondb.node && rm -rf wit && cp -r ../../crates/service-bindings/wit wit",
+    "pretest": "node fixtures/build.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@tlsft/service-error": "^0.1.0",
     "@tlsft/service-key": "^0.6.0"
   },
-  "license": "MIT OR Apache-2.0"
+  "license": "MIT OR Apache-2.0",
+  "bin": {
+    "carbondb-build": "bin/carbondb-build.js"
+  },
+  "peerDependencies": {
+    "@bytecodealliance/jco": "^1.42.0"
+  },
+  "peerDependenciesMeta": {
+    "@bytecodealliance/jco": {
+      "optional": true
+    }
+  }
 }

@@ -1,0 +1,6 @@
+name = "fetcher"
+# Room for a request to the world outside: the test's `/slow` pauses 100 ms.
+timeout = 2000
+
+[[sql]]
+binding = "db"

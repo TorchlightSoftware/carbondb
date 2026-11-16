@@ -7,7 +7,7 @@ import {mkdtempSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {configure} from 'carbondb'
-import * as chat from '../index.js'
+import {component} from '../index.js'
 
 function configFile() {
   const path = join(mkdtempSync(join(tmpdir(), 'chat-')), 'carbondb.toml')
@@ -19,7 +19,7 @@ function configFile() {
 // channel running [chat], made on the first start and found again on later ones.
 async function start(config) {
   const carbon = await configure(config)
-  carbon.services.add('chat', chat)
+  carbon.services.add('chat', component)
   const identities = await carbon.call('GET [@carbon]/identities')
   const known = identities.some((identity) => identity.slug === 'app')
   if (known) {

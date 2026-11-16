@@ -189,7 +189,7 @@ impl Space {
     }
   }
 
-  // Set up its service here: its `init` in a transaction of its own, outside
+  // Set up its service here: its `setup` in a transaction of its own, outside
   // any op, then the check every table's keys must pass. While an op is
   // applying, it waits until that op is done.
   pub fn set_up(self: &Rc<Self>, service: &Rc<Service>) -> Result<()> {
@@ -199,7 +199,7 @@ impl Space {
     }
     self.store.write(|store| {
       let binding = Rc::new(DbBinding { space: Rc::clone(self), window: CallWindow { service: true, op: None }, open: Cell::new(true) });
-      let initialized = (service.init)(Rc::clone(&binding) as Rc<dyn Db>);
+      let initialized = (service.setup)(Rc::clone(&binding) as Rc<dyn Db>);
       binding.open.set(false);
       initialized?;
       check_keys(store)
@@ -215,8 +215,8 @@ impl Space {
   }
 }
 
-// The `db` binding a service's `init` receives: its own tables in this
-// space, open only while `init` runs.
+// The `db` binding a service's `setup` receives: its own tables in this
+// space, open only while `setup` runs.
 struct DbBinding {
   space: Rc<Space>,
   window: CallWindow,
@@ -226,7 +226,7 @@ struct DbBinding {
 impl DbBinding {
   fn scoped(&self) -> Result<crate::call_window::Scoped<'_>> {
     if !self.open.get() {
-      return Err(internal("A service's init has returned, so its db binding is closed"));
+      return Err(internal("A service's setup has returned, so its db binding is closed"));
     }
     Ok(self.space.store.scoped(self.window.clone()))
   }

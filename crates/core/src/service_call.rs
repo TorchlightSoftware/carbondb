@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::carbon::{Cancel, Carbon};
 use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal, timed_out};
-use crate::ops::effects::{EffectLog, Made, Turn};
+use crate::ops::effects::{EffectLog, Turn};
 use crate::space::Space;
 use crate::call_window::{CallWindow, Scoped};
 use crate::store::Reader;
@@ -75,6 +75,13 @@ fn allowed(caller: &Call, callee: &Call) -> Result<()> {
   }
 }
 
+// What asking for an effect gets: a turn to make it, in its slot of the
+// run's log when it is recorded; or the output the op's first run recorded.
+pub(crate) enum Asked {
+  Make(Option<usize>),
+  Recorded(Result<Value>),
+}
+
 pub struct ServiceCall {
   carbon: Rc<Carbon>,
   space: Rc<Space>,
@@ -97,6 +104,8 @@ pub struct ServiceCall {
   deadline: RefCell<Option<Cancel>>,
   // Whether the core settled it when its deadline passed.
   expired: Cell<bool>,
+  // Drops whatever runs its handler, when it expires first.
+  abandon: RefCell<Option<Cancel>>,
 }
 
 impl ServiceCall {
@@ -130,7 +139,48 @@ impl ServiceCall {
       settle: RefCell::new(Some(settle)),
       deadline: RefCell::default(),
       expired: Cell::new(false),
+      abandon: RefCell::default(),
     })
+  }
+
+  // Ask for an effect, as a handler does, in the order it asks: an effect
+  // made on every run takes no slot; any other takes the next slot of the
+  // run's log, or gets what the op's first run recorded. Asking and making
+  // are apart so an effect whose input arrives later, as an outgoing
+  // request's body does, still takes its slot when it is asked for.
+  pub(crate) fn ask_effect(&self, name: &str, input: &Value) -> Result<Asked> {
+    if !self.live.get() {
+      return Err(self.ended());
+    }
+    let always = self.space.service().is_some_and(|service| service.always.iter().any(|effect| effect == name));
+    if always {
+      return Ok(Asked::Make(None));
+    }
+    let turn = self.effects.borrow_mut().next(name, input);
+    Ok(match turn {
+      Turn::Make(slot) => Asked::Make(Some(slot)),
+      Turn::Recorded(output) => Asked::Recorded(output),
+    })
+  }
+
+  // Make an effect asked for, keeping its output in its slot, if it took one.
+  pub(crate) fn make_effect(self: Rc<Self>, slot: Option<usize>, name: &str, input: Value, reply: Reply) {
+    self.pending.set(self.pending.get() + 1);
+    let (caller, made_with) = (Rc::clone(&self), input.clone());
+    let made: Reply = Box::new(move |output| {
+      caller.pending.set(caller.pending.get() - 1);
+      if let Some(slot) = slot {
+        caller.effects.borrow_mut().keep(slot, made_with, output.clone());
+      }
+      reply(output)
+    });
+    let carbon = Rc::clone(&self.carbon);
+    carbon.effects().make(self, name, input, made)
+  }
+
+  // How to drop whatever runs its handler, should it expire first.
+  pub(crate) fn abandon_with(&self, cancel: Cancel) {
+    self.abandon.replace(Some(cancel));
   }
 
   // The deadline it must settle by, which settling cancels.
@@ -144,6 +194,9 @@ impl ServiceCall {
     let Some(settle) = self.settle.borrow_mut().take() else { return };
     self.expired.set(true);
     settle(Err(timed_out(&self.call.key(), timeout)), self.calls.take());
+    if let Some(abandon) = self.abandon.take() {
+      abandon();
+    }
   }
 
   pub fn carbon(&self) -> &Rc<Carbon> {
@@ -286,26 +339,11 @@ impl HandlerContext for ServiceCall {
   }
 
   fn effect(self: Rc<Self>, name: &str, input: Value, reply: Reply) {
-    if !self.live.get() {
-      return reply(Err(self.ended()));
+    match self.ask_effect(name, &input) {
+      Ok(Asked::Make(slot)) => self.make_effect(slot, name, input, reply),
+      Ok(Asked::Recorded(output)) => reply(output),
+      Err(error) => reply(Err(error)),
     }
-    let always = self.space.service().is_some_and(|service| service.always.iter().any(|effect| effect == name));
-    let turn = if always { Turn::Make } else { self.effects.borrow_mut().next(name) };
-    if let Turn::Recorded(output) = turn {
-      return reply(output);
-    }
-    self.pending.set(self.pending.get() + 1);
-    let caller = Rc::clone(&self);
-    let (kept_name, kept_input) = (name.to_string(), input.clone());
-    let made: Reply = Box::new(move |output| {
-      caller.pending.set(caller.pending.get() - 1);
-      if !always && caller.effects.borrow().first_run() {
-        caller.effects.borrow_mut().keep(Made { name: kept_name, input: kept_input, output: output.clone() });
-      }
-      reply(output)
-    });
-    let carbon = Rc::clone(&self.carbon);
-    carbon.effects().make(self, name, input, made)
   }
 
   // A handler that finishes before the calls it made fails, since their writes

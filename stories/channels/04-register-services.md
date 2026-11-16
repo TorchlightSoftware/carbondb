@@ -5,19 +5,19 @@ Status: implemented — single-node
 ## Calls
 
 ```js
-import * as chat from './services/chat.js'
+import {component as chat} from '@tlsft/carbondb-svc-chat'
 
 carbon.services.add('chat', chat)   // in main(), on every start
 ```
 
-A service is its package: a `service.toml` and an exported module. The module exports `manifest`, where its `service.toml` is; its calls keyed by service key, each with a handler and optional tags (such as `append`); and an optional `init`, which sets up its schema through its `sql` binding on every open. A handler receives that binding in `env`, under the name its `service.toml` gives it, and `call` and `effect` for what it does outside its own tables. How it shapes its tables is its own concern: `carbondb/migrations` applies a directory of D1-style migrations from `init`. The name it is registered under is the one passed to `services.add`, which overrides the name in its `service.toml`; a channel names each service it runs by that registered package (see [story 6](06-create-shared-channel.md)).
+A service is its package: a WebAssembly component carrying its `service.toml`, given as a file URL, a path or its bytes. A JavaScript service's module exports its calls keyed by service key, each with a handler and optional tags (such as `append`), and an optional `setup`, which sets up its schema through its `sql` binding on every open; `carbondb-build` builds it into its package, and a Rust service builds against ServiceBindings. A handler receives that binding in `env`, under the name its `service.toml` gives it, and `call` and `effect` for what it does outside its own tables. How it shapes its tables is its own concern: `carbondb/migrations` applies D1-style migrations from `setup`. The name it is registered under is the one passed to `services.add`, which overrides the name in its `service.toml`; a channel names each service it runs by that registered package (see [story 6](06-create-shared-channel.md)).
 
 ## Rules
 
 - The app registers its services in `main()` on every start. Nothing is stored in the database, and the handler code is never copied into it.
 - Nothing is loaded from hard-coded lists or the TOML file.
-- A service's version is the hash of its package, carried in every op.
-- A service without a `service.toml` is refused with a 400, as is one declaring a field CarbonDB does not know or more than one `sql` binding.
+- A service's version is the hash of its package's bytes, carried in every op.
+- What is not a component, or a component without a `service.toml`, is refused with a 400, as is one declaring a field CarbonDB does not know or more than one `sql` binding.
 - A name already registered, CarbonDB's own (`channel`, `identity`) included, is refused with a 409.
 - Each service runs in a space of its own: one SQLite file beside the system database, holding its tables, its op log and its results. Its statements run as written, and it may not touch CarbonDB's `carbon_` tables or attach another file.
 - Creating a service, with `POST [channel]/services`, for a package this device has not registered is refused with a 404 naming it; so is founding an identity whose `services` name one, with a 400. A service that already exists and runs one opens initializing: its GETs get a 404, and its ops wait until the package is registered.

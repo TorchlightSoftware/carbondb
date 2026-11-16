@@ -1,15 +1,11 @@
-// The services an app registers in main(), on every start. A service is its
-// exported module: `manifest`, where its package's service.toml is; its
-// `calls`, keyed by service key; and an optional `init`, which sets up its
-// schema through its `db` binding. The core reads the manifest, versions the
-// package, keeps the registry and routes to each service by name; registering
-// hands it the manifest's path, the service's `init` and its entry point.
+// The services an app registers in main(), on every start. A service is a
+// package: a WebAssembly component carrying its service.toml, as
+// `carbondb/build` builds one, given as a file URL, a path or its bytes. The
+// core reads its manifest, versions it by its bytes, compiles it, keeps the
+// registry and routes to each service by name.
 
-import {fileURLToPath} from 'node:url'
-import {serializeError} from '@tlsft/service-error'
-import {entryOf} from './entry.js'
-import {core, toError} from './native.js'
-import {compileRoutes} from './routes.js'
+import {readFileSync} from 'node:fs'
+import {core} from './native.js'
 
 export class Services {
   #native
@@ -18,33 +14,10 @@ export class Services {
     this.#native = native
   }
 
-  add(name, impl) {
-    if (impl.init !== undefined && typeof impl.init !== 'function') throw new TypeError(`Service '${name}' declares an init that is not a function`)
-    const entry = entryOf(compileRoutes(impl.calls ?? {}))
-    core(() => this.#native.register(name, pathOf(impl.manifest), initOf(name, impl), entry))
+  add(name, component) {
+    const bytes = bytesOf(component)
+    core(() => this.#native.register(name, bytes))
   }
 }
 
-// Where a manifest is, as the core reads it: from a file URL, as
-// `new URL('./service.toml', import.meta.url)` gives, or a path; null when
-// the service exports none, which the core refuses.
-const pathOf = (manifest) => (manifest instanceof URL ? fileURLToPath(manifest) : manifest ?? null)
-
-// The core calls `init` with the service's `db` binding, open while it runs,
-// and takes back null or a service error's data. `init` runs inside a
-// transaction the core holds, so it finishes before it returns.
-function initOf(name, impl) {
-  return (binding) => {
-    try {
-      const returned = impl.init?.({
-        run: (sql, params) => core(() => binding.run(sql, params)),
-        get: (sql, params) => core(() => binding.get(sql, params)),
-        all: (sql, params) => core(() => binding.all(sql, params))
-      })
-      if (typeof returned?.then === 'function') throw new TypeError(`Service '${name}' has an init that returns a Promise; init finishes before it returns`)
-      return null
-    } catch (thrown) {
-      return serializeError(toError(thrown))
-    }
-  }
-}
+const bytesOf = (component) => (component instanceof Uint8Array ? component : readFileSync(component))

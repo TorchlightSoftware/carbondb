@@ -11,5 +11,8 @@
   "scripts": {
     "build": "npm run build --workspace carbondb",
     "test": "cargo test --workspace --all-features && npm run build && npm test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco": "^1.42.0"
   }
 }

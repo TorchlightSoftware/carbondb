@@ -17,7 +17,7 @@ The hello world is create a channel, add [chat] to it, post, edit, delete, list 
 
 ## The app interface
 
-- **Setup:** an app's `main()` loads CarbonDB with its TOML config, registers each service with `carbon.services.add(name, impl)`, where `impl` is the service's exported module (its `manifest`, `init` and `calls`), and gets the `carbon` handle. Whether it runs single-node or replicated is a config setting, so switching is a config change, not a refactor of the app.
+- **Setup:** an app's `main()` loads CarbonDB with its TOML config, registers each service with `carbon.services.add(name, impl)`, where `impl` is the service's exported module (its `manifest`, `setup` and `calls`), and gets the `carbon` handle. Whether it runs single-node or replicated is a config setting, so switching is a config change, not a refactor of the app.
 - **Handles:** one per channel, reached through refs from `carbon` (see [Handles](#handles)).
 - **`call(key, input)`:** runs the handler of the service the channel names in the key and resolves with its result, or rejects with a service error. A GET answers at once; a write once this device has applied it and the watches its commit owes a run have run again.
 - **Timeouts:** every call must settle within its service's `timeout`, or it rejects with a `504`.
@@ -71,8 +71,8 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 
 ## Stack
 
-- **Packaging:** one native binary per platform. JS apps drive it as a library, and the Node binding is a napi-rs native module.
-- **Handlers:** service handlers run in the host Node process and call the core for storage and sync. Route definitions stay in JS. Validating a call's input is the service's own business: a handler that validates throws `validationError`, and CarbonDB never sees its schema.
+- **Packaging:** one native binary per platform. JS apps drive it as a library, and the Node binding is a napi-rs native module. The core runs on a thread of its own, driven by a single-threaded tokio runtime.
+- **Handlers:** every service runs as a WebAssembly component on the core's WASM host, wasmtime, whatever language it was written in, and reaches the core only through the `carbondb:service` world ([docs/wasm-services.md](../../docs/wasm-services.md)). A JavaScript service's routes stay in its own module, compiled into its component with QuickJS. Validating a call's input is the service's own business: a handler that validates throws `validationError`, and CarbonDB never sees its schema.
 - **SQLite:** real SQLite in the Rust core. A handler's `sql` binding offers `run`, `get` and `all`, each one statement with its parameters, run by the core in the call's transaction.
 - **rusqlite:** pinned to 0.39.0 with the `session` and `bundled` features. Version 0.41.1 cannot link beside sqlx 0.9, because it needs libsqlite3-sys 0.39 and sqlx-sqlite 0.9.0 needs below 0.38.
 - **p2panda:** provides transport, signed per-author logs and spaces, so sqlite-sync and cr-sqlite are not needed. Only capture and merge are ours.
@@ -138,7 +138,7 @@ Creating a channel or a service cannot be undone: its effects are made once. If 
 ## Applying an op
 
 - Every replica of a service sorts its ops by (hybrid logical clock, device, op hash), drops duplicates, and re-runs the service's handler in that order, so business rules give the same result everywhere.
-- The core owns the order and the changesets, so it decides when a handler runs or re-runs. It routes every call by the name the channel gives the service to that service's entry point, the same for Rust builtins, npm services and WASM packages, and the entry point settles it once.
+- The core owns the order and the changesets, so it decides when a handler runs or re-runs. It routes every call by the name the channel gives the service to that service's entry point, the same for every package, whatever language built it, and the entry point settles it once.
 - The op log records what this device received, local calls and synced ops alike. A service's OpWriter writes each op as it arrives, before it applies, as a durable queue would, so a crash loses nothing. While an op applies, its transaction holds the file, so an op arriving meanwhile is held by the OpWriter and written as soon as that turn ends, before the next op applies. Rows are never changed, except that an op's effects are written onto its row when its first run settles.
 - Results record what this device did with each op: applied or refused with its service error, with its output. A result is keyed by its op hash and never leaves this device. A rewind replaces results; it never touches the log.
 - The pending ops are the op log minus the results: the ops with no result yet. They are read from the service's file each turn, never kept in memory, and apply one at a time in the shared order, so ops left without a result by a crash simply apply next time the service opens. A local call is stamped when it arrives, since that is when it is written; an op that arrives later but sorts earlier is handled by rewind.
@@ -153,7 +153,7 @@ Creating a channel or a service cannot be undone: its effects are made once. If 
 
 What a handler does outside its own service's tables is an effect: calling another service, creating a channel's or service's space, changing p2panda membership, a handshake with another device. How they work, precisely, is in [docs/replication.md](../../docs/replication.md#effects-are-made-once).
 
-- An effect is made once, on the op's first run, on the device that made it. Its output, success or failure, is recorded in order on the op's log row when the first run settles, and travels with the op. The core never interprets an output; the service decides what is a failure.
+- An effect is made once, on the op's first run, on the device that made it. Its output, success or failure, is recorded on the op's log row, in the order the handler asked for it, when the first run settles, and travels with the op. The core never interprets an output; the service decides what is a failure.
 - Every later run, on another device or after a rewind here, gets the recorded outputs in order instead of making the effects again. A run asking for more effects than the first run made gets an unreachable failure, the same on every replica.
 - A service declares its effects in its `service.toml`, `[effects.<name>] replicate = "never"` (the default) or `"always"`, which makes the effect again on every run on every replica, never recorded.
 - The registry holds each effect's handler by name. Single-node, this device makes what it can alone (`call` and `create`); an effect that needs peers has no handler and fails as unreachable until p2panda.
@@ -201,7 +201,7 @@ GETs and watch re-runs use a second read-only connection in WAL mode, so they se
 - Otherwise its run rolls back, and every later op of the service that read or wrote any of its tables is undone, newest first, and its result forgotten; the late op applies at its place and they re-run in order, each tried in place, replaying the effects recorded on their rows. A rewind never leaves its service: what another service did is its own, and a message it was sent stays sent.
 - The `append` tag is an author's promise that no handler depends on the row being absent. A late tagged op applies in place and re-runs nothing. Not built: inserts of different rows already apply in place by themselves, and today an insert still rewinds the later ops that read its whole table.
 - The core treats tags as opaque flags. A tagged op whose changeset holds anything but inserts is rejected on every replica. A wrong promise about reads is not detected at runtime; the test harness catches it.
-- A row's key comes from the op that creates it, never from the rows already in the table: a key SQLite assigns, a rowid or an AUTOINCREMENT id, depends on those rows, so after a rewind it can move under the row's author. After a service's `init`, the core checks every table it owns has a primary key that is not SQLite's rowid, and refuses the service with an error naming the table, what to change and why. Handlers take keys from `op.id()`, or an integer key from `DEFAULT (op_id())`, a SQL function every runtime registers that draws below 2^53. Sessions do not record schema changes, so schema changes only in `init`, outside any op.
+- A row's key comes from the op that creates it, never from the rows already in the table: a key SQLite assigns, a rowid or an AUTOINCREMENT id, depends on those rows, so after a rewind it can move under the row's author. After a service's `setup`, the core checks every table it owns has a primary key that is not SQLite's rowid, and refuses the service with an error naming the table, what to change and why. Handlers take keys from `op.id()`, or an integer key from `DEFAULT (op_id())`, a SQL function every runtime registers that draws below 2^53. Sessions do not record schema changes, so schema changes only in `setup`, outside any op.
 
 ## Publishing
 
@@ -337,7 +337,7 @@ During a partition, GETs read the local copy, and writes apply locally and publi
 
 **The core (Rust)** owns the p2panda nodes and spaces, identity and devices, the op envelope and clock, the shared order, SQLite execution, sessions, undo, rewind, the apply loop, the effect registry, resolving `[name]` through the channel, and `[@carbon]`. It ships `[channel]` and `[identity]` as packages written against the service API, like any other service: the core reads and writes their records only through calls to them, but for one exception: where an app needs an answer at once, as a handle finding a ref, the core reads `[channel]`'s tables directly, read-only, over committed state in that service's own file. It also keeps what an app needs from CarbonDB itself, such as watches, the spaces this device holds and the device an identity acts from, so the runtime holds no CarbonDB state. It knows nothing of app schemas, routes, zod, roles or merge strategy.
 
-**The service runtime (JS)** owns the entry point of each npm service: its route matching, the handler context and its access checks. How a service shapes its tables, such as by migrations, is the service's own concern.
+**The WASM host** runs each package's component: an instance per call, as a task on the core's thread, reaching only the world's host imports and a closed WASI. Inside a JavaScript component, `carbondb/service` owns the entry point: route matching and the handler context. How a service shapes its tables, such as by migrations, is the service's own concern. **The JS runtime** only passes the app's calls to the core and hands back its answers.
 
 Services are actors: each holds its own state, and reaches the others only by message, with delivery the only guarantee between them. That also lets each service choose its own hosting and custody. Handlers are language agnostic.
 

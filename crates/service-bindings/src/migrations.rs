@@ -1,8 +1,8 @@
-//! An opt-in helper for a service's `init`: apply a list of D1-style
+//! An opt-in helper for a service's `setup`: apply a list of D1-style
 //! migrations, each named, in order, tracking the ones applied in a table the
 //! caller names, such as `d1_migrations` as Cloudflare D1 does. A service
 //! ported from a Worker keeps its migrations directory and calls this from
-//! `init`. The core tracks its own tables' migrations the same way.
+//! `setup`. The core tracks its own tables' migrations the same way.
 //!
 //! Schema only moves forward: a database that has applied a migration this
 //! code does not declare is refused, since it was set up by newer code.

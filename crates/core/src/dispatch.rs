@@ -243,13 +243,15 @@ impl Carbon {
 
   // Resume a stopped space once its failure is fixed: its pending ops apply
   // again from the first, the op that was applying when it stopped included.
-  pub fn resume(self: &Rc<Self>, space: &Rc<Space>) {
+  // Returns the watches it ran again.
+  pub fn resume(self: &Rc<Self>, space: &Rc<Space>) -> Vec<WatchId> {
     if !matches!(space.run_state(), RunState::Stopped { .. }) {
-      return;
+      return vec![];
     }
     space.store().clear_failure();
-    self.set_run_state(space, RunState::Idle);
+    let rerun = self.set_run_state(space, RunState::Idle);
     self.drain(space);
+    rerun
   }
 
   // An op applies only with the version of the service it was made for.

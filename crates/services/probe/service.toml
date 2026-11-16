@@ -1,0 +1,5 @@
+name = "probe"
+timeout = 100
+
+[[sql]]
+binding = "db"

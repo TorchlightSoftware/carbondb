@@ -1,30 +1,18 @@
-// An opt-in helper for a service's `init`: apply D1-style migrations, each
+// An opt-in helper for a service's `setup`: apply D1-style migrations, each
 // named, in order, tracking the ones applied in the service's own
 // `d1_migrations` table, as Cloudflare D1 does. A service ported from a Worker
-// keeps its migrations directory and applies it from `init`:
+// keeps its migrations directory, imports each file as text, and applies
+// them from `setup`:
 //
-//   import {applyMigrations, readMigrations} from 'carbondb/migrations'
-//   const migrations = readMigrations(new URL('./migrations/', import.meta.url))
-//   export const init = (db) => applyMigrations(db, migrations)
+//   import {applyMigrations} from 'carbondb/migrations'
+//   import createMessages from './migrations/0001_create_messages.sql'
+//   const migrations = [{name: '0001_create_messages', sql: createMessages}]
+//   export const setup = (db) => applyMigrations(db, migrations)
 //
-// It uses nothing but the `db` binding, and the core only from the outside, so
-// a service importing it still runs wherever its `db` does.
-
-import {readdirSync, readFileSync} from 'node:fs'
-import {basename} from 'node:path'
-import {fileURLToPath} from 'node:url'
+// It uses nothing but the `db` binding, so it runs wherever the service does.
 
 // The tracking table. Its key is the migration's name, so it never takes a key from SQLite.
 const TRACKING = 'CREATE TABLE IF NOT EXISTS d1_migrations (name TEXT PRIMARY KEY) WITHOUT ROWID'
-
-// The `.sql` files of a directory, in file name order, as {name, sql}.
-export function readMigrations(directory) {
-  const path = directory instanceof URL ? fileURLToPath(directory) : directory
-  return readdirSync(path)
-    .filter((file) => file.endsWith('.sql'))
-    .sort()
-    .map((file) => ({name: basename(file, '.sql'), sql: readFileSync(`${path}/${file}`, 'utf8')}))
-}
 
 // Apply the migrations not applied yet. Schema only moves forward: a database
 // that has applied a migration this code does not declare was set up by newer

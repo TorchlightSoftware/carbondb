@@ -11,6 +11,8 @@ categories = ["database-implementations"]
 
 [dependencies]
 carbondb-service-bindings = { workspace = true, features = ["manifest"] }
+carbondb-svc-channel.workspace = true
+carbondb-svc-identity.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,9 +22,15 @@ self_cell = "1.2.1"
 service-key = "0.6.0"
 sqlparser = { version = "=0.63.0", features = ["visitor"] }
 toml = "1.1.8"
-
-[build-dependencies]
-carbondb-service-bindings = { workspace = true, features = ["build"] }
+rand = { version = "0.10.1", default-features = false, features = ["std_rng"] }
+tokio = { version = "1.54.1", features = ["sync", "rt", "time", "net"] }
+wasmtime = { version = "=50.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "component-model-async", "async", "std"] }
+wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p2", "p3"] }
+wasmtime-wasi-http = { version = "=50.0.1", default-features = false, features = ["p2", "p3", "default-send-request", "component-model-async"] }
+base64 = "0.22.1"
+bytes = "1.12.1"
+http = "1"
+http-body-util = "0.1.5"
 
 [dev-dependencies]
 tempfile = "3"
