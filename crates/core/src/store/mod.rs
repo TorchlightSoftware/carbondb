@@ -216,10 +216,6 @@ impl Store {
     Scoped { connection: self.connection(), access: &self.access, failure: &self.failure, statements: &self.statements, window }
   }
 
-  #[cfg(test)]
-  pub(crate) fn access(&self) -> &Shared {
-    &self.access
-  }
 }
 
 impl Db for Store {
@@ -517,7 +513,7 @@ mod tests {
   fn records_the_first_system_failure_met_on_any_statement() {
     let (directory, store) = store();
     let holder = hold_lock(&directory.path().join("space.db"));
-    let window = CallWindow { prefix: Some("chat/db/".into()), op: None };
+    let window = CallWindow { service: true, op: None };
     let error = store.scoped(window).run("CREATE TABLE note (id TEXT PRIMARY KEY) WITHOUT ROWID", &[]).unwrap_err();
     assert_eq!((error.status, error.code.as_str()), (503, "SYSTEM_FAILURE"));
     assert_eq!(store.begin_write().unwrap_err().status, 503);

@@ -1,9 +1,11 @@
 //! The authorizer: what a statement may touch, and what it read.
 //!
 //! SQLite asks the authorizer about every table, column and pragma a
-//! statement names as it is compiled. A service's statement that reaches
-//! outside its namespace is refused; the core's own statements, outside any
-//! call window, reach everything.
+//! statement names as it is compiled. A service's tables share their file with
+//! the core's own record of the space (the op log, results and migrations,
+//! all named `carbon_`), so a service's statement that names one of those, or
+//! reaches another file through ATTACH or a pragma, is refused; the core's
+//! own statements, outside any call window, reach everything.
 //!
 //! The authorizer also records what statements read: a GET's read set, which
 //! `watch` re-runs on, and an op's, which rewind checks. It reports tables,
@@ -97,14 +99,14 @@ pub(crate) fn unrecorded<T>(access: &Shared, work: impl FnOnce() -> T) -> T {
 }
 
 // Record what a statement reads, and refuse a service's statement that reaches
-// outside its namespace.
+// outside its own tables.
 pub(crate) fn authorize(access: &mut Access, action: &AuthAction<'_>) -> Authorization {
   if let Some(table) = read_table(action).filter(|_| access.reading) {
     access.statement.insert(table.to_string());
   }
-  match &access.window.prefix {
-    Some(prefix) if !within(prefix, action) => Authorization::Deny,
-    _ => Authorization::Allow,
+  match access.window.service && !within(action) {
+    true => Authorization::Deny,
+    false => Authorization::Allow,
   }
 }
 
@@ -116,8 +118,8 @@ fn read_table<'a>(action: &AuthAction<'a>) -> Option<&'a str> {
   }
 }
 
-// Whether every name an action touches lies in the namespace, or is SQLite's own.
-fn within(prefix: &str, action: &AuthAction<'_>) -> bool {
+// Whether every name an action touches is the service's own, or SQLite's: never the core's.
+fn within(action: &AuthAction<'_>) -> bool {
   let names: Vec<&str> = match *action {
     AuthAction::Read { table_name, .. }
     | AuthAction::Insert { table_name }
@@ -131,8 +133,8 @@ fn within(prefix: &str, action: &AuthAction<'_>) -> bool {
     AuthAction::CreateTrigger { trigger_name, table_name } | AuthAction::DropTrigger { trigger_name, table_name } => vec![trigger_name, table_name],
     AuthAction::CreateView { view_name } | AuthAction::DropView { view_name } => vec![view_name],
     // The session recording an op reads the columns of each table a statement
-    // changes, so reading its own tables' columns stays within a namespace.
-    AuthAction::Pragma { pragma_name: "table_xinfo", pragma_value: Some(table_name) } => vec![table_name],
+    // changes, so reading its own tables' columns is the service's own.
+    AuthAction::Pragma { pragma_name: "table_xinfo" | "table_info", pragma_value: Some(table_name) } => vec![table_name],
     AuthAction::Pragma { .. } | AuthAction::Attach { .. } | AuthAction::Detach { .. } | AuthAction::CreateVtable { .. } | AuthAction::DropVtable { .. } => return false,
     AuthAction::CreateTempIndex { .. }
     | AuthAction::CreateTempTable { .. }
@@ -144,6 +146,9 @@ fn within(prefix: &str, action: &AuthAction<'_>) -> bool {
     | AuthAction::DropTempView { .. } => return false,
     _ => vec![],
   };
-  names.into_iter().all(|name| name.is_empty() || name.starts_with(prefix) || name.starts_with("sqlite_"))
+  names.into_iter().all(|name| !name.starts_with(CORE))
 }
+
+// What the core's own tables in a space's file are named.
+pub(crate) const CORE: &str = "carbon_";
 

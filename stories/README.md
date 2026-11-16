@@ -132,7 +132,7 @@ The schemas, routes, validation, roles and merge strategy of app services, beyon
 - [An app developer registers a service by its package or crate name](backlog/package-names.md)
 - [The core keeps its own timers once replication runs](backlog/core-timers.md)
 - [An app can sign a message as an identity and verify one](backlog/sign-and-verify.md)
-- [p2panda lets a device write through a group it belongs to](backlog/upstream-group-write.md)
+- [p2panda lets a device write through a group it belongs to](channels/backlog/upstream-group-write.md)
 - [An identity can replace the default assignment policy](backlog/assignment-policy-override.md)
 
 ## API sketch

@@ -1,14 +1,20 @@
 //! This device's CarbonDB: its config, its clock, the host's timers, the
-//! services it runs, the system database as its root space, the spaces opened
-//! so far, and the watches on them (`watch`). Every call goes through
-//! `submit`, in `dispatch`; a call from the app comes in through `call` (`app`).
+//! services it runs, the effects it can carry out, the system database as its
+//! root space, the spaces opened so far, and the watches on them (`watch`).
+//! Every call goes through `submit`, in `dispatch`; a call from the app comes
+//! in through `call` (`app`).
+//!
+//! Each space runs one service. Which one, under what name and in which
+//! channel, is this device's own record, kept in the system database as each
+//! space is created here; a call to `[name]` reaches the space its channel
+//! names for it.
 //!
 //! The core keeps no timers of its own: it runs on the host's thread, in
 //! callback style, so the host schedules what the core asks for later, as
 //! Node does with `setTimeout`.
 //!
-//! This is the single-node core: no p2panda and no network. Calls that need
-//! peers are refused.
+//! This is the single-node core: no p2panda and no network. Effects that need
+//! peers have no handler here, and are unreachable.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,19 +22,22 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::dispatch::call_effect;
+use crate::error::{Result, bad_request, not_built, not_found};
 use crate::ops::clock::{self, Clock};
-use crate::config::{Config, SyncMode};
-use crate::error::{Result, bad_request, not_built};
+use crate::ops::effects::Effects;
 use crate::ops::op::stamp;
+use crate::ops::oplog::LogRow;
+use crate::config::{Config, SyncMode};
+use crate::service_call::ServiceCall;
 use crate::services::carbon::{self as local, Identity};
 use crate::services::{Service, Services};
-use crate::space::{self, RunState, Space};
+use crate::space::{self, RunState, Runs, Space};
 use crate::store::Store;
 use crate::watch::Watches;
-use crate::ops::oplog::LogRow;
-use crate::{Actor, Call, Routing, Op};
+use crate::{Actor, Call, Db, Op, Reply};
 
 // How an opened space reaches whoever asked for it.
 pub type Opened = Box<dyn FnOnce(Result<Rc<Space>>)>;
@@ -45,6 +54,7 @@ pub struct Carbon {
   clock: Clock,
   schedule: Schedule,
   services: Services,
+  effects: Effects,
   system: Rc<Space>,
   spaces: RefCell<HashMap<String, Rc<Space>>>,
   pub(crate) watches: Watches,
@@ -57,12 +67,14 @@ impl Carbon {
       return Err(not_built("Replicated mode"));
     }
     std::fs::create_dir_all(config.directory()).map_err(|error| bad_request(format!("Cannot create {}: {error}", config.directory().display())))?;
-    let system = Rc::new(Space::root(Store::open(&config.system)?, local::SYSTEM_MIGRATIONS)?);
+    let services = Services::builtin();
+    let system = Rc::new(Space::root(Store::open(&config.system)?, local::SYSTEM_MIGRATIONS, services.get("carbon")?)?);
     let carbon = Rc::new(Carbon {
       config,
       clock: Clock::default(),
       schedule,
-      services: Services::builtin(),
+      services,
+      effects: Effects::default().with("call", Rc::new(call_effect)).with("create", Rc::new(create_effect)),
       system,
       spaces: RefCell::default(),
       watches: Watches::default(),
@@ -75,16 +87,20 @@ impl Carbon {
     &self.services
   }
 
+  pub fn effects(&self) -> &Effects {
+    &self.effects
+  }
+
   // The root space: the system database, where identities live.
   pub fn system(&self) -> &Rc<Space> {
     &self.system
   }
 
-  // Register an app's service, and set it up in every open space that names it.
+  // Register an app's service, and set it up in every open space that runs it.
   pub fn register(self: &Rc<Self>, service: Service) -> Result<()> {
     let service = self.services.register(service)?;
-    let naming: Vec<Rc<Space>> = self.spaces.borrow().values().filter(|space| space.names(&service.name)).cloned().collect();
-    for space in naming {
+    let running: Vec<Rc<Space>> = self.spaces.borrow().values().filter(|space| space.not_set_up().as_deref() == Some(service.name.as_str())).cloned().collect();
+    for space in running {
       space.set_up(&service)?;
       self.drain(&space);
     }
@@ -96,9 +112,9 @@ impl Carbon {
     (self.schedule)(delay, then)
   }
 
-  // Stamp a call as an op, now.
-  pub(crate) fn stamp(&self, actor: &Actor, call: &Call, input: &Value) -> Op {
-    stamp(actor, call, input, &self.services.version(&call.service), self.clock.now())
+  // Stamp a call as an op, now. Its version is that of the package the space runs.
+  pub(crate) fn stamp(&self, actor: &Actor, call: &Call, input: &Value, package: &str) -> Op {
+    stamp(actor, call, input, &self.services.version(package), self.clock.now())
   }
 
   // Where a space's database sits: beside the system database, named by space id.
@@ -106,53 +122,36 @@ impl Carbon {
     self.config.directory().join(format!("{id}.db"))
   }
 
-  // A space on this device, opened on first use: `[space]` is set up first,
-  // then `GET [space]/origin` names the services it runs, and each registered
-  // here is set up too. A service this device does not run is refused when it
-  // is called.
+  // A space on this device, opened on first use with the service this device
+  // recorded it runs, set up here when it is registered. A space whose service
+  // is not registered opens, and its ops wait until it is.
   pub fn with_space(self: &Rc<Self>, id: &str, opened: Opened) {
-    let cached = self.spaces.borrow().get(id).cloned();
-    if let Some(space) = cached {
-      return opened(Ok(space));
+    opened(self.space(id))
+  }
+
+  pub(crate) fn space(self: &Rc<Self>, id: &str) -> Result<Rc<Space>> {
+    if let Some(space) = self.opened(id) {
+      return Ok(space);
     }
-    let path = self.space_path(id);
-    if !path.exists() {
-      return opened(Err(space::missing(id)));
-    }
-    let space = match Space::open(&path, id).map(Rc::new).and_then(|space| space.set_up(&self.services.get("space")?).map(|_| space)) {
-      Ok(space) => space,
-      Err(error) => return opened(Err(error)),
-    };
-    let carbon = Rc::clone(self);
-    self.learn(&Rc::clone(&space), Box::new(move |learned| opened(learned.map(|_| carbon.keep_open(space)))));
+    let runs = self.held(id)?.ok_or_else(|| space::missing(id))?;
+    let space = Rc::new(Space::open(&self.space_path(id), id, runs)?);
+    self.set_up(&space)?;
+    Ok(self.keep_open(space))
   }
 
-  // Learn the services a space's origin names and set up those this device
-  // runs. A space whose origin has not applied here yet names none.
-  pub(crate) fn learn(self: &Rc<Self>, space: &Rc<Space>, learned: Box<dyn FnOnce(Result<()>)>) {
-    let origin = Call::from_key("GET [space]/origin").expect("a builtin key parses");
-    let (carbon, here) = (Rc::clone(self), Rc::clone(space));
-    self.submit(space, Actor::default(), origin, Value::Null, Box::new(move |origin| {
-      learned(match origin {
-        Ok(origin) => serde_json::from_value(origin.value["services"].clone()).map_err(Into::into).and_then(|named: Vec<String>| carbon.name(&here, &named)),
-        Err(error) if error.status == 404 => Ok(()),
-        Err(error) => Err(error),
-      })
-    }));
+  // What this device recorded a space runs, if it holds the space.
+  fn held(&self, id: &str) -> Result<Option<Runs>> {
+    let row = self.system.store().reader()?.get("SELECT package, name, channel FROM carbon_system_space WHERE id = ?", &[json!(id)])?;
+    Ok((!row.is_null()).then(|| Runs {
+      package: row["package"].as_str().unwrap_or_default().to_string(),
+      name: row["name"].as_str().unwrap_or_default().to_string(),
+      channel: row["channel"].as_str().map(str::to_string),
+    }))
   }
 
-  // Name a space's services and set up those this device runs.
-  fn name(&self, space: &Rc<Space>, named: &[String]) -> Result<()> {
-    space.name(named);
-    named.iter().filter_map(|name| self.services.find(name)).try_for_each(|service| space.set_up(&service))
-  }
-
-  // Set up the services a new space's origin names, once that origin applies,
-  // for the device that created it: every one must run on this device, and a
-  // set-up that fails refuses the call that created the space.
-  pub(crate) fn set_up(self: &Rc<Self>, space: &Rc<Space>, names: &[String]) -> Result<()> {
-    self.services.require_registered(names)?;
-    self.name(space, names)
+  // Set a space's service up, when it is registered here.
+  fn set_up(&self, space: &Rc<Space>) -> Result<()> {
+    self.services.find(&space.runs.package).map_or(Ok(()), |service| space.set_up(&service))
   }
 
   // Keep a space open, and apply what is pending in it.
@@ -162,34 +161,68 @@ impl Carbon {
     space
   }
 
-  // A new space, running only `[space]` until its origin op names the rest.
-  pub(crate) fn create_space(self: &Rc<Self>, id: &str) -> Result<Rc<Space>> {
-    let created = Rc::new(Space::create(&self.space_path(id), id)?);
-    created.set_up(&self.services.get("space")?)?;
+  // A new space on this device, running a registered package, recorded here
+  // with what it runs.
+  pub(crate) fn create_space(self: &Rc<Self>, id: &str, runs: Runs) -> Result<Rc<Space>> {
+    let service = self.services.get(&runs.package)?;
+    let created = Rc::new(Space::create(&self.space_path(id), id, runs.clone())?);
+    self.system.store().run("INSERT INTO carbon_system_space (id, package, name, channel) VALUES (?, ?, ?, ?)", &[json!(id), json!(runs.package), json!(runs.name), json!(runs.channel)])?;
+    created.set_up(&service)?;
     Ok(self.keep_open(created))
   }
 
-  // A row another device sent for a space: once its time is admitted and its
-  // space accepts ops, the time moves this device's clock past it, and it is
-  // logged like any other op and applied in the shared order. The space is
-  // created here when its first row arrives, and learns its services once its
-  // origin applies, which every row follows.
+  // The channel a space belongs to, through which its calls to other services resolve.
+  pub(crate) fn channel_of(&self, space: &Space) -> Result<String> {
+    space.runs.channel.clone().ok_or_else(|| not_found(format!("Space {} belongs to no channel, so it calls no other service", space.id)))
+  }
+
+  // The space a call reaches from a space or a channel: the space itself when
+  // it runs the call's service, or the service its channel names for it.
+  pub(crate) fn service_space(self: &Rc<Self>, id: &str, call: &Call) -> Result<Rc<Space>> {
+    let space = self.space(id)?;
+    if space.answers(call) || space.is_root() {
+      return Ok(space);
+    }
+    let channel = self.channel_of(&space)?;
+    let named = self.named(&channel, &call.service)?;
+    self.space(&named)
+  }
+
+  // The space a channel names for `[name]`: its own space for `[channel]`.
+  pub fn named(self: &Rc<Self>, channel: &str, name: &str) -> Result<String> {
+    if name == "channel" {
+      return Ok(channel.to_string());
+    }
+    let found = self.read_tables(channel, |db| db.get("SELECT space FROM service WHERE name = ?", &[json!(name)]))?;
+    found["space"].as_str().map(str::to_string).ok_or_else(|| not_found(format!("[{name}] is not a service this channel names")).with_details(json!({"service": name})))
+  }
+
+  // Delete this device's copy of a space: closed, its file removed, and
+  // forgotten here.
+  pub(crate) fn forget(&self, id: &str) -> Result<()> {
+    self.spaces.borrow_mut().remove(id);
+    self.system.store().run("DELETE FROM carbon_system_space WHERE id = ?", &[json!(id)])?;
+    for suffix in ["", "-wal", "-shm"] {
+      let path = PathBuf::from(format!("{}{suffix}", self.space_path(id).display()));
+      if path.exists() {
+        std::fs::remove_file(&path).map_err(|error| bad_request(format!("Cannot delete {}: {error}", path.display())))?;
+      }
+    }
+    Ok(())
+  }
+
+  // A row another device sent for a space this device holds: once its time is
+  // admitted and its space accepts ops, the time moves this device's clock
+  // past it, and it is logged like any other op and applied in the shared order.
   pub fn receive(self: &Rc<Self>, id: &str, row: LogRow, received: Box<dyn FnOnce(Result<()>)>) {
     if let Err(refused) = clock::admit(row.op.time, clock::wall()) {
       return received(Err(refused));
     }
-    let carbon = Rc::clone(self);
-    let logged: Opened = Box::new(move |space| {
-      let accepted = space.and_then(|space| crate::dispatch::accepting(&space).map(|_| space));
-      received(accepted.map(|space| {
-        carbon.clock.observe(row.op.time);
-        carbon.log(&space, row)
-      }))
-    });
-    match self.space_path(id).exists() {
-      true => Rc::clone(self).with_space(id, logged),
-      false => logged(self.create_space(id)),
-    }
+    let accepted = self.space(id).and_then(|space| crate::dispatch::accepting(&space).map(|_| space));
+    received(accepted.map(|space| {
+      self.clock.observe(row.op.time);
+      self.log(&space, row)
+    }))
   }
 
   pub fn identity(&self, slug: &str) -> Result<Identity> {
@@ -210,51 +243,21 @@ impl Carbon {
   }
 }
 
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use crate::testing::{actor, alice, call_now, carbon, space_now};
-  use serde_json::json;
+// The `create` effect: the space of a new channel or service, created on this
+// device running the package named. A channel's space belongs to itself; a
+// service's to the channel of the space that creates it.
+fn create_effect(caller: Rc<ServiceCall>, input: Value, reply: Reply) {
+  reply(create(&caller, &input))
+}
 
-  #[test]
-  fn refuses_replicated_mode_for_now() {
-    let directory = tempfile::tempdir().unwrap();
-    let config = directory.path().join("carbondb.toml");
-    std::fs::write(&config, "system = \"system.db\"\n").unwrap();
-    assert_eq!(Carbon::open(&config, crate::testing::Timers::default().schedule()).err().unwrap().code, "NOT_BUILT");
-  }
-
-  #[test]
-  fn routes_by_service_name_and_refuses_services_it_does_not_run() {
-    let (_directory, carbon) = carbon();
-    let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
-    let system = Rc::clone(carbon.system());
-    assert_eq!(call_now(&carbon, &personal, &actor(&identity), "GET [device]/refs", Value::Null).unwrap().value[0]["name"], json!("Pixel9"));
-    assert_eq!(call_now(&carbon, &system, &Actor::default(), "GET [@carbon]/identities", Value::Null).unwrap().value[0]["slug"], json!("alice"));
-    let refused = [
-      (&personal, "GET [@elsewhere]/x"),
-      (&personal, "GET [identity]/origin"),
-      (&personal, "GET [chat]/messages"),
-      (&personal, "GET [@device]/refs"),
-      (&system, "GET [space]/refs"),
-      (&system, "GET [@carbon]/status"),
-    ];
-    for (space, key) in refused {
-      assert_eq!(call_now(&carbon, space, &actor(&identity), key, Value::Null).unwrap_err().status, 404, "{key}");
-    }
-  }
-
-  #[test]
-  fn opens_a_space_naming_a_service_it_does_not_run_and_refuses_calls_to_it_until_registered() {
-    let (directory, carbon) = carbon();
-    let identity = alice(&carbon);
-    drop(carbon);
-    let restarted = crate::testing::reopen(&directory);
-    let personal = space_now(&restarted, &identity.personal).unwrap();
-    let error = call_now(&restarted, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap_err();
-    assert_eq!((error.status, error.details), (404, Some(json!({"service": "notes"}))));
-    crate::testing::register_notes(&restarted);
-    assert_eq!(call_now(&restarted, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap().value, json!([]));
-  }
+fn create(caller: &ServiceCall, input: &Value) -> Result<Value> {
+  let carbon = caller.carbon();
+  let (id, package) = (input["space"].as_str().unwrap_or_default(), input["package"].as_str().unwrap_or_default().to_string());
+  let name = input["name"].as_str().map_or_else(|| package.clone(), str::to_string);
+  let channel = match package.as_str() {
+    "channel" => Some(id.to_string()),
+    _ => caller.space().runs.channel.clone(),
+  };
+  carbon.create_space(id, Runs { package: package.clone(), name, channel })?;
+  Ok(json!({"space": id, "version": carbon.services().version(&package)}))
 }

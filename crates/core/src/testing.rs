@@ -125,8 +125,14 @@ pub fn register_notes(carbon: &Rc<Carbon>) {
 
 // The scripted test service under a name of its own, with its own notes.
 pub fn register_script(carbon: &Rc<Carbon>, name: &str) {
+  register_script_making(carbon, name, &[]);
+}
+
+// The scripted test service, declaring the effects it makes again on every run.
+pub fn register_script_making(carbon: &Rc<Carbon>, name: &str, always: &[&str]) {
   let init = Rc::new(|db: Rc<dyn Db>| db.run("CREATE TABLE IF NOT EXISTS note (id TEXT PRIMARY KEY, text TEXT NOT NULL) WITHOUT ROWID", &[]).map(|_| ()));
-  carbon.register(Service::replicated(name, &format!("{name}-v1"), Some("db"), NOTES_TIMEOUT, init, Rc::new(notes))).unwrap();
+  let service = Service::replicated(name, &format!("{name}-v1"), Some("db"), NOTES_TIMEOUT, init, Rc::new(notes));
+  carbon.register(Service { always: always.iter().map(|effect| effect.to_string()).collect(), ..service }).unwrap();
 }
 
 // Start something that answers through a callback, and return its answer,
@@ -154,15 +160,37 @@ pub fn actor(identity: &Identity) -> Actor {
   Actor { identity: Some(identity.id.clone()), device: Some(identity.device.clone()) }
 }
 
-// A space running `[notes]`, nested in the identity's personal space.
+// A call on a channel's handle, as the identity, answered at once.
+pub fn on(carbon: &Rc<Carbon>, channel: &str, identity: &Identity, key: &str, input: Value) -> Result<Value> {
+  now(|answer| carbon.call(Some(channel), Some(&identity.id), key, input, answer))
+}
+
+// The space a channel names for `[name]`.
+pub fn service(carbon: &Rc<Carbon>, channel: &str, name: &str) -> Rc<Space> {
+  carbon.service_space(channel, &Call::from_key(&format!("GET [{name}]/any")).unwrap()).unwrap()
+}
+
+// The identity's personal channel's `[notes]`.
+pub fn personal_notes(carbon: &Rc<Carbon>, identity: &Identity) -> Rc<Space> {
+  service(carbon, &identity.personal, "notes")
+}
+
+// A channel "Room" in the identity's personal channel, running `[notes]`: its id.
+pub fn room_channel(carbon: &Rc<Carbon>, identity: &Identity) -> String {
+  let created = on(carbon, &identity.personal, identity, "POST [channel]/channel", json!({"name": "Room"})).unwrap();
+  let room = created["channel"].as_str().unwrap().to_string();
+  on(carbon, &room, identity, "POST [channel]/services", json!({"name": "notes"})).unwrap();
+  room
+}
+
+// The `[notes]` of a fresh "Room" channel in the identity's personal channel.
 pub fn room(carbon: &Rc<Carbon>, identity: &Identity) -> Rc<Space> {
-  let personal = space_now(carbon, &identity.personal).unwrap();
-  let created = call_now(carbon, &personal, &actor(identity), "POST [@carbon]/space", json!({"name": "Room", "services": ["notes"]})).unwrap();
-  space_now(carbon, created.value["space"].as_str().unwrap()).unwrap()
+  let room = room_channel(carbon, identity);
+  service(carbon, &room, "notes")
 }
 
 pub fn texts(db: &dyn Db) -> Result<Value> {
-  let rows = db.all("SELECT text FROM \"notes/db/note\" ORDER BY text", &[])?;
+  let rows = db.all("SELECT text FROM note ORDER BY text", &[])?;
   Ok(Value::Array(rows.into_iter().map(|row| row["text"].clone()).collect()))
 }
 

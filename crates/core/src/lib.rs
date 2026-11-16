@@ -1,7 +1,7 @@
-//! CarbonDB's core, single-node: spaces on SQLite, the services this device
-//! runs, and the one path every call takes to them. Services are written
-//! against ServiceBindings (`carbondb-service-bindings`); bindings for a host
-//! language sit on top.
+//! CarbonDB's core, single-node: each service in its own SQLite file, in a
+//! channel; the services this device runs, and the one path every call takes
+//! to them. Services are written against ServiceBindings
+//! (`carbondb-service-bindings`); bindings for a host language sit on top.
 
 pub mod app;
 pub mod call;

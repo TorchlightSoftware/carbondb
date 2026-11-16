@@ -1,6 +1,6 @@
 //! The op log of a space, or of the system database: what this device
 //! received, each op written as it arrives, before it applies, and never
-//! changed, but that a local op gains its sub-calls when it first commits.
+//! changed, but that an op gains its effects when its first run settles.
 //! What became of each op is its result, in `results`; the ops with no result
 //! yet are pending.
 
@@ -8,54 +8,54 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::error::Result;
+use crate::ops::effects::Made;
 use crate::{Db, Op};
 
 // The shared order every replica applies ops in. An op with no device, made
 // on the system handle, sorts first among those of its time.
 pub(crate) const ORDER: &str = "ORDER BY time, COALESCE(device, ''), hash";
 
-const COLUMNS: &str = "hash, time, device, author, key, input, version, sub_calls";
+const COLUMNS: &str = "hash, time, device, author, key, input, version, effects";
 
 // An op as its log row holds it, and as it travels between devices: the op
-// and, for a local op that has run, the sub-calls it made, which every replay
-// runs in place of the local op. None until a local op first commits; every
-// other op has none.
+// and, once its first run has settled, the effects it made, whose outputs
+// every later run replays. None until then.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogRow {
   pub op: Op,
-  pub sub_calls: Option<Vec<Op>>,
+  pub effects: Option<Vec<Made>>,
 }
 
 impl LogRow {
   // An op as it arrives from this device, before it has run.
   pub fn new(op: Op) -> LogRow {
-    LogRow { op, sub_calls: None }
+    LogRow { op, effects: None }
   }
 }
 
 // Write a row to the log. An op already logged is a duplicate and is dropped.
 pub fn append(db: &dyn Db, row: &LogRow) -> Result<()> {
   let op = &row.op;
-  let sub_calls = row.sub_calls.as_ref().map(serde_json::to_string).transpose()?;
+  let effects = row.effects.as_ref().map(serde_json::to_string).transpose()?;
   db.run(
     &format!("INSERT OR IGNORE INTO carbon_oplog ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
-    &[json!(op.hash), json!(op.time), json!(op.device), json!(op.author), json!(op.key), json!(op.input.to_string()), json!(op.version), json!(sub_calls)],
+    &[json!(op.hash), json!(op.time), json!(op.device), json!(op.author), json!(op.key), json!(op.input.to_string()), json!(op.version), json!(effects)],
   )?;
   Ok(())
 }
 
-// Write a local op's sub-calls onto its row when it first commits, in the
-// transaction that records its result; none is written as an empty list. A
-// replay of the op leaves what its first run wrote.
-pub fn record_sub_calls(db: &dyn Db, hash: &str, sub_calls: &[Op]) -> Result<()> {
-  db.run("UPDATE carbon_oplog SET sub_calls = ? WHERE hash = ? AND sub_calls IS NULL", &[json!(serde_json::to_string(sub_calls)?), json!(hash)])?;
+// Write an op's effects onto its row when its first run settles, with its
+// result; none is written as an empty list. A later run leaves what its first
+// run wrote.
+pub fn record_effects(db: &dyn Db, hash: &str, effects: &[Made]) -> Result<()> {
+  db.run("UPDATE carbon_oplog SET effects = ? WHERE hash = ? AND effects IS NULL", &[json!(serde_json::to_string(effects)?), json!(hash)])?;
   Ok(())
 }
 
-// The sub-calls a local op's row carries once it has run, in the order it made them.
-pub fn sub_calls(db: &dyn Db, hash: &str) -> Result<Option<Vec<Op>>> {
-  let row = db.get("SELECT sub_calls FROM carbon_oplog WHERE hash = ?", &[json!(hash)])?;
-  Ok(row["sub_calls"].as_str().map(serde_json::from_str).transpose()?)
+// The effects an op's row carries once its first run has settled, in the order made.
+pub fn effects(db: &dyn Db, hash: &str) -> Result<Option<Vec<Made>>> {
+  let row = db.get("SELECT effects FROM carbon_oplog WHERE hash = ?", &[json!(hash)])?;
+  Ok(row["effects"].as_str().map(serde_json::from_str).transpose()?)
 }
 
 // The log in the shared order.
@@ -86,6 +86,6 @@ pub(crate) fn to_row(row: Value) -> Result<LogRow> {
     row["time"].as_u64().unwrap_or_default(),
     text("hash").unwrap_or_default(),
   );
-  let sub_calls = row["sub_calls"].as_str().map(serde_json::from_str).transpose()?;
-  Ok(LogRow { op, sub_calls })
+  let effects = row["effects"].as_str().map(serde_json::from_str).transpose()?;
+  Ok(LogRow { op, effects })
 }

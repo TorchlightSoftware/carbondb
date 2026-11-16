@@ -1,27 +1,22 @@
-//! A service's SQL: everything CarbonDB reads in it, the reach it allows it,
-//! and what its statements mean for rewind.
+//! A service's SQL: what CarbonDB reads in it, the reach it allows it, and
+//! what its statements mean for rewind.
 //!
-//! - `namespace` parses each statement, the one place SQL is parsed, and
-//!   moves the names a service owns into its namespace.
 //! - `lookup` finds the one row a statement reads, when it reads just one,
-//!   confirmed by SQLite's query planner.
-//! - `authorizer` refuses a statement that reaches outside its service's
-//!   namespace and records what each statement read.
+//!   confirmed by SQLite's query planner. It is the one place SQL is parsed,
+//!   with sqlparser; a statement it cannot read runs as written and reads its
+//!   whole tables.
+//! - `authorizer` refuses a statement that reaches the core's own tables or
+//!   another file, and records what each statement read.
 //! - `schema` checks a service's tables after its `init`.
 //!
-//! This module keeps what is worked out for each statement, once per
-//! statement text and per space, in memory: the SQL as SQLite runs it, and
-//! the row it looks up. The cache is cleared whenever SQLite's schema version
-//! changes, so a trigger or an index added later is always seen; after a
-//! restart each statement is worked out once more.
-//!
-//! sqlparser is used in `namespace`, which parses, and in `lookup`, which also
-//! tokenizes a statement to number its parameters. A better way to read SQL
-//! replaces only those two.
+//! This module keeps what is worked out for each statement, once per statement
+//! text and per space, in memory: the row it looks up. The cache is cleared
+//! whenever SQLite's schema version changes, so a trigger or an index added
+//! later is always seen; after a restart each statement is worked out once
+//! more.
 
 pub mod authorizer;
 pub mod lookup;
-pub mod namespace;
 pub mod schema;
 
 use std::cell::{Cell, RefCell};
@@ -40,31 +35,29 @@ use lookup::Lookup;
 #[derive(Default)]
 pub(crate) struct Statements {
   schema: Cell<Option<i64>>,
-  known: RefCell<HashMap<(String, String), Rc<Analysed>>>,
+  known: RefCell<HashMap<String, Rc<Analysed>>>,
 }
 
 impl Statements {
   // A service's statement as worked out the first time its text ran under
   // the schema this connection reads.
-  pub(crate) fn get(&self, connection: &Connection, failure: &Failure, prefix: &str, sql: &str) -> Result<Rc<Analysed>> {
+  pub(crate) fn get(&self, connection: &Connection, failure: &Failure, sql: &str) -> Result<Rc<Analysed>> {
     let version = checked(failure, connection.prepare_cached("PRAGMA schema_version").and_then(|mut pragma| pragma.query_row([], |row| row.get(0))))?;
     if self.schema.replace(Some(version)) != Some(version) {
       self.known.borrow_mut().clear();
     }
-    let key = (prefix.to_string(), sql.to_string());
-    if let Some(known) = self.known.borrow().get(&key) {
+    if let Some(known) = self.known.borrow().get(sql) {
       return Ok(Rc::clone(known));
     }
-    let analysed = Rc::new(analyse(connection, prefix, sql)?);
-    self.known.borrow_mut().insert(key, Rc::clone(&analysed));
+    let analysed = Rc::new(Analysed { lookup: lookup::find(connection, sql) });
+    self.known.borrow_mut().insert(sql.to_string(), Rc::clone(&analysed));
     Ok(analysed)
   }
 }
 
-// A statement as SQLite runs it, and the row it looks up, if it reads just one.
+// The row a statement looks up, if it reads just one.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Analysed {
-  pub sql: String,
   lookup: Option<Lookup>,
 }
 
@@ -75,25 +68,15 @@ impl Analysed {
   }
 }
 
-// Work a service's statement out: its namespaced SQL, and the row it looks up.
-fn analyse(connection: &Connection, prefix: &str, sql: &str) -> Result<Analysed> {
-  let statements = namespace::parse(sql)?;
-  let renamed = namespace::rename(sql, &statements, prefix)?;
-  let lookup = lookup::find(connection, sql, &statements, &renamed, prefix);
-  Ok(Analysed { sql: renamed, lookup })
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
   use super::*;
   use serde_json::json;
 
-  const PREFIX: &str = "notes/db/";
-
-  // A bare connection holding a service's namespaced table.
+  // A bare connection holding a service's table.
   pub(crate) fn connection() -> Connection {
     let connection = Connection::open_in_memory().unwrap();
-    connection.execute_batch(r#"CREATE TABLE "notes/db/note" (id TEXT PRIMARY KEY, text TEXT) WITHOUT ROWID"#).unwrap();
+    connection.execute_batch("CREATE TABLE note (id TEXT PRIMARY KEY, text TEXT) WITHOUT ROWID").unwrap();
     connection
   }
 
@@ -101,10 +84,10 @@ pub(crate) mod tests {
   fn a_statement_is_worked_out_once_until_the_schema_changes() {
     let (connection, statements, failure) = (connection(), Statements::default(), Failure::default());
     let sql = "SELECT text FROM note WHERE id = ?";
-    let first = statements.get(&connection, &failure, PREFIX, sql).unwrap();
-    assert!(Rc::ptr_eq(&first, &statements.get(&connection, &failure, PREFIX, sql).unwrap()), "a repeat run reuses its entry");
-    connection.execute_batch(r#"CREATE TABLE "notes/db/tag" (name TEXT PRIMARY KEY) WITHOUT ROWID"#).unwrap();
-    let again = statements.get(&connection, &failure, PREFIX, sql).unwrap();
+    let first = statements.get(&connection, &failure, sql).unwrap();
+    assert!(Rc::ptr_eq(&first, &statements.get(&connection, &failure, sql).unwrap()), "a repeat run reuses its entry");
+    connection.execute_batch("CREATE TABLE tag (name TEXT PRIMARY KEY) WITHOUT ROWID").unwrap();
+    let again = statements.get(&connection, &failure, sql).unwrap();
     assert!(!Rc::ptr_eq(&first, &again), "a schema change replaces it");
     assert_eq!(*first, *again);
   }
@@ -114,8 +97,8 @@ pub(crate) mod tests {
     let (connection, statements, failure) = (connection(), Statements::default(), Failure::default());
     let sql = "SELECT text FROM note WHERE id = ?";
     let params = [json!("a")];
-    assert!(statements.get(&connection, &failure, PREFIX, sql).unwrap().looked_up(&params).is_some());
-    connection.execute_batch(r#"CREATE TRIGGER "notes/db/kept" AFTER DELETE ON "notes/db/note" BEGIN SELECT 1; END"#).unwrap();
-    assert_eq!(statements.get(&connection, &failure, PREFIX, sql).unwrap().looked_up(&params), None);
+    assert!(statements.get(&connection, &failure, sql).unwrap().looked_up(&params).is_some());
+    connection.execute_batch("CREATE TRIGGER kept AFTER DELETE ON note BEGIN SELECT 1; END").unwrap();
+    assert_eq!(statements.get(&connection, &failure, sql).unwrap().looked_up(&params), None);
   }
 }

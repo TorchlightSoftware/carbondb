@@ -41,10 +41,18 @@ pub trait HandlerContext: Db {
   // The op the call writes within, with its ids and randomness; none for a GET.
   fn op(&self) -> Option<&Op>;
 
-  // Make a call by its service key, in the same space and as the same actor.
-  // Inside an op it runs within the op, sees its writes, and when it fails only
-  // its own writes roll back. It answers through `reply`, now or later.
+  // Make a call by its service key, as the same actor. A call to this service
+  // runs within the op, sees its writes, and when it fails only its own writes
+  // roll back. A call to another service, named in this service's channel, is
+  // a message to it: the `call` effect. It answers through `reply`, now or later.
   fn call(self: Rc<Self>, key: &str, input: Value, reply: Reply);
+
+  // Make an effect by name: something outside this service's own tables. On
+  // an op's first run the effect is made and its output, success or failure,
+  // recorded with the op; every replay gets the recorded output instead, unless
+  // the service declares the effect `replicate = "always"`. A replay asking for
+  // more effects than its first run made gets an unreachable failure.
+  fn effect(self: Rc<Self>, name: &str, input: Value, reply: Reply);
 
   // Settle the call, once.
   fn settle(&self, result: Result<Value>) -> Result<()>;
@@ -59,6 +67,8 @@ pub struct Package {
   pub binding: Option<&'static str>,
   // Milliseconds every call to it must settle within; none takes the host's default.
   pub timeout: Option<u64>,
+  // The effects it makes again on every run, by name.
+  pub always: &'static [&'static str],
   pub init: fn(&dyn Db) -> Result<()>,
   pub entry: fn(Rc<dyn HandlerContext>),
 }

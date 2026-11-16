@@ -2303,22 +2303,74 @@ implement per-row reads
 
     New crates/core/src/statements.rs: a per-space, in-memory cache keyed by statement text, cleared whenever SQLite's schema version changes
 
-Nowhere were you authorized to create a new crate.
+Nowhere were you authorized to create a new crate.  Is this just an internal organization mechanism, not required to be published?
 
-#---
+    The first time a statement is seen costs about six small schema queries and the plan.
 
-    Still open: Replicated handlers' side effects are mediated by the WASM boundary:
-    - Which replay policies a side-effect binding can declare, with a table of consequences for each. Proposed so far:
-      - record, the default: the side effect happens on the first run only, and replays get the recorded responses;
+That seems like a lot.  Can you explain?  Maybe it's nothing in terms of performance cost though.
 
-"once" would be a clearer name.  "record" doesn't tell me anything about what it does.
+---
 
-      - repeat: made again on every run on every replica, which is safe only when the response feeds neither the database nor the output.
+    Let the planner do the structural checks.
 
-"replicate" lets say.  But aren't once and replicate mutually exclusive?  So are these tags, or are they an enum for a setting?
+I would do that.  But skip the other proposals you've made.
 
-And do we imagine there being other configurations?  Whether we use enums or a tagging system, I want to ensure that we leave room for additions down the road and we don't back ourselves into a corner.
+I would like this code to live somewhere related to its function... and properly named.  What would you call it, a query analyzer?
 
-    - Whether a failed side effect is recorded like a response, so every replay sees the same failure the first run saw.
+Basically everything related to reading queries, figuring out what their scope is, and translating that into semantics that we care about, should be encapsulated somewhere.  That should either be a single file, or a directory containing a few files.
 
-The outputs of the side effects have to be memoized and transmitted with the Op: I think we've already established that in our other discussions, yes?  The service itself is responsible for interpreting this and deciding whether it's a failure condition for the business logic.  Core's job is just to record it and provide it to the replicated services, not to interpret it.
+---
+
+    Proposed shape:
+
+    query/mod.rs
+    query/namespace.rs
+    query/lookup.rs
+    query/authorizer.rs
+
+I like, mostly.  These things belong together for sure.  Not sure about the name "query".  Are you saying most of statements.rs would go into mod.rs?
+
+    What stays out:
+    - call_window.r
+
+Agreed.  Should "op" related stuff go into its own folder?
+
+    - store.rs
+
+Should "write" related stuff go into its own folder?
+
+    - schema.rs
+
+Should "schema" related stuff go in its own folder?
+
+---
+
+    sqlparser can't read IN table. SQLite's shorthand x IN texts (a table or CTE name after IN) is refused as unreadable SQL by the name rewrite
+
+How do we fix that?
+
+---
+
+a: meh
+b: definitely not
+c: meh
+d: definitely not
+
+Are you unable to get help on this from the query planner that we just hooked into?
+
+---
+
+    this statement fails one step earlier, while its table names are being moved into the service's namespace.
+
+Ok... and we decided to do that rather than keeping DBs unique per service in order to preserve atomicity/transactional integrity between services.
+
+But: cross service transactional integrity was never gauranteed or relied upon in the Cloudflare runtime.  And it doesn't actually match up with the concept of services as "actor model".  We're doing a lot of SQL rewrite stuff that would be unnecessary if we were to give the services their own database instances.
+
+Add a new topic: SQLite instance per service, not per space
+
+And discuss with me.
+
+---
+
+
+

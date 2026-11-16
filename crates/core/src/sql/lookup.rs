@@ -33,6 +33,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 use sqlparser::ast::{BinaryOperator, Expr, FromTable, ObjectNamePart, SetExpr, Statement, TableFactor, Value as Literal};
 use sqlparser::dialect::SQLiteDialect;
+use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Token, Tokenizer};
 
 use crate::store::changeset::Row;
@@ -53,10 +54,12 @@ impl Lookup {
   }
 }
 
-// The row a parsed statement looks up by its whole key, confirmed by SQLite
-// on the statement as it runs, moved into the service's namespace.
-pub(crate) fn find(connection: &Connection, sql: &str, statements: &[Statement], renamed: &str, prefix: &str) -> Option<Lookup> {
-  candidate(sql, statements).and_then(|candidate| confirm(connection, renamed, prefix, candidate).ok().flatten())
+// The row a statement looks up by its whole key, confirmed by SQLite. A
+// statement sqlparser cannot read, such as SQLite's `x IN table`, runs as
+// written and reads its whole tables.
+pub(crate) fn find(connection: &Connection, sql: &str) -> Option<Lookup> {
+  let statements = Parser::parse_sql(&SQLiteDialect {}, sql).ok()?;
+  candidate(sql, &statements).and_then(|candidate| confirm(connection, sql, candidate).ok().flatten())
 }
 
 // Where a key value comes from: a parameter, by its index from 0, or a literal.
@@ -222,9 +225,8 @@ struct KeyColumn {
 // term, the key compares exactly, the table has no triggers, the parameters
 // SQLite counts are the ones numbered, and the planner searches the table by
 // its whole primary key.
-fn confirm(connection: &Connection, sql: &str, prefix: &str, candidate: Candidate) -> rusqlite::Result<Option<Lookup>> {
-  let named = format!("{prefix}{}", candidate.table);
-  let Some(table) = table_name(connection, &named)? else { return Ok(None) };
+fn confirm(connection: &Connection, sql: &str, candidate: Candidate) -> rusqlite::Result<Option<Lookup>> {
+  let Some(table) = table_name(connection, &candidate.table)? else { return Ok(None) };
   let columns = key_columns(connection, &table)?;
   if columns.is_empty() {
     return Ok(None);
@@ -232,7 +234,7 @@ fn confirm(connection: &Connection, sql: &str, prefix: &str, candidate: Candidat
   let key: Option<Vec<(Source, Kind)>> = columns.iter().map(|column| candidate.terms.iter().find(|(name, _)| *name == column.name).map(|(_, source)| (source.clone(), column.kind))).collect();
   let (Some(key), Some(index)) = (key, key_index(connection, &table)?) else { return Ok(None) };
   let exact = key_collations(connection, &index)?.iter().all(|collation| collation.eq_ignore_ascii_case("BINARY"));
-  let shown_as = if candidate.shown_as == candidate.table { named } else { candidate.shown_as.clone() };
+  let shown_as = candidate.shown_as.clone();
   let searched = plan(connection, sql, candidate.params)?.is_some_and(|plan| searches_by_key(&plan, &shown_as, &index, &columns));
   Ok((exact && !has_triggers(connection, &table)? && searched).then_some(Lookup { table, key }))
 }
@@ -298,8 +300,6 @@ mod tests {
   use crate::store::changeset::rows;
   use serde_json::json;
 
-  const PREFIX: &str = "notes/db/";
-
   // A space holding a service's tables of every kind a lookup meets.
   fn store() -> (tempfile::TempDir, Store) {
     let directory = tempfile::tempdir().unwrap();
@@ -315,22 +315,22 @@ mod tests {
       CREATE TRIGGER watched_seen AFTER UPDATE ON watched BEGIN INSERT INTO seen (id) VALUES (new.id); END;
       CREATE VIEW recent AS SELECT * FROM note;
     ";
-    store.scoped(CallWindow { prefix: Some(PREFIX.into()), op: None }).run(schema, &[]).unwrap();
+    store.scoped(CallWindow { service: true, op: None }).run(schema, &[]).unwrap();
     (directory, store)
   }
 
   // A read as a test names it: `table` for the whole table, `table@key` for one row.
   fn read(named: &str) -> Read {
     match named.split_once('@') {
-      Some((table, key)) => Read::Row(Row { table: format!("{PREFIX}{table}"), key: key.into() }),
-      None => Read::Table(format!("{PREFIX}{named}")),
+      Some((table, key)) => Read::Row(Row { table: table.into(), key: key.into() }),
+      None => Read::Table(named.into()),
     }
   }
 
   // What one statement of the service reads, run in an op's transaction.
   fn reads_of(store: &Store, sql: &str, params: &[Value]) -> Vec<Read> {
     store.begin_write().unwrap();
-    store.scoped(CallWindow { prefix: Some(PREFIX.into()), op: None }).all(sql, params).unwrap();
+    store.scoped(CallWindow { service: true, op: None }).all(sql, params).unwrap();
     let read = store.read_set();
     store.end_write(false).unwrap();
     read
@@ -384,7 +384,7 @@ mod tests {
   fn several_statements_run_at_once_read_their_whole_tables() {
     let (_directory, store) = store();
     store.begin_write().unwrap();
-    store.scoped(CallWindow { prefix: Some(PREFIX.into()), op: None }).run("SELECT text FROM note WHERE id = 'a'; SELECT text FROM note WHERE id = 'b'", &[]).unwrap();
+    store.scoped(CallWindow { service: true, op: None }).run("SELECT text FROM note WHERE id = 'a'; SELECT text FROM note WHERE id = 'b'", &[]).unwrap();
     assert_eq!(store.read_set(), vec![read("note")]);
     store.end_write(false).unwrap();
   }
@@ -392,7 +392,7 @@ mod tests {
   #[test]
   fn a_row_read_names_its_row_as_the_changeset_does() {
     let (_directory, store) = store();
-    let scoped = store.scoped(CallWindow { prefix: Some(PREFIX.into()), op: None });
+    let scoped = store.scoped(CallWindow { service: true, op: None });
     scoped.run("INSERT INTO pair (a, b, text) VALUES ('x', 1, 'old')", &[]).unwrap();
     store.begin_write().unwrap();
     scoped.run("UPDATE pair SET text = ? WHERE a = ? AND b = ?", &[json!("new"), json!("x"), json!(1)]).unwrap();
@@ -404,10 +404,10 @@ mod tests {
   #[test]
   fn sqlite_plans_a_lookup_by_key_as_one_search_of_its_key() {
     let connection = crate::sql::tests::connection();
-    let table = "notes/db/note";
+    let table = "note";
     let index = key_index(&connection, table).unwrap();
-    let plan = plan(&connection, r#"SELECT text FROM "notes/db/note" WHERE id = ?"#, 1).unwrap();
-    assert_eq!((index.clone(), plan), (Some("sqlite_autoindex_notes/db/note_1".into()), Some(vec!["SEARCH notes/db/note USING PRIMARY KEY (id=?)".to_string()])));
+    let plan = plan(&connection, "SELECT text FROM note WHERE id = ?", 1).unwrap();
+    assert_eq!((index.clone(), plan), (Some("sqlite_autoindex_note_1".into()), Some(vec!["SEARCH note USING PRIMARY KEY (id=?)".to_string()])));
     assert_eq!(key_collations(&connection, &index.unwrap()).unwrap(), vec!["BINARY".to_string()]);
   }
 }

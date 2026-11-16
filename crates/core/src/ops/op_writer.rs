@@ -45,6 +45,7 @@ impl OpWriter {
 mod tests {
   use super::*;
   use crate::Op;
+  use crate::ops::effects::Made;
   use serde_json::json;
 
   fn row(hash: &str, time: u64) -> LogRow {
@@ -74,15 +75,16 @@ mod tests {
   }
 
   #[test]
-  fn drops_an_op_already_logged_and_keeps_a_received_row_with_its_sub_calls() {
+  fn drops_an_op_already_logged_and_keeps_a_received_row_with_its_effects() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(&directory.path().join("s.db")).unwrap();
     store.migrate(crate::space::MIGRATIONS).unwrap();
     let writer = OpWriter::default();
-    let local = LogRow { sub_calls: Some(vec![row("s", 2).op]), ..row("l", 1) };
-    writer.write(&store, false, local.clone()).unwrap();
+    let made = Made { name: "call".into(), input: json!({"key": "GET [tag]/tags"}), output: Ok(json!(["red"])) };
+    let received = LogRow { effects: Some(vec![made.clone()]), ..row("l", 1) };
+    writer.write(&store, false, received.clone()).unwrap();
     writer.write(&store, false, row("l", 1)).unwrap();
-    assert_eq!(oplog::rows(&store).unwrap(), vec![local]);
-    assert_eq!(oplog::sub_calls(&store, "l").unwrap().map(|ops| ops[0].hash.clone()), Some("s".to_string()));
+    assert_eq!(oplog::rows(&store).unwrap(), vec![received]);
+    assert_eq!(oplog::effects(&store, "l").unwrap(), Some(vec![made]));
   }
 }

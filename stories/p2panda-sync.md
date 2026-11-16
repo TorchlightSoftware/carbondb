@@ -36,7 +36,7 @@ Checked against p2panda 0.8.1 and the spike's earlier pin:
 - An identity tags its devices, and a service tags its operational requirements.
 - An identity's assignment policy reads the tags on its devices and on the services in a space, and assigns which of its devices hold that space at pull, read, write or manage. Much as a scheduler places jobs on suitable machines by their labels, the policy places a space's work on suitable devices.
 - The CarbonDB core provides a default assignment policy. Letting an identity replace it is [backlogged](backlog/assignment-policy-override.md) until testing shows the use cases.
-- Asking p2panda to accept group-held write access is [backlogged](backlog/upstream-group-write.md), so that we can share a working use case first.
+- Asking p2panda to accept group-held write access is [backlogged](channels/backlog/upstream-group-write.md), so that we can share a working use case first.
 
 ## Open
 

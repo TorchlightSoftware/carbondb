@@ -175,8 +175,8 @@ impl Carbon {
     self.inner.register(core::Service::npm(&name, &package, set_up, run)).map_err(to_napi)
   }
 
-  // Make a call by its service key to a space, or to the system handle when no
-  // space is named, as the identity named or as no one. `reply` is called with (error, value).
+  // Make a call by its service key on a channel, or on the system handle when
+  // none is named, as the identity named or as no one. `reply` is called with (error, value).
   #[napi]
   pub fn call(&self, env: Env, space: Option<String>, identity: Option<String>, key: String, input: Value, reply: Callback<'_>) -> Result<()> {
     let reply = answering(&env, reply)?;
@@ -192,10 +192,16 @@ impl Carbon {
     self.inner.watch(&space, identity.as_deref(), &key, answering(&env, listener)?).map_err(to_napi)
   }
 
-  // The ref in a space to `kind:slug`, found at once: the space it points to, its kind, name and slug.
+  // The ref in a channel to `kind:slug`, found at once: the channel it points to, its kind, name and slug.
   #[napi]
-  pub fn find_ref(&self, space: String, kind: String, slug: String) -> Result<Value> {
-    self.inner.find_ref(&space, &kind, &slug).map_err(to_napi)
+  pub fn find_ref(&self, channel: String, kind: String, slug: String) -> Result<Value> {
+    self.inner.find_ref(&channel, &kind, &slug).map_err(to_napi)
+  }
+
+  // The id of the service a channel names `[name]`; the channel's own for `[channel]`.
+  #[napi]
+  pub fn service(&self, channel: String, name: String) -> Result<String> {
+    self.inner.named(&channel, &name).map_err(to_napi)
   }
 
   // Stop a watch or a RunState listener.
@@ -316,6 +322,15 @@ impl HandlerContext {
   pub fn call(&self, env: Env, key: String, input: Value, reply: Callback<'_>) -> Result<()> {
     let reply = answering(&env, reply)?;
     Rc::clone(&self.inner).call(&key, input, Box::new(move |answer| reply(answer)));
+    Ok(())
+  }
+
+  // Make an effect by name: made on an op's first run and recorded, its
+  // recorded output replayed on every later run; `reply` is called with (error, value).
+  #[napi]
+  pub fn effect(&self, env: Env, name: String, input: Value, reply: Callback<'_>) -> Result<()> {
+    let reply = answering(&env, reply)?;
+    Rc::clone(&self.inner).effect(&name, input, Box::new(move |answer| reply(answer)));
     Ok(())
   }
 

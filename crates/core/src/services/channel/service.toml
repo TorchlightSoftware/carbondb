@@ -1,4 +1,4 @@
-name = "space"
+name = "channel"
 
 [[sql]]
 binding = "db"

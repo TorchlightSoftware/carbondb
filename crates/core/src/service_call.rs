@@ -1,18 +1,18 @@
 //! A service call: one call running in the core, which its service's entry
 //! point sees as its handler context. It holds the call, its input and the
 //! actor; the connection its queries run on, inside the op's transaction or a
-//! GET's snapshot; the op it runs within, if it writes; the calls it has made;
-//! and the way to settle it, once.
+//! GET's snapshot; the op it runs within, if it writes; the op's effects; the
+//! calls it has made; and the way to settle it, once.
 //!
-//! A call made inside another runs inside the same op, under a savepoint, so
+//! A call to the same service runs inside the same op, under a savepoint, so
 //! it sees the writes before it, and a failure rolls back only its own writes
-//! and throws to the handler that made it.
+//! and throws to the handler that made it. A call to another service is a
+//! message to it, made as the `call` effect: on the op's first run it is
+//! posted to that service and its answer recorded; every later run gets the
+//! recorded answer (`ops::effects`).
 //!
 //! A call that outlives its deadline expires: the core settles it with a
-//! timeout, and its handler's own answer, when it comes, is dropped. A local service writing to a
-//! replicated one also stamps the call as an op of its own: a sub-call, which
-//! the local op carries on its log row so other devices replay it without the
-//! local op.
+//! timeout, and its handler's own answer, when it comes, is dropped.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -21,9 +21,11 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::Value;
 
+use serde_json::json;
+
 use crate::carbon::{Cancel, Carbon};
-use crate::dispatch::Settled;
 use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal, timed_out};
+use crate::ops::effects::{EffectLog, Made, Turn};
 use crate::space::Space;
 use crate::call_window::{CallWindow, Scoped};
 use crate::store::Reader;
@@ -45,12 +47,6 @@ pub(crate) enum Conn {
 pub struct CallRecord {
   pub key: String,
   pub input: Value,
-  // The space it ran in, when not the caller's.
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub space: Option<String>,
-  // Its own op's stamp, when it ran as a sub-call.
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub op: Option<Op>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub output: Option<Value>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,37 +61,17 @@ impl CallRecord {
       Ok(value) => (Some(value.clone()), None),
       Err(error) => (None, Some(error.clone())),
     };
-    CallRecord { key: call.key(), input, space: None, op: None, output, error, calls }
+    CallRecord { key: call.key(), input, output, error, calls }
   }
 }
 
-// The sub-calls a local op carries, from the calls it made: each stamped as an
-// op of its own whose writes committed, in the order made. A refused call
-// rolled back its writes, and those of every call inside it.
-pub(crate) fn sub_calls(calls: &[CallRecord]) -> Vec<Op> {
-  calls.iter().filter(|record| record.error.is_none()).flat_map(|record| match &record.op {
-    Some(op) => vec![op.clone()],
-    None => sub_calls(&record.calls),
-  }).collect()
-}
-
-// How a call made inside another runs.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Within {
-  // Inside the caller's op, re-run with it on every replica.
-  SameOp,
-  // As a sub-call, stamped as an op of its own: a local service writing to a replicated one.
-  OwnOp,
-}
-
-// Who may call what, and how: a replicated service never calls a local one,
-// since every replica would repeat its effects; a GET never calls a write.
-fn within(caller: &Call, callee: &Call) -> Result<Within> {
+// Who may call what: a replicated service never calls a local one, since
+// every replica would repeat its effects; a GET never calls a write.
+fn allowed(caller: &Call, callee: &Call) -> Result<()> {
   match (caller.confined, caller.writes(), callee.confined, callee.writes()) {
     (false, _, true, _) => Err(forbidden(format!("A replicated service never calls a local one, such as {}", callee.key()))),
     (_, false, _, true) => Err(bad_request(format!("A GET cannot call {}, which writes", callee.key()))),
-    (true, _, false, true) => Ok(Within::OwnOp),
-    _ => Ok(Within::SameOp),
+    _ => Ok(()),
   }
 }
 
@@ -108,6 +84,8 @@ pub struct ServiceCall {
   conn: Conn,
   // The op it runs within, when it writes. Calls within one op share it, and so its draws.
   op: Option<Op>,
+  // The effects of the run it belongs to, shared by every call within it.
+  effects: Rc<RefCell<EffectLog>>,
   // Whether the top-level call it belongs to is still open; nothing queries after.
   live: Rc<Cell<bool>>,
   calls: RefCell<Vec<CallRecord>>,
@@ -129,6 +107,7 @@ impl ServiceCall {
     input: Value,
     conn: Conn,
     op: Option<Op>,
+    effects: Rc<RefCell<EffectLog>>,
     live: Rc<Cell<bool>>,
     settle: Settle,
   ) -> Rc<ServiceCall> {
@@ -140,6 +119,7 @@ impl ServiceCall {
       input,
       conn,
       op,
+      effects,
       live,
       calls: RefCell::default(),
       pending: Cell::new(0),
@@ -175,79 +155,44 @@ impl ServiceCall {
     self.op.as_ref().filter(|_| self.call.writes())
   }
 
-  // Make a call in a space, as an actor. Only a local service calls into
-  // another space, or as another actor, as when it sets up a new identity.
-  pub fn call_in(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, reply: Reply) {
-    if !self.live.get() {
-      return reply(Err(self.ended()));
-    }
-    if !Rc::ptr_eq(space, &self.space) || actor != self.actor {
-      return self.elsewhere(space, actor, call, input, reply);
-    }
-    match within(&self.call, &call) {
-      Ok(Within::OwnOp) => {
-        let own_op = self.carbon.stamp(&actor, &call, &input);
-        self.inside(actor, call, input, Some(own_op), reply)
-      }
-      Ok(Within::SameOp) => self.inside(actor, call, input, None, reply),
-      Err(error) => reply(Err(error)),
-    }
-  }
-
-  // Replay a sub-call a local op made, as recorded on its row: under the
-  // stamp it was made with, in place of the local op itself.
-  pub(crate) fn replay(self: &Rc<Self>, sub_call: Op, reply: Reply) {
-    if !self.live.get() {
-      return reply(Err(self.ended()));
-    }
-    match Call::from_key(&sub_call.key) {
-      Ok(call) => self.inside(crate::ops::op::actor(&sub_call), call, sub_call.input.clone(), Some(sub_call), reply),
-      Err(error) => reply(Err(error)),
-    }
-  }
-
-  // A local service's call into another space, or as another actor: an op of
-  // that space's own, applied when its turn there comes.
-  fn elsewhere(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, reply: Reply) {
+  // Make a call in another space, as an actor: the `call` effect. Only a local
+  // service names the space, or acts as another, as when it founds an identity.
+  pub fn call_in(self: &Rc<Self>, space: &str, actor: Actor, call: Call, input: Value, reply: Reply) {
     if !self.call.confined {
-      return reply(Err(forbidden(format!("Only a local service calls into another space or as another actor, not {}", self.call.key()))));
+      return reply(Err(forbidden(format!("Only a local service calls into a space by its id, or as another actor, not {}", self.call.key()))));
     }
-    if Rc::ptr_eq(space, &self.space) && call.writes() {
-      let own_op = self.carbon.stamp(&actor, &call, &input);
-      return self.inside(actor, call, input, Some(own_op), reply);
-    }
-    self.pending.set(self.pending.get() + 1);
-    let caller = Rc::clone(self);
-    let (record_call, record_input, id) = (call.clone(), input.clone(), space.id.clone());
-    self.carbon.submit(space, actor, call, input, Box::new(move |settled: Result<Settled>| {
-      let result = settled.map(|settled| settled.value);
-      let mut record = CallRecord::of(&record_call, record_input, &result, vec![]);
-      record.space = Some(id);
-      caller.returned(record);
-      reply(result)
-    }));
+    let request = json!({"space": space, "key": call.key(), "input": input, "as": actor});
+    HandlerContext::effect(Rc::clone(self), "call", request, reply)
   }
 
-  // A call inside this one's transaction: under a savepoint when it writes, in
-  // the same op, or as a sub-call with an op of its own.
-  fn inside(self: &Rc<Self>, actor: Actor, call: Call, input: Value, own_op: Option<Op>, reply: Reply) {
+  // A call to this same service, inside this one's op: under a savepoint when it writes.
+  fn inside(self: &Rc<Self>, call: Call, input: Value, reply: Reply) {
     let guarded = self.call.writes();
     if guarded && let Err(error) = self.space.store().savepoint() {
       return reply(Err(error));
     }
-    let op = own_op.clone().or_else(|| self.op.clone());
     self.pending.set(self.pending.get() + 1);
     let caller = Rc::clone(self);
     let (record_call, record_input) = (call.clone(), input.clone());
     let settle: Settle = Box::new(move |result, calls| {
       let result = if guarded { caller.close(result) } else { result };
-      let mut record = CallRecord::of(&record_call, record_input, &result, calls);
-      record.op = own_op;
-      caller.returned(record);
+      caller.returned(CallRecord::of(&record_call, record_input, &result, calls));
       reply(result)
     });
-    let callee = ServiceCall::new(&self.carbon, &self.space, actor, call, input, self.conn.clone(), op, Rc::clone(&self.live), settle);
+    let callee = ServiceCall::new(&self.carbon, &self.space, self.actor.clone(), call, input, self.conn.clone(), self.op.clone(), Rc::clone(&self.effects), Rc::clone(&self.live), settle);
     self.carbon.route(callee);
+  }
+
+  // A call to another service: a message, made as the `call` effect and kept
+  // among the calls this one made.
+  fn message(self: &Rc<Self>, call: Call, input: Value, reply: Reply) {
+    let caller = Rc::clone(self);
+    let (record_call, record_input) = (call.clone(), input.clone());
+    let request = json!({"key": call.key(), "input": input});
+    HandlerContext::effect(Rc::clone(self), "call", request, Box::new(move |result| {
+      caller.calls.borrow_mut().push(CallRecord::of(&record_call, record_input, &result, vec![]));
+      reply(result)
+    }));
   }
 
   // End a call's savepoint, keeping its writes or rolling them back.
@@ -268,13 +213,13 @@ impl ServiceCall {
     internal(format!("{} has ended; nothing more runs inside it", self.call.key()))
   }
 
-  // The `db` binding: the service's namespace on this call's connection, with its op.
+  // The `db` binding: the service's own tables on this call's connection,
+  // with its op. `[@carbon]`'s statements are the core's own.
   fn db(&self) -> Result<Scoped<'_>> {
     if !self.live.get() {
       return Err(self.ended());
     }
-    let prefix = self.carbon.services().get(&self.call.service)?.prefix()?;
-    let window = CallWindow { prefix, op: self.writing().cloned() };
+    let window = CallWindow { service: !self.call.confined, op: self.writing().cloned() };
     Ok(match &self.conn {
       Conn::Writer => self.space.store().scoped(window),
       Conn::Reader(reader) => reader.scoped(window),
@@ -318,13 +263,40 @@ impl HandlerContext for ServiceCall {
   }
 
   fn call(self: Rc<Self>, key: &str, input: Value, reply: Reply) {
-    match Call::from_key(key) {
-      Ok(call) => {
-        let (space, actor) = (Rc::clone(&self.space), self.actor.clone());
-        self.call_in(&space, actor, call, input, reply)
-      }
-      Err(error) => reply(Err(error)),
+    if !self.live.get() {
+      return reply(Err(self.ended()));
     }
+    let call = match Call::from_key(key).and_then(|call| allowed(&self.call, &call).map(|_| call)) {
+      Ok(call) => call,
+      Err(error) => return reply(Err(error)),
+    };
+    match self.space.answers(&call) {
+      true => self.inside(call, input, reply),
+      false => self.message(call, input, reply),
+    }
+  }
+
+  fn effect(self: Rc<Self>, name: &str, input: Value, reply: Reply) {
+    if !self.live.get() {
+      return reply(Err(self.ended()));
+    }
+    let always = self.space.service().is_some_and(|service| service.always.iter().any(|effect| effect == name));
+    let turn = if always { Turn::Make } else { self.effects.borrow_mut().next(name) };
+    if let Turn::Recorded(output) = turn {
+      return reply(output);
+    }
+    self.pending.set(self.pending.get() + 1);
+    let caller = Rc::clone(&self);
+    let (kept_name, kept_input) = (name.to_string(), input.clone());
+    let made: Reply = Box::new(move |output| {
+      caller.pending.set(caller.pending.get() - 1);
+      if !always && caller.effects.borrow().first_run() {
+        caller.effects.borrow_mut().keep(Made { name: kept_name, input: kept_input, output: output.clone() });
+      }
+      reply(output)
+    });
+    let carbon = Rc::clone(&self.carbon);
+    carbon.effects().make(self, name, input, made)
   }
 
   // A handler that finishes before the calls it made fails, since their writes
@@ -352,49 +324,21 @@ impl HandlerContext for ServiceCall {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use serde_json::json;
 
   #[test]
-  fn decides_how_a_call_inside_another_runs() {
+  fn decides_who_may_call_what() {
     let key = |key: &str| Call::from_key(key).unwrap();
     let cases = [
-      ("POST [chat]/messages", "POST [space]/ref", Ok(Within::SameOp)),
-      ("POST [chat]/messages", "GET [space]/refs", Ok(Within::SameOp)),
-      ("GET [chat]/messages", "GET [space]/refs", Ok(Within::SameOp)),
-      ("POST [@carbon]/space", "POST [space]/ref", Ok(Within::OwnOp)),
-      ("POST [@carbon]/space", "GET [space]/refs", Ok(Within::SameOp)),
-      ("POST [@carbon]/space", "GET [@carbon]/status", Ok(Within::SameOp)),
+      ("POST [chat]/messages", "POST [tag]/tags", Ok(())),
+      ("POST [chat]/messages", "GET [channel]/members", Ok(())),
+      ("GET [chat]/messages", "GET [tag]/tags", Ok(())),
+      ("POST [@carbon]/identity", "POST [channel]/origin", Ok(())),
       ("POST [chat]/messages", "GET [@carbon]/status", Err(403)),
-      ("GET [chat]/messages", "POST [space]/ref", Err(400)),
-      ("GET [@carbon]/status", "POST [space]/ref", Err(400)),
+      ("GET [chat]/messages", "POST [tag]/tags", Err(400)),
+      ("GET [@carbon]/status", "POST [channel]/ref", Err(400)),
     ];
     for (caller, callee, expected) in cases {
-      assert_eq!(within(&key(caller), &key(callee)).map_err(|error| error.status), expected, "{caller} -> {callee}");
-    }
-  }
-
-  // A call a local op made: an op of its own when `own` names its hash, refused when `refused`.
-  fn made(key: &str, own: Option<&str>, refused: bool, calls: Vec<CallRecord>) -> CallRecord {
-    let op = own.map(|hash| Op::new(key.into(), json!({}), None, None, "v".into(), 1, hash.into()));
-    let (output, error) = if refused { (None, Some(bad_request("no"))) } else { (Some(json!(null)), None) };
-    CallRecord { key: key.into(), input: json!({}), space: None, op, output, error, calls }
-  }
-
-  #[test]
-  fn a_local_op_keeps_the_sub_calls_whose_writes_committed() {
-    let in_another_space = CallRecord { space: Some("other".into()), ..made("POST [space]/origin", None, false, vec![]) };
-    let cases = [
-      ("an op of its own that applied", vec![made("POST [space]/ref", Some("a"), false, vec![])], vec!["a"]),
-      ("an op of its own that was refused", vec![made("POST [space]/ref", Some("a"), true, vec![])], vec![]),
-      ("in the order they were made", vec![made("POST [space]/ref", Some("a"), false, vec![]), made("POST [space]/ref", Some("b"), false, vec![])], vec!["a", "b"]),
-      ("inside a local call that applied", vec![made("POST [@notes]/run", None, false, vec![made("POST [space]/ref", Some("a"), false, vec![])])], vec!["a"]),
-      ("inside a local call that failed, which rolled it back", vec![made("POST [@notes]/run", None, true, vec![made("POST [space]/ref", Some("a"), false, vec![])])], vec![]),
-      ("a read, which writes nothing", vec![made("GET [space]/refs", None, false, vec![])], vec![]),
-      ("a call into another space, an op there", vec![in_another_space], vec![]),
-    ];
-    for (name, calls, expected) in cases {
-      let hashes: Vec<String> = sub_calls(&calls).into_iter().map(|op| op.hash).collect();
-      assert_eq!(hashes, expected, "{name}");
+      assert_eq!(allowed(&key(caller), &key(callee)).map_err(|error| error.status), expected, "{caller} -> {callee}");
     }
   }
 }

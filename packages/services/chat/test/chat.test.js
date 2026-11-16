@@ -15,24 +15,26 @@ function configFile() {
   return path
 }
 
-// An app's start: load CarbonDB, register [chat], and reach the lobby, made on
-// the first start and found again on later ones.
+// An app's start: load CarbonDB, register [chat], and reach the lobby, a
+// channel running [chat], made on the first start and found again on later ones.
 async function start(config) {
-  const carbon = await configure(config)
+  carbon = await configure(config)
   carbon.services.add('chat', chat)
   const identities = await carbon.call('GET [@carbon]/identities')
   const known = identities.some((identity) => identity.slug === 'app')
   if (known) {
-    return carbon.ref('identity:app').ref('personal:app').ref('space:lobby')
+    return carbon.ref('identity:app').ref('personal:app').ref('channel:lobby')
   } else {
     await carbon.call('POST [@carbon]/identity', {slug: 'app', device: 'server'})
     const personal = carbon.ref('identity:app').ref('personal:app')
-    await personal.call('POST [@carbon]/space', {name: 'Lobby', services: ['chat']})
-    return personal.ref('space:lobby')
+    await personal.call('POST [channel]/channel', {name: 'Lobby'})
+    const lobby = personal.ref('channel:lobby')
+    await lobby.call('POST [channel]/services', {name: 'chat'})
+    return lobby
   }
 }
 
-let config, lobby
+let config, carbon, lobby
 beforeEach(async () => {
   config = configFile()
   lobby = await start(config)
@@ -99,8 +101,8 @@ describe('errors', () => {
 
 describe('status', () => {
   it('describes the lobby: its name, services and single-node state', async () => {
-    const {kind, name, services, access, sync, peers} = await lobby.call('GET [@carbon]/status')
-    assert.deepStrictEqual({kind, name, services, access, sync, peers}, {kind: 'space', name: 'Lobby', services: ['chat'], access: ['manage'], sync: 'off', peers: []})
+    const {kind, name, services, access, sync, peers} = await carbon.call('GET [@carbon]/status', {channel: lobby.channel})
+    assert.deepStrictEqual({kind, name, services, access, sync, peers}, {kind: 'channel', name: 'Lobby', services: [{name: 'chat', access: ['manage'], sync: 'off'}], access: ['manage'], sync: 'off', peers: []})
   })
 })
 

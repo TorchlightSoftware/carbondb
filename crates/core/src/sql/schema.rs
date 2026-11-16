@@ -14,15 +14,17 @@ use serde_json::{Value, json};
 
 use crate::Db;
 use crate::error::{Result, bad_request};
+use crate::sql::authorizer::CORE;
 
-// Refuse the first table in a namespace whose rows' keys SQLite assigns.
-pub fn check_keys(db: &dyn Db, prefix: &str) -> Result<()> {
-  let tables = db.all("SELECT name, wr FROM pragma_table_list WHERE type = 'table' AND substr(name, 1, length(?)) = ?", &[json!(prefix), json!(prefix)])?;
+// Refuse the first of a service's tables whose rows' keys SQLite assigns:
+// every table in its file but the core's own and SQLite's.
+pub fn check_keys(db: &dyn Db) -> Result<()> {
+  let tables = db.all("SELECT name, wr FROM pragma_table_list WHERE schema = 'main' AND type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND substr(name, 1, length(?)) != ?", &[json!(CORE), json!(CORE)])?;
   for table in &tables {
     let name = table["name"].as_str().unwrap_or_default();
     let keys = db.all("SELECT type FROM pragma_table_info(?) WHERE pk > 0", &[json!(name)])?;
     if let Some(problem) = problem(table["wr"] == json!(1), &keys) {
-      return Err(guidance(name.strip_prefix(prefix).unwrap_or(name), problem));
+      return Err(guidance(name, problem));
     }
   }
   Ok(())
@@ -68,9 +70,9 @@ mod tests {
     for (sql, expected) in cases {
       let directory = tempfile::tempdir().unwrap();
       let store = Store::open(&directory.path().join("s.db")).unwrap();
-      store.scoped(CallWindow { prefix: Some("notes/db/".into()), op: None }).run(sql, &[]).unwrap();
-      store.run_batch("CREATE TABLE elsewhere (text TEXT)").unwrap();
-      let checked = check_keys(&store, "notes/db/");
+      store.scoped(CallWindow { service: true, op: None }).run(sql, &[]).unwrap();
+      store.run_batch("CREATE TABLE carbon_log (text TEXT)").unwrap();
+      let checked = check_keys(&store);
       match expected {
         None => assert!(checked.is_ok(), "{sql}: {checked:?}"),
         Some(problem) => {

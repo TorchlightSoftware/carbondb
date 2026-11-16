@@ -1,5 +1,5 @@
-//! A service key parsed into the parts the core routes on: `POST [space]/ref`
-//! is {method: POST, service: space, resource: /ref}. The grammar is the
+//! A service key parsed into the parts the core routes on: `POST [channel]/ref`
+//! is {method: POST, service: channel, resource: /ref}. The grammar is the
 //! `service-key` crate's, the same as the JS runtime's, so a key means the
 //! same wherever it is written.
 
@@ -52,7 +52,7 @@ mod tests {
 
   #[test]
   fn reads_what_it_routes_on_from_a_key() {
-    let cases = [("POST [space]/ref", "POST", true), ("GET [@carbon]/status", "GET", false), ("[device]/refs", "", true)];
+    let cases = [("POST [channel]/ref", "POST", true), ("GET [@carbon]/status", "GET", false), ("[identity]/devices", "", true)];
     for (key, method, writes) in cases {
       let call = Call::from_key(key).unwrap();
       assert_eq!((call.method(), call.writes(), call.key()), (method, writes, key.to_string()), "{key}");

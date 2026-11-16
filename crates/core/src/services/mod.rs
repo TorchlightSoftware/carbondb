@@ -1,19 +1,18 @@
 //! The services this device runs: `[@carbon]`, the one the core implements
-//! itself; the builtin packages `[space]`, `[identity]` and `[device]`; and the
-//! app services the runtime registers at startup. A service is its name,
-//! whether it is local (`[@name]`, run once on this device) or replicated, its
+//! itself; the builtin packages `[channel]` and `[identity]`; and the app
+//! services the runtime registers at startup. A service is its name, whether
+//! it is local (`[@name]`, run once on this device) or replicated, its
 //! version, its `sql` binding, the time every call to it must settle within,
-//! the `init` that sets up its schema, and its entry point. CarbonDB routes a
-//! call to an entry point by service name only; the entry point routes method
-//! and resource itself.
+//! the effects it makes again on every run, the `init` that sets up its
+//! schema, and its entry point. Each space runs one service; CarbonDB routes a
+//! call to that service's entry point, which routes method and resource itself.
 //!
 //! An npm service is registered from its package's `service.toml`, under the
 //! name the app gives it, which overrides the canonical name in the manifest.
 
 pub mod carbon;
-pub mod device;
+pub mod channel;
 pub mod identity;
-pub mod space;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -25,7 +24,6 @@ use carbondb_service_bindings::manifest::{self, Manifest};
 use serde_json::json;
 
 use crate::error::{Result, bad_request, conflict, not_found};
-use crate::sql::namespace;
 use crate::service_call::ServiceCall;
 use crate::{Db, HandlerContext, Package};
 
@@ -33,7 +31,7 @@ use crate::{Db, HandlerContext, Package};
 // this module, with its own service.toml and migrations, written against
 // ServiceBindings alone as a package of its own would be; the build script
 // packages each.
-const BUILTINS: [Package; 3] = [space::PACKAGE, identity::PACKAGE, device::PACKAGE];
+const BUILTINS: [Package; 2] = [channel::PACKAGE, identity::PACKAGE];
 
 // How long a call to a service may take to settle when its service.toml names no timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -53,6 +51,9 @@ pub struct Service {
   pub binding: Option<String>,
   // Every top-level call to it must settle within this, or it is settled with a timeout.
   pub timeout: Duration,
+  // The effects it makes again on every run of an op, by name; every other is
+  // made on an op's first run only.
+  pub always: Vec<String>,
   pub init: Init,
   // Every service but `[@carbon]` sees its service call only as a handler context.
   pub(crate) entry: Rc<dyn Fn(Rc<ServiceCall>)>,
@@ -66,6 +67,7 @@ impl Service {
       version: version.into(),
       binding: binding.map(str::to_string),
       timeout,
+      always: vec![],
       init,
       entry: Rc::new(move |call: Rc<ServiceCall>| entry(call)),
     }
@@ -73,31 +75,25 @@ impl Service {
 
   fn package(package: &Package) -> Service {
     let (init, entry) = (package.init, package.entry);
-    Service::replicated(package.name, package.version, package.binding, timeout(package.timeout), Rc::new(move |db: Rc<dyn Db>| init(db.as_ref())), Rc::new(entry))
+    let service = Service::replicated(package.name, package.version, package.binding, timeout(package.timeout), Rc::new(move |db: Rc<dyn Db>| init(db.as_ref())), Rc::new(entry));
+    Service { always: package.always.iter().map(|name| name.to_string()).collect(), ..service }
   }
 
   // An npm package's service, registered under `name`.
   pub fn npm(name: &str, package: &NpmPackage, init: Init, entry: Entry) -> Service {
-    Service::replicated(name, &package.version, package.binding.as_deref(), package.timeout, init, entry)
-  }
-
-  // The namespace its statements run in: `chat/db/`. None for `[@carbon]`, the
-  // core's own, whose statements run unscoped.
-  pub fn prefix(&self) -> Result<Option<String>> {
-    match (&self.binding, self.local) {
-      (Some(binding), _) => Ok(Some(namespace::prefix(&self.name, binding))),
-      (None, true) => Ok(None),
-      (None, false) => Err(bad_request(format!("Service '{}' declares no sql binding, so it has no tables", self.name))),
-    }
+    let service = Service::replicated(name, &package.version, package.binding.as_deref(), package.timeout, init, entry);
+    Service { always: package.always.clone(), ..service }
   }
 }
 
 // An npm package as the core reads it, from the service.toml its module points
-// to: the binding its handlers receive, its timeout, and its version, the hash
-// of every file beside its service.toml.
+// to: the binding its handlers receive, its timeout, the effects it makes
+// again on every run, and its version, the hash of every file beside its
+// service.toml.
 pub struct NpmPackage {
   pub binding: Option<String>,
   pub timeout: Duration,
+  pub always: Vec<String>,
   pub version: String,
 }
 
@@ -107,7 +103,7 @@ impl NpmPackage {
     let path = manifest.ok_or_else(|| bad_request(format!("Service '{name}' exports no manifest, the URL of its service.toml")))?;
     let read = Manifest::read(path).map_err(bad_request)?;
     let version = manifest::version(path.parent().unwrap_or(path)).map_err(bad_request)?;
-    Ok(NpmPackage { binding: read.binding().map(str::to_string), timeout: timeout(read.timeout), version })
+    Ok(NpmPackage { binding: read.binding().map(str::to_string), timeout: timeout(read.timeout), always: read.replicated_always(), version })
   }
 }
 
@@ -127,7 +123,6 @@ impl Services {
   }
 
   pub fn register(&self, service: Service) -> Result<Rc<Service>> {
-    namespace::check_parts(std::iter::once(service.name.as_str()).chain(service.binding.as_deref()))?;
     let mut registered = self.registered.borrow_mut();
     if registered.contains_key(&service.name) {
       return Err(conflict(format!("A service '{}' is already registered on this device", service.name)));
@@ -141,12 +136,12 @@ impl Services {
     self.registered.borrow().get(name).cloned()
   }
 
-  // A service a space names, which this device must run.
+  // A service a channel names, which this device must run.
   pub fn get(&self, name: &str) -> Result<Rc<Service>> {
     self.find(name).ok_or_else(|| missing(name))
   }
 
-  // Refuse a new space naming a service this device cannot run.
+  // Refuse a new service of a package this device cannot run.
   pub fn require_registered(&self, names: &[String]) -> Result<()> {
     let missing: Vec<&String> = names.iter().filter(|name| self.find(name).is_none()).collect();
     if missing.is_empty() {
@@ -173,7 +168,7 @@ fn timeout(milliseconds: Option<u64>) -> Duration {
 // from running again and from being published.
 pub const SERVICE_MISSING: &str = "service missing";
 
-// Where a service a space names leads when this device does not run it.
+// Where a service a channel names leads when this device does not run it.
 pub fn missing(name: &str) -> crate::error::ServiceError {
   not_found(format!("Service '{name}' is not registered on this device")).with_details(json!({"service": name}))
 }
@@ -194,34 +189,21 @@ mod tests {
   fn starts_with_the_builtins_and_registers_each_name_once() {
     let services = Services::builtin();
     let builtins: Vec<(String, bool, Option<String>)> =
-      ["carbon", "space", "identity", "device"].iter().map(|name| services.get(name).unwrap()).map(|service| (service.name.clone(), service.local, service.binding.clone())).collect();
+      ["carbon", "channel", "identity"].iter().map(|name| services.get(name).unwrap()).map(|service| (service.name.clone(), service.local, service.binding.clone())).collect();
     let db = || Some("db".to_string());
-    assert_eq!(builtins, [("carbon".into(), true, None), ("space".into(), false, db()), ("identity".into(), false, db()), ("device".into(), false, db())]);
+    assert_eq!(builtins, [("carbon".into(), true, None), ("channel".into(), false, db()), ("identity".into(), false, db())]);
     services.register(service("chat")).unwrap();
-    for name in ["chat", "space"] {
+    for name in ["chat", "channel"] {
       assert_eq!(services.register(service(name)).err().unwrap().status, 409, "{name}");
     }
     assert_eq!(services.version("chat"), "v1");
-    assert_eq!(services.get("chat").unwrap().prefix().unwrap(), Some("chat/db/".into()));
-  }
-
-  #[test]
-  fn refuses_a_name_that_would_nest_inside_another_service_namespace() {
-    let services = Services::builtin();
-    services.register(service("chat")).unwrap();
-    let nested = [replicated("chat/db", Some("db")), replicated("notes", Some("db/x"))];
-    for service in nested {
-      let name = service.name.clone();
-      assert_eq!(services.register(service).err().unwrap().status, 400, "{name}");
-      assert!(services.find(&name).is_none(), "{name}");
-    }
   }
 
   #[test]
   fn names_what_is_missing() {
     let services = Services::builtin();
-    assert!(services.require_registered(&["space".into()]).is_ok());
-    let error = services.require_registered(&["space".into(), "crm".into()]).unwrap_err();
+    assert!(services.require_registered(&["channel".into()]).is_ok());
+    let error = services.require_registered(&["channel".into(), "crm".into()]).unwrap_err();
     assert_eq!((error.status, error.details), (400, Some(json!({"services": ["crm"]}))));
     assert_eq!(services.get("crm").err().unwrap().details, Some(json!({"service": "crm"})));
   }
@@ -240,10 +222,11 @@ mod tests {
 
   #[test]
   fn registers_an_npm_service_from_its_service_toml_under_the_name_the_app_gives_it() {
-    let chat = package("name = \"chat\"\ntimeout = 50\n[[sql]]\nbinding = \"db\"\n");
+    let chat = package("name = \"chat\"\ntimeout = 50\n[[sql]]\nbinding = \"db\"\n[effects.fetch]\nreplicate = \"always\"\n");
     let manifest = chat.path().join("service.toml");
     let service = npm("lobby", Some(&manifest)).unwrap();
     assert_eq!((service.name.as_str(), service.binding.as_deref(), service.timeout), ("lobby", Some("db"), Duration::from_millis(50)));
+    assert_eq!(service.always, ["fetch"]);
     assert_eq!(service.version, manifest::version(chat.path()).unwrap());
     let plain = package("name = \"plain\"\n");
     assert_eq!(npm("plain", Some(&plain.path().join("service.toml"))).unwrap().timeout, DEFAULT_TIMEOUT);

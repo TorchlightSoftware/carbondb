@@ -14,13 +14,15 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::{Manifest, version};
 
-// The Rust a package embeds: its name, version, sql binding and timeout.
+// The Rust a package embeds: its name, version, sql binding, timeout, and
+// the effects it makes again on every run.
 pub fn generate(manifest: &Manifest, version: &str) -> String {
   format!(
-    "pub const NAME: &str = {:?};\npub const VERSION: &str = {version:?};\npub const BINDING: Option<&str> = {:?};\npub const TIMEOUT: Option<u64> = {:?};\n",
+    "pub const NAME: &str = {:?};\npub const VERSION: &str = {version:?};\npub const BINDING: Option<&str> = {:?};\npub const TIMEOUT: Option<u64> = {:?};\npub const ALWAYS: &[&str] = &{:?};\n",
     manifest.name,
     manifest.binding(),
-    manifest.timeout
+    manifest.timeout,
+    manifest.replicated_always()
   )
 }
 
@@ -50,7 +52,7 @@ mod tests {
     let manifest = Manifest::parse("name = \"space\"\n[[sql]]\nbinding = \"db\"\n").unwrap();
     assert_eq!(
       generate(&manifest, "v1"),
-      "pub const NAME: &str = \"space\";\npub const VERSION: &str = \"v1\";\npub const BINDING: Option<&str> = Some(\"db\");\npub const TIMEOUT: Option<u64> = None;\n"
+      "pub const NAME: &str = \"space\";\npub const VERSION: &str = \"v1\";\npub const BINDING: Option<&str> = Some(\"db\");\npub const TIMEOUT: Option<u64> = None;\npub const ALWAYS: &[&str] = &[];\n"
     );
   }
 

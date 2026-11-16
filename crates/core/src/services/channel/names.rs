@@ -1,5 +1,5 @@
-//! Slugs: the lowercase kebab-case half of a space name, as in `team:sales`. A
-//! slug is a local pet name, unique among the refs of the space holding it.
+//! Slugs: the lowercase kebab-case half of a channel name, as in `team:sales`. A
+//! slug is a local pet name, unique among the refs of the channel holding it.
 
 // A name as a lowercase kebab-case slug: "Randall's Playhouse" becomes "randalls-playhouse".
 pub fn slugify(name: &str) -> String {

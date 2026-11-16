@@ -25,16 +25,18 @@ async function handle(routes, context, request) {
 
 // What a handler receives: its path parameters and input; `env`, its bindings
 // by the names its service.toml gives them, as a Worker's env holds them; a way
-// to make calls of its own; and the op, with `run` on its binding, when the call writes.
+// to make calls of its own, and effects; and the op, with `run` on its
+// binding, when the call writes.
 function handlerContextOf(context, {input, op, binding}, path) {
   const queries = {
     get: (sql, params) => core(() => context.get(sql, params)),
     all: (sql, params) => core(() => context.all(sql, params))
   }
   const call = (key, callInput = null) => answered((reply) => context.call(key, callInput, reply))
-  if (!op) return {path, input, env: envOf(binding, queries), call}
+  const effect = (name, effectInput = null) => answered((reply) => context.effect(name, effectInput, reply))
+  if (!op) return {path, input, env: envOf(binding, queries), call, effect}
   const db = {...queries, run: (sql, params) => core(() => context.run(sql, params))}
-  return {path, input, env: envOf(binding, db), call, op: opOf(context, op, path)}
+  return {path, input, env: envOf(binding, db), call, effect, op: opOf(context, op, path)}
 }
 
 // A service's env: its one sql binding under its name, or nothing when it declares none.

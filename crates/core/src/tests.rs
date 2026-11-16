@@ -1,12 +1,14 @@
 //! Tests across the core: how calls apply, nest and roll back; what the op log
-//! and results record; and what `[@carbon]` sets up, through the builtins, as ops.
+//! and results record; what `[@carbon]` founds, through `[channel]` and
+//! `[identity]`, as ops; how channels name and create services; how effects
+//! are made once and replayed; and how replicas converge.
 
 use std::rc::Rc;
 
 use serde_json::{Value, json};
 
 use crate::ops::results::{self, Outcome};
-use crate::testing::{actor, alice, call_now, carbon, room, space_now, texts};
+use crate::testing::{actor, alice, call_now, carbon, on, room, room_channel, service, space_now, texts};
 use crate::ops::oplog;
 use crate::{Actor, Db, Routing};
 
@@ -103,9 +105,9 @@ mod transactions {
     let identity = alice(&carbon);
     let space = room(&carbon, &identity);
     let wrote = call_now(&carbon, &space, &actor(&identity), "POST [notes]/run", run(json!([{"insert": "a"}]))).unwrap();
-    assert_eq!(wrote.tables, vec!["notes/db/note"]);
+    assert_eq!(wrote.tables, vec!["note"]);
     let read = call_now(&carbon, &space, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap();
-    assert_eq!(read.tables, vec!["notes/db/note"]);
+    assert_eq!(read.tables, vec!["note"]);
   }
 }
 
@@ -122,31 +124,33 @@ mod oplog_entries {
     call_now(&carbon, &space, &actor(&identity), "POST [notes]/run", json!({"do": [{"fail": "no"}]})).unwrap_err();
     call_now(&carbon, &space, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap();
 
-    assert_eq!(logged(&space), vec!["POST [space]/origin", "POST [notes]/run", "POST [notes]/run"]);
-    assert_eq!(outcomes(&space), vec![Ok(()), Ok(()), Err(409)]);
-    let applied = &oplog::entries(space.store()).unwrap()[1];
+    assert_eq!(logged(&space), vec!["POST [notes]/run", "POST [notes]/run"]);
+    assert_eq!(outcomes(&space), vec![Ok(()), Err(409)]);
+    let applied = &oplog::entries(space.store()).unwrap()[0];
     assert_eq!((&applied.author, &applied.device, &applied.input, applied.version.as_str()), (&Some(identity.id.clone()), &Some(identity.device.clone()), &script, "notes-v1"));
     let calls = json!([{"key": "POST [notes]/run", "input": {"do": [{"insert": "a"}]}, "output": []}]);
     assert_eq!(results::of(space.store(), &applied.hash).unwrap(), Some(Outcome::Applied { output: json!([[]]), calls }));
+    assert_eq!(oplog::effects(space.store(), &applied.hash).unwrap(), Some(vec![]), "a call to the same service is no effect");
     assert_eq!(texts(&space.store().reader().unwrap()).unwrap(), json!(["a"]));
   }
 
   #[test]
-  fn applies_an_op_left_without_a_result_when_its_space_opens_again() {
+  fn applies_an_op_left_without_a_result_once_its_service_is_registered_again() {
     let (directory, carbon) = carbon();
     let identity = alice(&carbon);
     let space = room(&carbon, &identity);
     let call = crate::Call::from_key("POST [notes]/run").unwrap();
-    let op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"insert": "after a crash"}]}));
+    let op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"insert": "after a crash"}]}), "notes");
     oplog::append(space.store(), &oplog::LogRow::new(op.clone())).unwrap();
     let id = space.id.clone();
     drop((space, carbon));
 
     let restarted = crate::testing::reopen(&directory);
     let space = space_now(&restarted, &id).unwrap();
-    assert_eq!(outcomes(&space), vec![Ok(()), Err(0)]);
+    assert_eq!(space.run_state(), crate::RunState::Initializing { services: vec!["notes".into()] });
+    assert_eq!(outcomes(&space), vec![Err(0)]);
     crate::testing::register_notes(&restarted);
-    assert_eq!(outcomes(&space), vec![Ok(()), Ok(())]);
+    assert_eq!(outcomes(&space), vec![Ok(())]);
     assert_eq!(texts(&space.store().reader().unwrap()).unwrap(), json!(["after a crash"]));
   }
 
@@ -156,8 +160,8 @@ mod oplog_entries {
     let identity = alice(&carbon);
     let space = room(&carbon, &identity);
     let call = crate::Call::from_key("POST [notes]/run").unwrap();
-    let mut op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"insert": "old"}]}));
-    op = crate::Op::new(op.key, op.input, op.author, op.device, "notes-v0".into(), op.time, op.hash);
+    let op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"insert": "old"}]}), "notes");
+    let op = crate::Op::new(op.key, op.input, op.author, op.device, "notes-v0".into(), op.time, op.hash);
     oplog::append(space.store(), &oplog::LogRow::new(op.clone())).unwrap();
     let id = space.id.clone();
     drop((space, carbon));
@@ -165,7 +169,7 @@ mod oplog_entries {
     let restarted = crate::testing::reopen(&directory);
     crate::testing::register_notes(&restarted);
     let space = space_now(&restarted, &id).unwrap();
-    assert_eq!(outcomes(&space), vec![Ok(()), Err(409)]);
+    assert_eq!(outcomes(&space), vec![Err(409)]);
     assert_eq!(texts(&space.store().reader().unwrap()).unwrap(), json!([]));
   }
 
@@ -182,7 +186,7 @@ mod oplog_entries {
     crate::testing::register_notes(&restarted);
     let space = space_now(&restarted, &id).unwrap();
     assert_eq!(texts(&space.store().reader().unwrap()).unwrap(), json!(["kept"]));
-    assert_eq!(logged(&space), vec!["POST [space]/origin", "POST [notes]/run"]);
+    assert_eq!(logged(&space), vec!["POST [notes]/run"]);
   }
 }
 
@@ -223,7 +227,7 @@ mod run_states {
     carbon.resume(&space);
     call_now(&carbon, &space, &actor(&identity), "POST [notes]/run", insert("c")).unwrap();
     assert_eq!(texts(&space.store().reader().unwrap()).unwrap(), json!(["c"]));
-    assert_eq!(logged(&space), vec!["POST [space]/origin", "POST [notes]/run"]);
+    assert_eq!(logged(&space), vec!["POST [notes]/run"]);
     assert_eq!(*states.borrow(), vec!["stopped", "idle", "applying", "idle"]);
   }
 
@@ -236,37 +240,20 @@ mod run_states {
     let space = room(&carbon, &identity);
     let call = crate::Call::from_key("POST [notes]/run").unwrap();
     let large = "x".repeat(64 * 1024);
-    let op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"call": "POST [notes]/run", "input": insert(&large), "catch": true}]}));
+    let op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"call": "POST [notes]/run", "input": insert(&large), "catch": true}]}), "notes");
     oplog::append(space.store(), &oplog::LogRow::new(op.clone())).unwrap();
     let pages = space.store().get("PRAGMA page_count", &[]).unwrap()["page_count"].clone();
     space.store().run_batch(&format!("PRAGMA max_page_count = {pages}")).unwrap();
 
     carbon.drain(&space);
     assert!(matches!(space.run_state(), RunState::Stopped { error } if error.status == 503));
-    assert_eq!(outcomes(&space), vec![Ok(()), Err(0)]);
+    assert_eq!(outcomes(&space), vec![Err(0)]);
 
     space.store().run_batch("PRAGMA max_page_count = 1073741823").unwrap();
     carbon.resume(&space);
     assert_eq!(space.run_state(), RunState::Idle);
-    assert_eq!(outcomes(&space), vec![Ok(()), Ok(())]);
+    assert_eq!(outcomes(&space), vec![Ok(())]);
     assert_eq!(texts(&space.store().reader().unwrap()).unwrap(), json!([large]));
-  }
-
-  // Restart with a room naming [notes] and [jots], registering only the services given.
-  fn restarted_room(registered: &[&str]) -> (tempfile::TempDir, Rc<crate::Carbon>, Rc<crate::Space>, crate::Actor) {
-    let (directory, carbon) = carbon();
-    crate::testing::register_script(&carbon, "jots");
-    let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
-    let created = call_now(&carbon, &personal, &actor(&identity), "POST [@carbon]/space", json!({"name": "Room", "services": ["notes", "jots"]})).unwrap();
-    let id = created.value["space"].as_str().unwrap().to_string();
-    drop((personal, carbon));
-    let restarted = crate::testing::reopen(&directory);
-    for name in registered {
-      crate::testing::register_script(&restarted, name);
-    }
-    let space = space_now(&restarted, &id).unwrap();
-    (directory, restarted, space, actor(&identity))
   }
 
   // Submit a call, and keep its answer for whenever it comes.
@@ -278,78 +265,82 @@ mod run_states {
     answer
   }
 
-  // While a service its space names is not set up here, the space is
-  // initializing: an op is logged like any other, and it and its caller wait.
-  #[test]
-  fn an_op_waits_while_its_space_initializes_and_applies_once_every_service_is_set_up() {
-    let (_directory, carbon, space, actor) = restarted_room(&["notes"]);
-    assert_eq!(space.run_state(), RunState::Initializing { services: vec!["jots".into()] });
-    let answer = submitted(&carbon, &space, &actor, "POST [notes]/run", insert("a"));
-    assert!(answer.borrow().is_none());
-    assert_eq!(logged(&space), vec!["POST [space]/origin", "POST [notes]/run"]);
-    assert_eq!(outcomes(&space), vec![Ok(()), Err(0)]);
-
-    crate::testing::register_script(&carbon, "jots");
-    assert_eq!(space.run_state(), RunState::Idle);
-    assert_eq!(answer.borrow_mut().take(), Some(Ok(json!([]))));
-    assert_eq!(texts(&space.store().reader().unwrap()).unwrap(), json!(["a"]));
-  }
-
   // A call to a service this device does not run is made with no version of
-  // it: it is logged like any other, then refused when its turn comes, and its
-  // refusal is kept as its result.
+  // it: it is logged like any other while its space waits for the service,
+  // then refused when its turn comes, and its refusal is kept as its result.
   #[test]
   fn logs_a_call_to_a_service_this_device_does_not_run_and_refuses_it_in_turn() {
-    let (_directory, carbon, space, actor) = restarted_room(&["jots"]);
-    let answer = submitted(&carbon, &space, &actor, "POST [notes]/run", insert("a"));
-    assert_eq!(oplog::entries(space.store()).unwrap()[1].version, crate::services::SERVICE_MISSING);
+    let (directory, carbon) = carbon();
+    let identity = alice(&carbon);
+    let space = room(&carbon, &identity);
+    let id = space.id.clone();
+    drop((space, carbon));
+    let restarted = crate::testing::reopen(&directory);
+    let space = space_now(&restarted, &id).unwrap();
+    let answer = submitted(&restarted, &space, &actor(&identity), "POST [notes]/run", insert("a"));
+    assert!(answer.borrow().is_none(), "its space waits for its service");
+    assert_eq!(oplog::entries(space.store()).unwrap()[0].version, crate::services::SERVICE_MISSING);
 
-    crate::testing::register_notes(&carbon);
+    crate::testing::register_notes(&restarted);
     assert_eq!(answer.borrow_mut().take(), Some(Err(404)));
-    assert_eq!(outcomes(&space), vec![Ok(()), Err(404)]);
+    assert_eq!(outcomes(&space), vec![Err(404)]);
     assert_eq!(texts(&space.store().reader().unwrap()).unwrap(), json!([]));
-
-    let elsewhere = submitted(&carbon, &space, &actor, "POST [elsewhere]/run", insert("b"));
-    assert_eq!(elsewhere.borrow_mut().take(), Some(Err(404)));
-    assert_eq!(outcomes(&space), vec![Ok(()), Err(404), Err(404)]);
+    let elsewhere = submitted(&restarted, &space, &actor(&identity), "POST [elsewhere]/run", insert("b"));
+    assert_eq!(elsewhere.borrow_mut().take(), Some(Err(404)), "a space answers only its own service");
   }
 }
 
 mod identities {
   use super::*;
-  use crate::services::carbon::Identity;
-
-  // What a call answers in a space, as the identity.
-  fn read(carbon: &Rc<crate::Carbon>, space: &Rc<crate::Space>, identity: &Identity, key: &str, input: Value) -> Value {
-    call_now(carbon, space, &actor(identity), key, input).unwrap().value
-  }
 
   #[test]
-  fn sets_up_both_spaces_by_ops_and_logs_its_own_call_in_the_system_log() {
+  fn founds_its_own_channel_sealed_with_identity_and_a_personal_channel_by_ops() {
     let (_directory, carbon) = carbon();
     let identity = alice(&carbon);
     assert_eq!(carbon.identity("alice").unwrap(), identity);
     assert_eq!(logged(carbon.system()), vec!["POST [@carbon]/identity"]);
+    let founding = &oplog::entries(carbon.system().store()).unwrap()[0];
+    let effects: Vec<String> = oplog::effects(carbon.system().store(), &founding.hash).unwrap().unwrap().into_iter().map(|made| format!("{} {}", made.name, made.input["key"].as_str().unwrap_or(""))).collect();
+    let expected = [
+      "create ",
+      "call POST [channel]/origin",
+      "call POST [channel]/services",
+      "call POST [identity]/origin",
+      "call POST [channel]/channel",
+      "call POST [channel]/services",
+      "call POST [channel]/seal",
+    ];
+    assert_eq!(effects, expected, "its own op records every effect it made");
 
-    let identity_space = space_now(&carbon, &identity.space).unwrap();
-    assert_eq!(logged(&identity_space), vec!["POST [space]/origin", "POST [identity]/origin", "POST [device]/origin", "POST [space]/ref"]);
-    // The identity space is founded by its first device alone, before the identity's id exists.
-    let authors: Vec<_> = oplog::entries(identity_space.store()).unwrap().into_iter().map(|op| op.author).collect();
-    let id = Some(identity.id.clone());
-    assert_eq!(authors, vec![None, None, id.clone(), id]);
-    assert!(oplog::entries(identity_space.store()).unwrap().iter().all(|op| op.device == Some(identity.device.clone())));
-    let answer = |key: &str, input: Value| read(&carbon, &identity_space, &identity, key, input);
-    assert_eq!(answer("GET [space]/manage", Value::Null), json!([identity.id]));
-    assert_eq!(answer("GET [identity]/origin", Value::Null), json!({"id": identity.id, "device": identity.device}));
-    assert_eq!(answer("GET [device]/devices", Value::Null), json!([identity.device]));
-    assert_eq!(answer("GET [space]/ref", json!({"kind": "personal", "slug": "alice"}))["space"], json!(identity.personal));
+    let own = space_now(&carbon, &identity.channel).unwrap();
+    assert_eq!(logged(&own), vec!["POST [channel]/origin", "POST [channel]/services", "POST [channel]/channel", "POST [channel]/seal"]);
+    assert!(oplog::entries(own.store()).unwrap().iter().all(|op| op.author == Some(identity.id.clone()) && op.device == Some(identity.device.clone())));
+    let answer = |channel: &str, key: &str, input: Value| on(&carbon, channel, &identity, key, input).unwrap();
+    assert_eq!(answer(&identity.channel, "GET [channel]/origin", Value::Null), json!({"kind": "identity", "name": "alice", "manage": [identity.id]}));
+    assert_eq!(answer(&identity.channel, "GET [identity]/origin", Value::Null), json!({"id": identity.id, "device": identity.device}));
+    assert_eq!(answer(&identity.channel, "GET [identity]/devices", Value::Null), json!([{"pubkey": identity.device, "name": "Pixel9", "tags": ["manage"]}]));
+    assert_eq!(answer(&identity.channel, "GET [channel]/ref", json!({"kind": "personal", "slug": "alice"}))["channel"], json!(identity.personal));
+    let sealed = on(&carbon, &identity.channel, &identity, "POST [channel]/ref", json!({"channel": "c1", "kind": "team", "name": "Sales"})).unwrap_err();
+    assert_eq!((sealed.status, sealed.message.as_str()), (403, "This channel is sealed and takes no further changes"));
 
-    let personal = space_now(&carbon, &identity.personal).unwrap();
-    assert_eq!(logged(&personal), vec!["POST [space]/origin", "POST [device]/ref"]);
-    let origin = read(&carbon, &personal, &identity, "GET [space]/origin", Value::Null);
-    assert_eq!(origin, json!({"kind": "personal", "name": "alice", "services": ["device", "notes"], "manage": [identity.id]}));
-    let devices = read(&carbon, &personal, &identity, "GET [device]/refs", Value::Null);
-    assert_eq!(devices, json!([{"pubkey": identity.device, "name": "Pixel9", "tags": ["manage"]}]));
+    assert_eq!(answer(&identity.personal, "GET [channel]/origin", Value::Null), json!({"kind": "personal", "name": "alice", "manage": [identity.id]}));
+    let services = answer(&identity.personal, "GET [channel]/services", Value::Null);
+    assert_eq!((services[0]["name"].clone(), services[0]["version"].clone()), (json!("notes"), json!("notes-v1")));
+    assert_eq!(answer(&identity.personal, "GET [notes]/texts", Value::Null), json!([]));
+  }
+
+  #[test]
+  fn renames_a_device_as_the_identity_itself_and_adding_one_needs_peers() {
+    let (_directory, carbon) = carbon();
+    let identity = alice(&carbon);
+    let renamed = on(&carbon, &identity.channel, &identity, &format!("PUT [identity]/devices/{}", identity.device), json!({"name": "Phone", "tags": []})).unwrap();
+    assert_eq!(renamed, json!({"pubkey": identity.device, "name": "Phone", "tags": []}));
+    let stranger = Actor { identity: Some("sally".into()), device: None };
+    let devices = service(&carbon, &identity.channel, "identity");
+    let refused = call_now(&carbon, &devices, &stranger, &format!("PUT [identity]/devices/{}", identity.device), json!({"name": "Mine"})).unwrap_err();
+    assert_eq!(refused.status, 403);
+    let enrolling = on(&carbon, &identity.channel, &identity, "POST [identity]/devices", json!({"name": "Laptop"})).unwrap_err();
+    assert_eq!((enrolling.status, enrolling.code.as_str()), (503, "UNREACHABLE"));
   }
 
   #[test]
@@ -359,14 +350,17 @@ mod identities {
     let row = carbon.system().store().reader().unwrap().get("SELECT secret FROM carbon_system_identity", &[]).unwrap();
     let secret = row["secret"].as_str().unwrap().to_string();
     assert_eq!(secret.len(), 64);
-    for id in [&identity.space, &identity.personal] {
-      let bytes = std::fs::read(directory.path().join("data").join(format!("{id}.db"))).unwrap();
-      assert!(!String::from_utf8_lossy(&bytes).contains(&secret));
+    for entry in std::fs::read_dir(directory.path().join("data")).unwrap() {
+      let path = entry.unwrap().path();
+      if path.extension().is_some_and(|extension| extension == "db") && path.file_name().unwrap() != "system.db" {
+        assert!(!String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains(&secret), "{}", path.display());
+      }
     }
     let listed = call_now(&carbon, carbon.system(), &Actor::default(), "GET [@carbon]/identities", Value::Null).unwrap().value;
+    assert_eq!(listed[0]["personal"], json!(identity.personal));
     assert!(listed[0].get("secret").is_none());
     let op = &oplog::entries(carbon.system().store()).unwrap()[0];
-    let kept = serde_json::to_string(&(op, results::of(carbon.system().store(), &op.hash).unwrap())).unwrap();
+    let kept = serde_json::to_string(&(op, results::of(carbon.system().store(), &op.hash).unwrap(), oplog::effects(carbon.system().store(), &op.hash).unwrap())).unwrap();
     assert!(!kept.contains(&secret));
   }
 
@@ -379,149 +373,209 @@ mod identities {
       (json!({"slug": "Alice", "device": "x"}), 400),
       (json!({"slug": "", "device": "x"}), 400),
       (json!({"slug": "sally", "device": "x", "services": ["crm"]}), 400),
+      (json!({"slug": "alice-2", "device": "x", "code": "scanned"}), 501),
     ];
     for (input, status) in cases {
       let error = call_now(&carbon, carbon.system(), &Actor::default(), "POST [@carbon]/identity", input.clone()).unwrap_err();
       assert_eq!(error.status, status, "{input}");
     }
-    assert_eq!(outcomes(carbon.system()), vec![Ok(()), Err(409), Err(400), Err(400), Err(400)]);
+    assert_eq!(outcomes(carbon.system()), vec![Ok(()), Err(409), Err(400), Err(400), Err(400), Err(501)]);
   }
 }
 
-mod spaces {
+mod channels {
   use super::*;
 
   #[test]
-  fn creates_a_space_by_a_ref_op_in_the_calling_space_and_an_origin_op_in_the_new_one() {
+  fn creates_a_channel_inside_another_and_points_to_it() {
     let (_directory, carbon) = carbon();
     let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
-    let create = |name: &str| call_now(&carbon, &personal, &actor(&identity), "POST [@carbon]/space", json!({"name": name, "services": ["notes"]})).unwrap().value;
-
+    let create = |name: &str| on(&carbon, &identity.personal, &identity, "POST [channel]/channel", json!({"name": name})).unwrap();
     let created = create("Randall's Playhouse");
-    assert_eq!((created["slug"].as_str(), created["kind"].as_str()), (Some("randalls-playhouse"), Some("space")));
+    assert_eq!((created["slug"].as_str(), created["kind"].as_str()), (Some("randalls-playhouse"), Some("channel")));
     assert_eq!(create("Randall's Playhouse")["slug"].as_str(), Some("randalls-playhouse-2"));
+    let channel = created["channel"].as_str().unwrap();
+    assert_eq!(carbon.find_ref(&identity.personal, "channel", "randalls-playhouse").unwrap()["channel"], json!(channel));
 
-    let entries = oplog::entries(personal.store()).unwrap();
-    let keys: Vec<&str> = entries.iter().map(|op| op.key.as_str()).collect();
-    assert_eq!(keys[2..], ["POST [@carbon]/space", "POST [@carbon]/space"]);
-    let local = &entries[2];
-    assert_eq!(local.device, Some(identity.device.clone()));
-    let sub_calls = oplog::sub_calls(personal.store(), &local.hash).unwrap().unwrap();
-    let reference = &sub_calls[0];
-    assert_eq!((sub_calls.len(), reference.key.as_str()), (1, "POST [space]/ref"));
-    assert_eq!((&reference.author, &reference.device), (&Some(identity.id.clone()), &Some(identity.device.clone())));
-    let Some(Outcome::Applied { calls, .. }) = results::of(personal.store(), &local.hash).unwrap() else { panic!("[@carbon]/space applied") };
-    assert_eq!(calls[0]["op"]["hash"], json!(reference.hash));
-    assert_eq!(oplog::sub_calls(personal.store(), &entries[0].hash).unwrap(), None, "a replicated op carries no sub-calls");
-    assert_eq!(local.hash, created["space"].as_str().unwrap());
-
-    let room = space_now(&carbon, created["space"].as_str().unwrap()).unwrap();
-    assert_eq!(logged(&room), vec!["POST [space]/origin"]);
-    let status = call_now(&carbon, &room, &actor(&identity), "GET [@carbon]/status", Value::Null).unwrap().value;
+    let playhouse = space_now(&carbon, channel).unwrap();
+    assert_eq!(logged(&playhouse), vec!["POST [channel]/origin"]);
+    assert_eq!(playhouse.runs.channel.as_deref(), Some(channel), "a channel's space belongs to itself");
+    let status = call_now(&carbon, carbon.system(), &actor(&identity), "GET [@carbon]/status", json!({"channel": channel})).unwrap().value;
     assert_eq!(
-      (&status["name"], &status["services"], &status["manage"], &status["access"], &status["sync"], &status["peers"]),
-      (&json!("Randall's Playhouse"), &json!(["notes"]), &json!([identity.id]), &json!(["manage"]), &json!("off"), &json!([]))
+      (&status["name"], &status["kind"], &status["access"], &status["sync"], &status["peers"], &status["services"]),
+      (&json!("Randall's Playhouse"), &json!("channel"), &json!(["manage"]), &json!("off"), &json!([]), &json!([]))
     );
   }
 
   #[test]
-  fn only_a_manager_may_create_a_space_in_another() {
+  fn names_a_service_it_creates_and_resolves_calls_to_it() {
+    let (_directory, carbon) = carbon();
+    crate::testing::register_script(&carbon, "jots");
+    let identity = alice(&carbon);
+    let room = room_channel(&carbon, &identity);
+    let named = on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "scratch", "package": "jots"})).unwrap();
+    assert_eq!(named["version"], json!("jots-v1"));
+    on(&carbon, &room, &identity, "POST [scratch]/run", json!({"do": [{"insert": "s"}]})).unwrap();
+    assert_eq!(on(&carbon, &room, &identity, "GET [scratch]/texts", Value::Null).unwrap(), json!(["s"]));
+    assert_eq!(texts(&service(&carbon, &room, "notes").store().reader().unwrap()).unwrap(), json!([]), "each service keeps its own tables");
+    let services: Vec<Value> = on(&carbon, &room, &identity, "GET [channel]/services", Value::Null).unwrap().as_array().unwrap().iter().map(|named| named["name"].clone()).collect();
+    assert_eq!(services, [json!("notes"), json!("scratch")]);
+    let refused = [
+      (json!({"name": "notes"}), 409),
+      (json!({"name": "channel"}), 409),
+      (json!({"name": "crm"}), 404),
+    ];
+    for (input, status) in refused {
+      assert_eq!(on(&carbon, &room, &identity, "POST [channel]/services", input.clone()).unwrap_err().status, status, "{input}");
+    }
+    assert_eq!(on(&carbon, &room, &identity, "GET [elsewhere]/texts", Value::Null).unwrap_err().status, 404);
+  }
+
+  #[test]
+  fn only_a_manager_changes_a_channel() {
     let (_directory, carbon) = carbon();
     let identity = alice(&carbon);
     let personal = space_now(&carbon, &identity.personal).unwrap();
     let stranger = Actor { identity: Some("someone-else".into()), device: None };
-    let error = call_now(&carbon, &personal, &stranger, "POST [@carbon]/space", json!({"name": "Room"})).unwrap_err();
+    let error = call_now(&carbon, &personal, &stranger, "POST [channel]/channel", json!({"name": "Room"})).unwrap_err();
     assert_eq!(error.status, 403);
-    assert_eq!(call_now(&carbon, &personal, &actor(&identity), "GET [space]/refs", Value::Null).unwrap().value, json!([]));
-    assert_eq!(logged(&personal), vec!["POST [space]/origin", "POST [device]/ref", "POST [@carbon]/space"]);
-    assert_eq!(outcomes(&personal), vec![Ok(()), Ok(()), Err(403)]);
+    let leaving = call_now(&carbon, &personal, &stranger, "POST [channel]/leave", json!({})).unwrap_err();
+    assert_eq!(leaving.code, "UNREACHABLE", "leaving needs no manage, only peers");
+    assert_eq!(on(&carbon, &identity.personal, &identity, "GET [channel]/refs", Value::Null).unwrap(), json!([]));
   }
 
   #[test]
-  fn refuses_calls_that_need_peers_are_not_built_or_break_the_rules() {
+  fn refuses_what_needs_peers_and_what_breaks_the_rules() {
     let (_directory, carbon) = carbon();
     let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
-    let identity_space = space_now(&carbon, &identity.space).unwrap();
-    let alice = actor(&identity);
-    let sally = Actor { identity: Some("sally".into()), device: None };
-    let system = Rc::clone(carbon.system());
+    let alice_on = |key: &str, input: Value| on(&carbon, &identity.personal, &identity, key, input).unwrap_err().code;
     let cases = [
-      (&personal, &alice, "POST [@carbon]/members", json!({}), "SINGLE_NODE"),
-      (&personal, &alice, "POST [@carbon]/join", json!({}), "SINGLE_NODE"),
-      (&personal, &alice, "POST [@carbon]/sync/start", json!({}), "SINGLE_NODE"),
-      (&personal, &alice, "POST [@carbon]/manage", json!({}), "NOT_BUILT"),
-      (&personal, &alice, "DELETE [@carbon]/data", json!({}), "NOT_BUILT"),
-      (&identity_space, &alice, "POST [@carbon]/devices", json!({}), "SINGLE_NODE"),
-      (&identity_space, &alice, "GET [@carbon]/identity/export", Value::Null, "NOT_BUILT"),
-      (&system, &Actor::default(), "POST [@carbon]/identity", json!({"slug": "alice-2", "device": "x", "code": "scanned"}), "SINGLE_NODE"),
-      (&personal, &alice, "POST [space]/members", json!({"identity": "sally"}), "SINGLE_NODE"),
-      (&personal, &alice, "POST [space]/manage", json!({}), "NOT_BUILT"),
-      (&identity_space, &alice, "POST [device]/origin", json!({"pubkey": "k2"}), "SINGLE_NODE"),
-      (&personal, &alice, "POST [device]/origin", json!({"pubkey": "k2"}), "BAD_REQUEST"),
-      (&personal, &sally, "POST [space]/ref", json!({"space": "s1", "kind": "team", "name": "Sales"}), "FORBIDDEN"),
-      (&personal, &alice, "POST [space]/origin", json!({"kind": "team", "name": "x", "services": [], "manage": []}), "CONFLICT"),
-      (&personal, &alice, "POST [space]/ref", json!({"space": "s1"}), "BAD_REQUEST"),
-      (&personal, &alice, "POST [space]/ref", json!({"space": "s1", "kind": "team", "name": "!!"}), "BAD_REQUEST"),
-      (&personal, &alice, "GET [space]/nothing", Value::Null, "NOT_FOUND"),
-      (&personal, &alice, "GET [identity]/origin", Value::Null, "NOT_FOUND"),
+      ("POST [channel]/members", json!({"contact": "sally", "access": "write"}), "UNREACHABLE"),
+      ("POST [channel]/join", json!({"code": "scanned"}), "UNREACHABLE"),
+      ("POST [channel]/leave", json!({}), "UNREACHABLE"),
+      ("POST [channel]/manage", json!({"add": ["sally"]}), "UNREACHABLE"),
+      ("DELETE [channel]/members/sally", Value::Null, "UNREACHABLE"),
+      ("DELETE [channel]/invitations/i1", Value::Null, "UNREACHABLE"),
+      ("POST [channel]/origin", json!({"kind": "team", "name": "x", "manage": []}), "CONFLICT"),
+      ("POST [channel]/ref", json!({"channel": "c1"}), "BAD_REQUEST"),
+      ("POST [channel]/ref", json!({"channel": "c1", "kind": "team", "name": "!!"}), "BAD_REQUEST"),
+      ("GET [channel]/nothing", Value::Null, "NOT_FOUND"),
+      ("GET [channel]/ref", json!({"kind": "team", "slug": "sales"}), "NOT_FOUND"),
+      ("GET [@carbon]/status", json!({}), "NOT_FOUND"),
     ];
-    for (space, actor, key, input, code) in cases {
-      let error = call_now(&carbon, space, actor, key, input).unwrap_err();
-      assert_eq!(error.code, code, "{key}");
+    for (key, input, code) in cases {
+      assert_eq!(alice_on(key, input), code, "{key}");
     }
+    let system = |key: &str, input: Value| call_now(&carbon, carbon.system(), &actor(&identity), key, input).unwrap_err().code;
+    assert_eq!(system("POST [@carbon]/sync/start", json!({"channel": identity.personal})), "UNREACHABLE");
+    assert_eq!(system("GET [@carbon]/status", json!({})), "BAD_REQUEST");
+    assert_eq!(system("GET [@carbon]/nothing", Value::Null), "NOT_FOUND");
+    assert_eq!(system("GET [channel]/refs", Value::Null), "NOT_FOUND");
+    assert_eq!(on(&carbon, &identity.personal, &identity, "GET [channel]/members", Value::Null).unwrap(), json!([{"identity": identity.id, "access": "manage"}]));
+    assert_eq!(on(&carbon, &identity.personal, &identity, "GET [channel]/invitations", Value::Null).unwrap(), json!([]));
   }
 
   #[test]
-  fn says_where_a_carbon_call_made_in_the_wrong_space_is_answered() {
+  fn a_ref_to_the_same_channel_replaces_the_last() {
     let (_directory, carbon) = carbon();
     let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
-    let alice = actor(&identity);
-    let system = Rc::clone(carbon.system());
-    let cases = [
-      (&system, Actor::default(), "POST [@carbon]/space", "In the system space, [@carbon] answers only POST [@carbon]/identity and GET [@carbon]/identities, not POST [@carbon]/space"),
-      (&system, Actor::default(), "POST [@carbon]/devices", "In the system space, [@carbon] answers only POST [@carbon]/identity and GET [@carbon]/identities, not POST [@carbon]/devices"),
-      (&personal, alice.clone(), "POST [@carbon]/identity", "POST [@carbon]/identity is answered in the system space, not here"),
-      (&personal, alice.clone(), "GET [@carbon]/identities", "GET [@carbon]/identities is answered in the system space, not here"),
-      (&personal, alice.clone(), "POST [@carbon]/devices", "POST [@carbon]/devices is answered in an identity space, not here"),
-      (&personal, alice.clone(), "GET [@carbon]/identity/export", "GET [@carbon]/identity/export is answered in an identity space, not here"),
-      (&personal, alice.clone(), "GET [@carbon]/nothing", "GET [@carbon]/nothing is not a call CarbonDB answers"),
-    ];
-    for (space, actor, key, message) in cases {
-      let error = call_now(&carbon, space, &actor, key, json!({})).unwrap_err();
-      assert_eq!((error.status, error.message.as_str()), (404, message), "{key}");
-    }
-  }
-
-  #[test]
-  fn a_ref_to_the_same_space_replaces_the_last_and_a_device_ref_the_last_for_its_key() {
-    let (_directory, carbon) = carbon();
-    let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
-    let alice = actor(&identity);
     for name in ["Sales", "Sales West"] {
-      call_now(&carbon, &personal, &alice, "POST [space]/ref", json!({"space": "s1", "kind": "team", "name": name})).unwrap();
+      on(&carbon, &identity.personal, &identity, "POST [channel]/ref", json!({"channel": "c1", "kind": "team", "name": name})).unwrap();
     }
-    let refs = call_now(&carbon, &personal, &alice, "GET [space]/refs", Value::Null).unwrap().value;
-    assert_eq!(refs, json!([{"space": "s1", "kind": "team", "name": "Sales West", "slug": "sales-west", "cascade": []}]));
+    let refs = on(&carbon, &identity.personal, &identity, "GET [channel]/refs", Value::Null).unwrap();
+    assert_eq!(refs, json!([{"channel": "c1", "kind": "team", "name": "Sales West", "slug": "sales-west", "cascade": []}]));
+  }
 
-    call_now(&carbon, &personal, &alice, "POST [device]/ref", json!({"pubkey": identity.device, "name": "Pixel9", "tags": []})).unwrap();
-    let devices = call_now(&carbon, &personal, &alice, "GET [device]/refs", Value::Null).unwrap().value;
-    assert_eq!(devices, json!([{"pubkey": identity.device, "name": "Pixel9", "tags": []}]));
+  #[test]
+  fn deletes_this_devices_copy_of_a_channel_and_its_services() {
+    let (directory, carbon) = carbon();
+    let identity = alice(&carbon);
+    let room = room_channel(&carbon, &identity);
+    let notes = service(&carbon, &room, "notes").id.clone();
+    call_now(&carbon, carbon.system(), &actor(&identity), "DELETE [@carbon]/data", json!({"channel": room})).unwrap();
+    for id in [&room, &notes] {
+      assert!(!directory.path().join("data").join(format!("{id}.db")).exists(), "{id}");
+      assert_eq!(space_now(&carbon, id).err().map(|error| error.status), Some(404), "{id}");
+    }
+  }
+}
+
+mod effects {
+  use super::*;
+  use crate::ops::effects::Made;
+  use crate::testing::{now, register_script, register_script_making};
+
+  // A room running `[notes]` and `[jots]`, and alice.
+  fn room_with_jots(always: &[&str]) -> (tempfile::TempDir, Rc<crate::Carbon>, crate::Identity, String) {
+    let (directory, carbon) = carbon();
+    register_script(&carbon, "jots");
+    register_script_making(&carbon, "loud", always);
+    let identity = alice(&carbon);
+    let room = room_channel(&carbon, &identity);
+    on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "jots"})).unwrap();
+    on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "loud"})).unwrap();
+    (directory, carbon, identity, room)
+  }
+
+  // A row arriving from alice's other device, late: before everything here.
+  fn late(carbon: &Rc<crate::Carbon>, space: &crate::Space, script: Value, effects: Option<Vec<Made>>) {
+    let call = crate::Call::from_key(&format!("POST [{}]/run", space.runs.name)).unwrap();
+    let actor = Actor { identity: Some("alice".into()), device: Some("laptop".into()) };
+    let op = crate::ops::op::stamp(&actor, &call, &json!({"do": script}), &carbon.services().version(&space.runs.package), 1);
+    now(|received| carbon.receive(&space.id, oplog::LogRow { op, effects }, received)).unwrap();
+  }
+
+  #[test]
+  fn a_call_to_another_service_is_made_once_and_replayed_after_a_rewind() {
+    let (_directory, carbon, identity, room) = room_with_jots(&[]);
+    let script = json!({"do": [{"read": true}, {"call": "POST [jots]/run", "input": {"do": [{"insert": "j"}]}}]});
+    on(&carbon, &room, &identity, "POST [notes]/run", script).unwrap();
+    let (notes, jots) = (service(&carbon, &room, "notes"), service(&carbon, &room, "jots"));
+    let made = &oplog::entries(notes.store()).unwrap()[0];
+    let recorded = oplog::effects(notes.store(), &made.hash).unwrap().unwrap();
+    assert_eq!((recorded.len(), recorded[0].name.as_str(), recorded[0].output.clone()), (1, "call", Ok(json!([]))));
+    assert_eq!(logged(&jots), vec!["POST [jots]/run"], "the call is a message, an op in the other service");
+
+    late(&carbon, &notes, json!([{"insert": "early"}]), Some(vec![]));
+    assert_eq!(texts(&notes.store().reader().unwrap()).unwrap(), json!(["early"]));
+    assert_eq!(outcomes(&notes), vec![Ok(()), Ok(())], "the rewound op ran again at its place");
+    assert_eq!(logged(&jots), vec!["POST [jots]/run"], "its replay got the recorded answer and posted nothing");
+    assert_eq!(texts(&jots.store().reader().unwrap()).unwrap(), json!(["j"]));
+  }
+
+  #[test]
+  fn an_effect_declared_always_is_made_again_on_every_run() {
+    let (_directory, carbon, identity, room) = room_with_jots(&["call"]);
+    let script = json!({"do": [{"read": true}, {"call": "POST [jots]/run", "input": {"do": [{"insert": "j"}]}}]});
+    on(&carbon, &room, &identity, "POST [loud]/run", script).unwrap();
+    let (loud, jots) = (service(&carbon, &room, "loud"), service(&carbon, &room, "jots"));
+    assert_eq!(oplog::effects(loud.store(), &oplog::entries(loud.store()).unwrap()[0].hash).unwrap(), Some(vec![]), "nothing is recorded");
+    late(&carbon, &loud, json!([{"insert": "early"}]), Some(vec![]));
+    assert_eq!(logged(&jots), vec!["POST [jots]/run", "POST [jots]/run"]);
+  }
+
+  #[test]
+  fn a_received_op_replays_the_effects_its_row_carries_and_one_beyond_them_is_unreachable() {
+    let (_directory, carbon, _identity, room) = room_with_jots(&[]);
+    let (notes, jots) = (service(&carbon, &room, "notes"), service(&carbon, &room, "jots"));
+    let answered = Made { name: "call".into(), input: json!({"key": "GET [jots]/texts"}), output: Ok(json!(["from the author"])) };
+    late(&carbon, &notes, json!([{"call": "GET [jots]/texts"}, {"call": "GET [jots]/texts", "catch": true}]), Some(vec![answered]));
+    let op = &oplog::entries(notes.store()).unwrap()[0];
+    let Some(Outcome::Applied { output, .. }) = results::of(notes.store(), &op.hash).unwrap() else { panic!("applied") };
+    assert_eq!(output, json!([["from the author"], {"error": 503}]));
+    assert_eq!(logged(&jots), Vec::<String>::new());
   }
 }
 
 mod deadlines {
   use super::*;
-  use crate::testing::{NOTES_TIMEOUT, hung, later, timed};
+  use crate::testing::{NOTES_TIMEOUT, hung, later, personal_notes, timed};
 
   #[test]
   fn an_op_not_settled_within_its_service_timeout_rolls_back_and_the_next_applies() {
     let (_directory, carbon, timers) = timed();
     let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
+    let personal = personal_notes(&carbon, &identity);
     let nested = json!({"do": [{"insert": "a"}, {"call": "POST [notes]/run", "input": {"do": [{"insert": "b"}, {"hang": true}]}}]});
     let answer = later(|reply| carbon.submit(&personal, actor(&identity), crate::Call::from_key("POST [notes]/run").unwrap(), nested, reply));
     assert!(answer.borrow().is_none());
@@ -539,7 +593,7 @@ mod deadlines {
   fn a_get_not_settled_in_time_answers_with_the_timeout_and_a_late_answer_is_dropped() {
     let (_directory, carbon, timers) = timed();
     let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
+    let personal = personal_notes(&carbon, &identity);
     hung();
     let answer = later(|reply| carbon.submit(&personal, actor(&identity), crate::Call::from_key("GET [notes]/hang").unwrap(), Value::Null, reply));
     timers.run();
@@ -553,7 +607,7 @@ mod deadlines {
   fn a_call_that_settles_cancels_its_deadline() {
     let (_directory, carbon, timers) = timed();
     let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
+    let personal = personal_notes(&carbon, &identity);
     assert_eq!(timers.delays(), [], "creating an identity left no deadline behind");
     call_now(&carbon, &personal, &actor(&identity), "POST [notes]/run", json!({"do": [{"insert": "a"}]})).unwrap();
     call_now(&carbon, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap();
@@ -568,7 +622,8 @@ mod replicas {
   use super::*;
   use crate::ops::op::stamp;
   use crate::ops::oplog::LogRow;
-  use crate::testing::{now, register_script};
+  use crate::space::Runs;
+  use crate::testing::now;
   use crate::{Call, Carbon, Space};
 
   const ROOM: &str = "room";
@@ -585,29 +640,22 @@ mod replicas {
     Made { time, device, key, input }
   }
 
-  // A `[notes]` or `[todo]` script made at `time`.
-  fn script(time: u64, service: &'static str, steps: Value) -> Made {
-    let key = if service == "todo" { "POST [todo]/run" } else { "POST [notes]/run" };
-    made(time, if time.is_multiple_of(2) { "phone" } else { "laptop" }, key, json!({"do": steps}))
+  // A `[notes]` script made at `time`.
+  fn script(time: u64, steps: Value) -> Made {
+    made(time, if time.is_multiple_of(2) { "phone" } else { "laptop" }, "POST [notes]/run", json!({"do": steps}))
   }
 
   // The row an op travels as, stamped with the version of its service this replica runs.
   fn row(carbon: &Carbon, made: &Made) -> LogRow {
     let call = Call::from_key(made.key).unwrap();
     let actor = Actor { identity: Some("alice".into()), device: Some(made.device.into()) };
-    LogRow::new(stamp(&actor, &call, &made.input, &carbon.services().version(&call.service), made.time))
+    LogRow::new(stamp(&actor, &call, &made.input, &carbon.services().version("notes"), made.time))
   }
 
-  // The room's origin, which every replica receives first, as p2panda's
-  // causal delivery guarantees: every op in a space follows its origin.
-  fn origin() -> Made {
-    made(1, "laptop", "POST [space]/origin", json!({"kind": "space", "name": "Room", "services": ["notes", "todo"], "manage": ["alice"]}))
-  }
-
-  // A fresh replica running `[notes]` and `[todo]`.
+  // A fresh replica holding the room, a `[notes]` service.
   fn device() -> (tempfile::TempDir, Rc<Carbon>) {
     let (directory, carbon) = carbon();
-    register_script(&carbon, "todo");
+    carbon.create_space(ROOM, Runs { package: "notes".into(), name: "notes".into(), channel: None }).unwrap();
     (directory, carbon)
   }
 
@@ -615,26 +663,19 @@ mod replicas {
     now(|received| carbon.receive(ROOM, row, received)).unwrap();
   }
 
-  // A replica that received the room's origin, then these rows in this order.
+  // A replica that received these rows in this order.
   fn replica(rows: &[&LogRow]) -> (tempfile::TempDir, Rc<Carbon>, Rc<Space>) {
     let (directory, carbon) = device();
-    receive(&carbon, row(&carbon, &origin()));
     rows.iter().for_each(|row| receive(&carbon, (*row).clone()));
     let space = space_now(&carbon, ROOM).unwrap();
     (directory, carbon, space)
   }
 
-  // A service's notes, as they stand in a replica.
-  fn notes(space: &Space, service: &str) -> Value {
-    let rows = space.store().reader().unwrap().all(&format!("SELECT text FROM \"{service}/db/note\" ORDER BY text"), &[]).unwrap();
-    Value::Array(rows.into_iter().map(|row| row["text"].clone()).collect())
-  }
-
-  // What a replica holds: each service's notes, and what became of each op in the shared order.
+  // What a replica holds: its notes, and what became of each op in the shared order.
   fn state(space: &Space) -> Value {
     let ops = oplog::entries(space.store()).unwrap();
     let results: Vec<Value> = ops.iter().map(|op| json!([op.key, results::of(space.store(), &op.hash).unwrap()])).collect();
-    json!({"notes": notes(space, "notes"), "todo": notes(space, "todo"), "results": results})
+    json!({"notes": texts(&space.store().reader().unwrap()).unwrap(), "results": results})
   }
 
   // Every order of the indices 0..n.
@@ -653,7 +694,7 @@ mod replicas {
     let rows: Vec<LogRow> = ops.iter().map(|made| row(&author, made)).collect();
     let (_in_order, _carbon, in_order) = replica(&rows.iter().collect::<Vec<_>>());
     let settled = state(&in_order);
-    assert_eq!(json!({"notes": settled["notes"], "todo": settled["todo"]}), expected, "{name}: in order");
+    assert_eq!(settled["notes"], expected, "{name}: in order");
     for order in orders(rows.len()) {
       let delivered: Vec<&LogRow> = order.iter().map(|at| &rows[*at]).collect();
       let (_directory, _carbon, space) = replica(&delivered);
@@ -666,65 +707,42 @@ mod replicas {
     let scenarios = [
       (
         "an edit made after a concurrent delete is refused everywhere",
-        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "notes", json!([{"delete": "a"}])), script(30, "notes", json!([{"replace": ["a", "b"]}]))],
-        json!({"notes": [], "todo": []}),
+        vec![script(10, json!([{"insert": "a"}])), script(20, json!([{"delete": "a"}])), script(30, json!([{"replace": ["a", "b"]}]))],
+        json!([]),
       ),
       (
         "an edit refused before the note arrived applies once it has",
-        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "notes", json!([{"replace": ["a", "b"]}]))],
-        json!({"notes": ["b"], "todo": []}),
+        vec![script(10, json!([{"insert": "a"}])), script(20, json!([{"replace": ["a", "b"]}]))],
+        json!(["b"]),
       ),
       (
         "a read sees every op before it, whenever they arrived",
-        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "notes", json!([{"insert": "b"}, {"read": true}])), script(30, "notes", json!([{"read": true}]))],
-        json!({"notes": ["a", "b"], "todo": []}),
-      ),
-      (
-        "ops on different services leave each other be",
-        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "todo", json!([{"insert": "t"}])), script(30, "notes", json!([{"read": true}]))],
-        json!({"notes": ["a"], "todo": ["t"]}),
-      ),
-      (
-        "a call into another service rewinds with both",
-        vec![
-          script(10, "todo", json!([{"insert": "t"}])),
-          script(20, "notes", json!([{"insert": "n"}, {"call": "POST [todo]/run", "input": {"do": [{"read": true}, {"insert": "from-notes"}]}}])),
-          script(30, "todo", json!([{"replace": ["t", "t2"]}])),
-        ],
-        json!({"notes": ["n"], "todo": ["from-notes", "t2"]}),
-      ),
-      (
-        "a branch that reaches another service only at its true place",
-        vec![
-          script(10, "notes", json!([{"unless": "x", "do": [{"call": "POST [todo]/run", "input": {"do": [{"insert": "early"}]}}]}])),
-          script(20, "notes", json!([{"insert": "x"}])),
-          script(30, "todo", json!([{"insert": "t"}, {"read": true}])),
-        ],
-        json!({"notes": ["x"], "todo": ["early", "t"]}),
+        vec![script(10, json!([{"insert": "a"}])), script(20, json!([{"insert": "b"}, {"read": true}])), script(30, json!([{"read": true}]))],
+        json!(["a", "b"]),
       ),
       (
         "a value kept unique by a query, never by a constraint, is inserted only by the first op",
-        vec![script(10, "notes", json!([{"unless": "a", "do": [{"insert": "a"}]}])), script(20, "notes", json!([{"unless": "a", "do": [{"insert": "a"}]}]))],
-        json!({"notes": ["a"], "todo": []}),
+        vec![script(10, json!([{"unless": "a", "do": [{"insert": "a"}]}])), script(20, json!([{"unless": "a", "do": [{"insert": "a"}]}]))],
+        json!(["a"]),
       ),
       (
         "an insert before an edit of another row, which the edit looked up by its key",
         vec![
-          script(5, "notes", json!([{"set": ["k", "first"]}])),
-          script(10, "notes", json!([{"insert": "a"}])),
-          script(20, "notes", json!([{"set": ["k", "second"]}])),
+          script(5, json!([{"set": ["k", "first"]}])),
+          script(10, json!([{"insert": "a"}])),
+          script(20, json!([{"set": ["k", "second"]}])),
         ],
-        json!({"notes": ["a", "second"], "todo": []}),
+        json!(["a", "second"]),
       ),
       (
         "an edit of a row by its key before the insert of that row",
-        vec![script(10, "notes", json!([{"set": ["k", "edited"]}])), script(20, "notes", json!([{"set": ["k", "inserted"]}]))],
-        json!({"notes": ["inserted"], "todo": []}),
+        vec![script(10, json!([{"set": ["k", "edited"]}])), script(20, json!([{"set": ["k", "inserted"]}]))],
+        json!(["inserted"]),
       ),
       (
         "inserts of different rows into one table",
-        vec![script(10, "notes", json!([{"insert": "a"}])), script(20, "notes", json!([{"insert": "b"}])), script(30, "notes", json!([{"insert": "c"}]))],
-        json!({"notes": ["a", "b", "c"], "todo": []}),
+        vec![script(10, json!([{"insert": "a"}])), script(20, json!([{"insert": "b"}])), script(30, json!([{"insert": "c"}]))],
+        json!(["a", "b", "c"]),
       ),
     ];
     for (name, ops, expected) in scenarios {
@@ -732,65 +750,25 @@ mod replicas {
     }
   }
 
-  // The refs a replica's room holds, by the space each points to, with its slug.
-  fn refs(carbon: &Rc<Carbon>, space: &Rc<Space>) -> Value {
-    let refs = call_now(carbon, space, &Actor::default(), "GET [space]/refs", Value::Null).unwrap().value;
-    Value::Object(refs.as_array().unwrap().iter().map(|reference| (reference["space"].as_str().unwrap().to_string(), reference["slug"].clone())).collect())
-  }
-
-  #[test]
-  fn a_local_op_replays_its_sub_calls_on_every_replica_and_never_runs_itself() {
-    let (_directory, author) = device();
-    let reference = |time: u64, device: &'static str, space: &str| made(time, device, "POST [space]/ref", json!({"space": space, "kind": "space", "name": "Lobby", "slug": null, "cascade": []}));
-    let direct = row(&author, &reference(10, "phone", "elsewhere"));
-    let local = LogRow { sub_calls: Some(vec![row(&author, &reference(20, "laptop", "child")).op]), ..row(&author, &made(20, "laptop", "POST [@carbon]/space", json!({"name": "Lobby"}))) };
-    for order in [[&direct, &local], [&local, &direct]] {
-      let (directory, carbon, space) = replica(&order);
-      assert_eq!(refs(&carbon, &space), json!({"elsewhere": "lobby", "child": "lobby-2"}), "delivered local op first: {}", order[0] == &local);
-      assert!(!directory.path().join("data/child.db").exists() && !directory.path().join(format!("data/{}.db", local.op.hash)).exists(), "the local op itself never ran");
-    }
-  }
-
-  #[test]
-  fn a_local_op_rewound_on_the_device_that_made_it_replays_its_sub_calls_and_never_runs_again() {
-    let (directory, carbon) = carbon();
-    let identity = alice(&carbon);
-    let space = room(&carbon, &identity);
-    let child = call_now(&carbon, &space, &actor(&identity), "POST [@carbon]/space", json!({"name": "Lobby"})).unwrap().value;
-    let local = oplog::entries(space.store()).unwrap().into_iter().find(|op| op.key == "POST [@carbon]/space").unwrap();
-    // Made on another of alice's devices at the same moment, it sorts just before the local op.
-    let late = Actor { identity: Some(identity.id.clone()), device: Some("0".into()) };
-    let input = json!({"space": "elsewhere", "kind": "space", "name": "Lobby", "slug": null, "cascade": []});
-    let reference = stamp(&late, &Call::from_key("POST [space]/ref").unwrap(), &input, &carbon.services().version("space"), local.time);
-    now(|received| carbon.receive(&space.id, LogRow::new(reference), received)).unwrap();
-
-    assert_eq!(refs(&carbon, &space), json!({"elsewhere": "lobby", child["space"].as_str().unwrap(): "lobby-2"}));
-    let databases = std::fs::read_dir(directory.path().join("data")).unwrap().filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|extension| extension == "db")).count();
-    assert_eq!(databases, 5, "the system database, alice's two spaces, the room and the child, and no second child");
-    assert_eq!(outcomes(&space), vec![Ok(()), Ok(()), Ok(())]);
-  }
-
   #[test]
   fn a_watch_shows_the_state_a_rewind_settles_on() {
     let (_directory, carbon) = device();
-    receive(&carbon, row(&carbon, &origin()));
     let seen = Rc::new(std::cell::RefCell::new(vec![]));
     let seeing = Rc::clone(&seen);
     carbon.watch(ROOM, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
-    receive(&carbon, row(&carbon, &script(20, "notes", json!([{"replace": ["a", "b"]}]))));
-    receive(&carbon, row(&carbon, &script(10, "notes", json!([{"insert": "a"}]))));
+    receive(&carbon, row(&carbon, &script(20, json!([{"replace": ["a", "b"]}]))));
+    receive(&carbon, row(&carbon, &script(10, json!([{"insert": "a"}]))));
     assert_eq!(seen.borrow().last(), Some(&json!(["b"])));
   }
 
   #[test]
   fn a_late_insert_of_another_row_applies_in_place_and_nothing_re_runs() {
     let (_directory, carbon) = device();
-    receive(&carbon, row(&carbon, &origin()));
     let seen = Rc::new(std::cell::RefCell::new(vec![]));
     let seeing = Rc::clone(&seen);
     carbon.watch(ROOM, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
-    receive(&carbon, row(&carbon, &script(20, "notes", json!([{"insert": "b"}]))));
-    receive(&carbon, row(&carbon, &script(10, "notes", json!([{"insert": "a"}]))));
+    receive(&carbon, row(&carbon, &script(20, json!([{"insert": "b"}]))));
+    receive(&carbon, row(&carbon, &script(10, json!([{"insert": "a"}]))));
     // A rewind would have shown the later insert undone, then applied again.
     assert_eq!(*seen.borrow(), vec![json!([]), json!(["b"]), json!(["a", "b"])]);
   }
@@ -798,13 +776,12 @@ mod replicas {
   #[test]
   fn a_late_insert_applies_in_place_before_an_edit_that_looked_up_another_row_by_its_key() {
     let (_directory, carbon) = device();
-    receive(&carbon, row(&carbon, &origin()));
     let seen = Rc::new(std::cell::RefCell::new(vec![]));
     let seeing = Rc::clone(&seen);
     carbon.watch(ROOM, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
-    receive(&carbon, row(&carbon, &script(5, "notes", json!([{"set": ["k", "first"]}]))));
-    receive(&carbon, row(&carbon, &script(20, "notes", json!([{"set": ["k", "second"]}]))));
-    receive(&carbon, row(&carbon, &script(10, "notes", json!([{"insert": "a"}]))));
+    receive(&carbon, row(&carbon, &script(5, json!([{"set": ["k", "first"]}]))));
+    receive(&carbon, row(&carbon, &script(20, json!([{"set": ["k", "second"]}]))));
+    receive(&carbon, row(&carbon, &script(10, json!([{"insert": "a"}]))));
     // A rewind would have shown the edit undone, then made again.
     assert_eq!(*seen.borrow(), vec![json!([]), json!(["first"]), json!(["second"]), json!(["a", "second"])]);
   }
@@ -812,30 +789,28 @@ mod replicas {
   #[test]
   fn a_call_made_after_receiving_an_op_sorts_after_it() {
     let (_directory, carbon) = device();
-    receive(&carbon, row(&carbon, &origin()));
     // A minute ahead of this device's clock, within how far clocks drift.
     let future = crate::ops::clock::wall() + 60_000;
-    receive(&carbon, row(&carbon, &script(future, "notes", json!([{"insert": "a"}]))));
+    receive(&carbon, row(&carbon, &script(future, json!([{"insert": "a"}]))));
     let space = space_now(&carbon, ROOM).unwrap();
     call_now(&carbon, &space, &Actor { identity: Some("alice".into()), device: Some("pixel".into()) }, "POST [notes]/run", json!({"do": [{"read": true}]})).unwrap();
     let ops = oplog::entries(space.store()).unwrap();
-    assert!(ops[2].time > future);
-    assert_eq!(results::of(space.store(), &ops[2].hash).unwrap(), Some(Outcome::Applied { output: json!([["a"]]), calls: json!([]) }));
+    assert!(ops[1].time > future);
+    assert_eq!(results::of(space.store(), &ops[1].hash).unwrap(), Some(Outcome::Applied { output: json!([["a"]]), calls: json!([]) }));
   }
 
   #[test]
   fn a_row_whose_time_is_too_far_ahead_or_impossible_is_refused_unlogged_and_leaves_the_clock_alone() {
     let (_directory, carbon) = device();
-    receive(&carbon, row(&carbon, &origin()));
     let wall = crate::ops::clock::wall();
     let cases = [("too far ahead, for now", wall + 3_600_000, 425), ("never", crate::ops::clock::NEVER, 400)];
     for (name, time, status) in cases {
-      let refused = now(|received| carbon.receive(ROOM, row(&carbon, &script(time, "notes", json!([{"insert": "a"}]))), received));
+      let refused = now(|received| carbon.receive(ROOM, row(&carbon, &script(time, json!([{"insert": "a"}]))), received));
       assert_eq!(refused.unwrap_err().status, status, "{name}");
     }
     let space = space_now(&carbon, ROOM).unwrap();
-    assert_eq!(oplog::entries(space.store()).unwrap().len(), 1, "only the origin was logged");
-    let next = carbon.stamp(&Actor::default(), &Call::from_key("POST [notes]/run").unwrap(), &json!({})).time;
+    assert_eq!(oplog::entries(space.store()).unwrap().len(), 0, "nothing was logged");
+    let next = carbon.stamp(&Actor::default(), &Call::from_key("POST [notes]/run").unwrap(), &json!({}), "notes").time;
     assert!(next < wall + 60_000, "the clock never took in a refused time");
   }
 }

@@ -14,34 +14,32 @@
 //!
 //! Which op applies next is read from the log: the first of the pending ops,
 //! the op log minus results, in the shared order. They apply one at a time,
-//! and only once every service the space names is set up here. An op that
-//! sorts before ops already applied is late: it is tried in place, and when
-//! that run would not match applying it at its place the space rewinds
-//! (`rewind`). A local op runs once, on the device that made it; every replay
-//! of it, here after a rewind or on another device, runs the sub-calls its row
-//! carries instead.
+//! and only once the space's service is set up here. An op that sorts before
+//! ops already applied is late: it is tried in place, and when that run would
+//! not match applying it at its place the space rewinds (`rewind`). An op's
+//! first run makes its effects and records them on its row; every later run,
+//! here after a rewind or on another device, replays them (`ops::effects`).
 //!
 //! A system failure stops the space: the file or disk failed, not the op. It
 //! neither logs nor applies another op, and every call to it fails with a 503,
 //! until the problem is fixed by hand and the space is resumed. Writing an op
 //! to the log or its result is never refused as the op's own failure.
 
-use std::cell::Cell;
-use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::carbon::Carbon;
 use crate::error::{Result, ServiceError, conflict, not_found, stopped};
+use crate::ops::effects::{EffectLog, Made};
 use crate::ops::op::actor;
 use crate::ops::oplog::LogRow;
 use crate::ops::results::Outcome;
 use crate::sql::authorizer::Read;
 use crate::ops::rewind::{self, Recorded, Sets};
-use crate::service_call::{CallRecord, Conn, ServiceCall, Settle, sub_calls};
+use crate::service_call::{CallRecord, Conn, ServiceCall, Settle};
 use crate::services::{self, SERVICE_MISSING, Service};
 use crate::space::{RunState, Space};
 use crate::store::Store;
@@ -72,7 +70,7 @@ impl Carbon {
     if !call.writes() {
       return self.read(space, actor, call, input, reply);
     }
-    let op = self.stamp(&actor, &call, &input);
+    let op = self.stamp(&actor, &call, &input, &space.runs.package);
     space.wait_for(&op.hash, reply);
     self.log(space, LogRow::new(op));
   }
@@ -86,7 +84,7 @@ impl Carbon {
   }
 
   // Apply a space's pending ops in turn, until one is still applying, none is
-  // pending, a service the space names is not set up yet, or it stops.
+  // pending, its service is not set up yet, or it stops.
   pub(crate) fn drain(self: &Rc<Self>, space: &Rc<Space>) {
     if space.draining.replace(true) {
       return;
@@ -109,76 +107,39 @@ impl Carbon {
     space.draining.set(false);
   }
 
-  // Move a space between Initializing and Idle: Initializing while a service
-  // its origin names is not set up here, with those services.
+  // Move a space between Initializing and Idle: Initializing while its
+  // service is not set up here.
   fn initialize(self: &Rc<Self>, space: &Space) {
-    let services = space.not_set_up();
-    let state = if services.is_empty() { RunState::Idle } else { RunState::Initializing { services } };
+    let state = match space.not_set_up() {
+      None => RunState::Idle,
+      Some(service) => RunState::Initializing { services: vec![service] },
+    };
     if space.run_state() != state {
       self.set_run_state(space, state);
     }
   }
 
-  // Apply one op: a local op that has run replays its sub-calls; any other
-  // op runs, with the version of its service it was made for.
+  // Apply one op, with the version of its service it was made for: a first
+  // run, or a replay of the effects its row carries.
   fn apply(self: &Rc<Self>, space: &Rc<Space>, row: LogRow) {
     let call = match Call::from_key(&row.op.key) {
       Ok(call) => call,
       Err(error) => return self.refuse(space, &row.op, error),
     };
-    match (call.confined, row.sub_calls) {
-      (true, Some(sub_calls)) => self.replay(space, row.op, call, sub_calls),
-      _ => match self.same_version(space, &call, &row.op) {
-        Ok(()) => self.run(space, row.op, call),
-        Err(error) => self.refuse(space, &row.op, error),
-      },
-    }
-  }
-
-  // Run an op through its service's entry point, in its transaction.
-  fn run(self: &Rc<Self>, space: &Rc<Space>, op: Op, call: Call) {
-    if let Some(service_call) = self.begin(space, op, call) {
-      self.start(service_call);
-    }
-  }
-
-  // Replay a local op that has run: its recorded sub-calls, in its
-  // transaction, never the local op itself. One deadline covers them all,
-  // each sub-call's service granting its own timeout.
-  fn replay(self: &Rc<Self>, space: &Rc<Space>, op: Op, call: Call, sub_calls: Vec<Op>) {
-    let timeout = sub_calls.iter().filter_map(|sub_call| Call::from_key(&sub_call.key).ok()).filter_map(|call| self.services().find(&call.service)).map(|service| service.timeout).sum::<Duration>();
-    let Some(local) = self.begin(space, op, call) else { return };
-    let expiring = Rc::clone(&local);
-    local.set_deadline(self.after(timeout, Box::new(move || expiring.expire(timeout))));
-    self.replay_sub_calls(local, VecDeque::from(sub_calls), vec![]);
-  }
-
-  // Run a local op's recorded sub-calls in order, each under its own
-  // savepoint, so one refused on replay rolls back only its own writes; then
-  // settle the local op with what each answered.
-  fn replay_sub_calls(self: &Rc<Self>, local: Rc<ServiceCall>, mut sub_calls: VecDeque<Op>, mut answers: Vec<Value>) {
-    let Some(sub_call) = sub_calls.pop_front() else {
-      let _ = local.settle(Ok(json!(answers)));
-      return;
-    };
-    let (carbon, next) = (Rc::clone(self), Rc::clone(&local));
-    let reply: crate::Reply = Box::new(move |result| {
-      answers.push(match result {
-        Ok(output) => json!({"output": output}),
-        Err(error) => json!({"error": error}),
-      });
-      carbon.replay_sub_calls(next, sub_calls, answers)
-    });
-    match Call::from_key(&sub_call.key).and_then(|call| self.same_version(local.space(), &call, &sub_call)) {
-      Ok(()) => local.replay(sub_call, reply),
-      Err(error) => reply(Err(error)),
+    match self.same_version(space, &call, &row.op) {
+      Ok(()) => {
+        if let Some(service_call) = self.begin(space, row.op, call, row.effects) {
+          self.start(service_call);
+        }
+      }
+      Err(error) => self.refuse(space, &row.op, error),
     }
   }
 
   // Open an op's transaction, and the service call it runs as, which settles
   // it. The ops after it in the shared order are read first: when there are
   // any, the op is late, and is tried in place.
-  fn begin(self: &Rc<Self>, space: &Rc<Space>, op: Op, call: Call) -> Option<Rc<ServiceCall>> {
+  fn begin(self: &Rc<Self>, space: &Rc<Space>, op: Op, call: Call, recorded: Option<Vec<Made>>) -> Option<Rc<ServiceCall>> {
     let later = match rewind::after(space.store(), &op) {
       Ok(later) => later,
       Err(failure) => {
@@ -192,31 +153,32 @@ impl Carbon {
     }
     self.set_run_state(space, RunState::Applying { op: op.hash.clone() });
     let live = Rc::new(Cell::new(true));
-    let (carbon, here, ended, applied, local) = (Rc::clone(self), Rc::clone(space), Rc::clone(&live), op.clone(), call.confined);
+    let effects = Rc::new(RefCell::new(EffectLog::of(recorded)));
+    let (carbon, here, ended, applied, kept) = (Rc::clone(self), Rc::clone(space), Rc::clone(&live), op.clone(), Rc::clone(&effects));
     let settle: Settle = Box::new(move |result, calls| {
       ended.set(false);
-      carbon.finish(&here, &applied, local, &later, result, calls);
+      let made = kept.borrow().made().map(<[Made]>::to_vec);
+      carbon.finish(&here, &applied, &later, result, calls, made);
       carbon.drain(&here);
     });
-    Some(ServiceCall::new(self, space, actor(&op), call, op.input.clone(), Conn::Writer, Some(op), live, settle))
+    Some(ServiceCall::new(self, space, actor(&op), call, op.input.clone(), Conn::Writer, Some(op), effects, live, settle))
   }
 
   // An op settled. A late op whose run would not match applying it at its
   // place rolls back and rewinds the space; any other ends its transaction
   // with its result and answers whoever waits on it.
-  fn finish(self: &Rc<Self>, space: &Rc<Space>, op: &Op, local: bool, later: &[Recorded], result: Result<Value>, calls: Vec<CallRecord>) {
+  fn finish(self: &Rc<Self>, space: &Rc<Space>, op: &Op, later: &[Recorded], result: Result<Value>, calls: Vec<CallRecord>, made: Option<Vec<Made>>) {
     let ran = Ran::of(space.store(), result.is_ok());
     let ran = match ran {
       Ok(ran) => ran,
       Err(failure) => return self.stop(space, failure),
     };
     if !rewind::fits_in_place(&ran.sets, later) {
-      return self.rewind(space, &ran.sets, later);
+      return self.rewind(space, op, made, later);
     }
-    match end(space.store(), op, local, &ran, result, calls) {
+    match end(space.store(), op, &ran, result, calls, made) {
       Ok(settled) => {
         self.set_run_state(space, RunState::Idle);
-        self.learn_origin(space);
         let settled = settled.map(|settled| Settled { watches: self.committed(&space.id, &settled.tables), ..settled });
         space.answer(&op.hash, settled);
       }
@@ -224,19 +186,21 @@ impl Carbon {
     }
   }
 
-  // Roll back a late op's run, then undo the later ops it depends on or that
-  // depend on it, and forget their results, in one transaction: they are
+  // Roll back a late op's run, then undo the later ops that touched the
+  // space's tables, and forget their results, in one transaction: they are
   // pending again, so the late op applies next at its place, and they re-run
-  // after it.
-  fn rewind(self: &Rc<Self>, space: &Rc<Space>, sets: &Sets, later: &[Recorded]) {
+  // after it. Effects its first run made are kept on its row, so its run at
+  // its place replays them rather than making them again.
+  fn rewind(self: &Rc<Self>, space: &Rc<Space>, op: &Op, made: Option<Vec<Made>>, later: &[Recorded]) {
     if let Err(failure) = space.store().end_write(false) {
       return self.stop(space, failure);
     }
     self.set_run_state(space, RunState::Idle);
-    let undone = rewind::undo_set(sets, later);
+    let undone = rewind::undo_set(later);
     let hashes: Vec<String> = undone.iter().map(|op| op.hash.clone()).collect();
     let undo = space.store().write(|store| {
       undone.iter().try_for_each(|op| store.undo(&op.changeset))?;
+      made.iter().try_for_each(|made| oplog::record_effects(store, &op.hash, made))?;
       results::forget(store, &hashes)
     });
     match undo.and_then(|(_, changeset)| tables(&changeset)) {
@@ -244,15 +208,6 @@ impl Carbon {
         self.committed(&space.id, &tables);
       }
       Err(failure) => self.stop(space, failure),
-    }
-  }
-
-  // Once a new space's origin applies, learn the services it names and set
-  // up those this device runs. A service whose set-up fails stays unset,
-  // which holds the space's ops back, as on open.
-  fn learn_origin(self: &Rc<Self>, space: &Rc<Space>) {
-    if !space.is_root() && !space.knows_origin() {
-      self.learn(space, Box::new(|_| {}));
     }
   }
 
@@ -303,13 +258,14 @@ impl Carbon {
       Err(error) => return self.answer_read(space, reply, Err(error)),
     };
     let live = Rc::new(Cell::new(true));
+    let effects = Rc::new(RefCell::new(EffectLog::of(None)));
     let (carbon, here, snapshot, ended) = (Rc::clone(self), Rc::clone(space), Rc::clone(&reader), Rc::clone(&live));
     let settle: Settle = Box::new(move |result, _calls| {
       ended.set(false);
       let tables = snapshot.end();
       carbon.answer_read(&here, reply, result.and_then(|value| Ok(Settled { value, tables: tables?, watches: vec![] })));
     });
-    self.start(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, live, settle));
+    self.start(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, effects, live, settle));
   }
 
   fn answer_read(self: &Rc<Self>, space: &Space, reply: Reply, settled: Result<Settled>) {
@@ -341,17 +297,41 @@ impl Carbon {
   }
 }
 
-// The service a call reaches, by name: a local service this device runs, or a
-// replicated one set up in this space. The root space runs local services only.
-fn answering(carbon: &Carbon, space: &Space, call: &Call) -> Result<Rc<Service>> {
-  let found = carbon.services().find(&call.service).filter(|service| service.local == call.confined);
-  match (call.confined, found) {
+// The service a call reaches: the space's own, set up here, by the name it
+// goes by. The system space runs `[@carbon]` only.
+fn answering(_carbon: &Carbon, space: &Space, call: &Call) -> Result<Rc<Service>> {
+  match (space.answers(call), space.service()) {
     (true, Some(service)) => Ok(service),
-    (true, None) => Err(not_found(format!("No local service [@{}] on this device", call.service))),
-    (false, _) if space.is_root() => Err(not_found(format!("The system space runs local services only, not {}", call.key()))),
-    (false, Some(service)) if space.runs(&call.service) => Ok(service),
-    (false, None) if space.names(&call.service) => Err(services::missing(&call.service)),
-    (false, _) => Err(not_found(format!("[{}] does not run in this space", call.service))),
+    (true, None) => Err(services::missing(&space.runs.package)),
+    (false, _) if space.is_root() => Err(not_found(format!("The system space runs [@carbon] only, not {}", call.key()))),
+    (false, _) => Err(not_found(format!("{} is not this space's service, [{}]", call.key(), space.runs.name))),
+  }
+}
+
+// The `call` effect: a call to another service, posted to its space as the
+// caller's actor, or, for a local service, as the actor it names. The space
+// is the one named, or the one the caller's channel names for the call's
+// service; a channel's space answers for the services it names.
+pub(crate) fn call_effect(caller: Rc<ServiceCall>, input: Value, reply: crate::Reply) {
+  let carbon = Rc::clone(caller.carbon());
+  let made = Call::from_key(input["key"].as_str().unwrap_or_default()).and_then(|call| {
+    let actor = match input.get("as").filter(|_| caller.call.confined) {
+      Some(actor) => serde_json::from_value(actor.clone())?,
+      None => caller.actor.clone(),
+    };
+    let space = match input["space"].as_str() {
+      Some(space) => space.to_string(),
+      None => carbon.channel_of(caller.space())?,
+    };
+    Ok((call, actor, space))
+  });
+  let (call, actor, space) = match made {
+    Ok(made) => made,
+    Err(error) => return reply(Err(error)),
+  };
+  match carbon.service_space(&space, &call) {
+    Ok(target) => carbon.submit(&target, actor, call, input["input"].clone(), Box::new(move |settled| reply(settled.map(|settled| settled.value)))),
+    Err(error) => reply(Err(error)),
   }
 }
 
@@ -389,12 +369,12 @@ impl Ran {
   }
 }
 
-// End an op's transaction: commit it with its result, and a local op on its
-// first run with its sub-calls, when it succeeded; or roll it back and keep
-// only its result, saying why. Either result keeps the op's read set and
-// changeset. Fails, leaving the op pending, when the store met a system
-// failure or the result could not be written: then the space stops.
-fn end(store: &Store, op: &Op, local: bool, ran: &Ran, result: Result<Value>, calls: Vec<CallRecord>) -> Result<Result<Settled>> {
+// End an op's transaction: commit it with its result when it succeeded, or
+// roll it back and keep only its result, saying why. Either result keeps the
+// op's read set and changeset, and on its first run the effects it made.
+// Fails, leaving the op pending, when the store met a system failure or the
+// result could not be written: then the space stops.
+fn end(store: &Store, op: &Op, ran: &Ran, result: Result<Value>, calls: Vec<CallRecord>, made: Option<Vec<Made>>) -> Result<Result<Settled>> {
   // Rolling back while stopping: the space stops with the first failure,
   // whatever the rollback meets.
   if let Some(failure) = store.failure() {
@@ -404,10 +384,7 @@ fn end(store: &Store, op: &Op, local: bool, ran: &Ran, result: Result<Value>, ca
   match result {
     Ok(value) => {
       let applied = Outcome::Applied { output: value.clone(), calls: json!(calls) };
-      let recorded = results::record(store, &op.hash, &applied, &ran.read_set, &ran.changeset).and_then(|_| match local {
-        true => oplog::record_sub_calls(store, &op.hash, &sub_calls(&calls)),
-        false => Ok(()),
-      });
+      let recorded = results::record(store, &op.hash, &applied, &ran.read_set, &ran.changeset).and_then(|_| made.iter().try_for_each(|made| oplog::record_effects(store, &op.hash, made)));
       if let Err(failure) = recorded {
         let _ = store.end_write(false);
         return Err(failure);
@@ -418,6 +395,7 @@ fn end(store: &Store, op: &Op, local: bool, ran: &Ran, result: Result<Value>, ca
     Err(error) => {
       store.end_write(false)?;
       results::record(store, &op.hash, &Outcome::Refused { error: error.clone(), calls: json!(calls) }, &ran.read_set, &[])?;
+      made.iter().try_for_each(|made| oplog::record_effects(store, &op.hash, made))?;
       Ok(Err(error))
     }
   }

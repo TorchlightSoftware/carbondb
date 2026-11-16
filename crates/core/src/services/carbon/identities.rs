@@ -1,8 +1,10 @@
 //! `POST [@carbon]/identity`, and the identities on this device as the system
-//! database keeps them. An identity is its first device's key pair, an identity
-//! space and a personal space, each set up by ops through `[space]`,
-//! `[identity]` and `[device]`, and its record here, with the first device's
-//! secret key, which no space ever holds.
+//! database keeps them. An identity is its first device's key pair; its own
+//! channel, running `[identity]` and sealed once founded, shared only by the
+//! person's own devices; and its personal channel, where everything else of
+//! the person's nests. Both are set up by ops through `[channel]` and
+//! `[identity]`. Its record here keeps the first device's secret key, which no
+//! channel ever holds.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -10,8 +12,9 @@ use std::rc::Rc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::steps::{self, Step, Target};
-use crate::services::space::names::slugify;
+use super::steps::{self, Step};
+use crate::services::channel::names::slugify;
+use crate::services::identity::id_of;
 
 use crate::error::{Result, bad_request, conflict, internal, not_found, single_node};
 use crate::hash::hash;
@@ -21,15 +24,19 @@ use carbondb_service_bindings::migrations::Migration;
 use crate::{Actor, Db, HandlerContext};
 
 // The system database's own tables, after a space's: the identities on this
-// device, each with its first device's secret key.
-pub const SYSTEM_MIGRATIONS: &[Migration] = &[("system/0001_identities", include_str!("../../../migrations/system/0001_identities.sql"))];
+// device, each with its first device's secret key, and the spaces it holds.
+pub const SYSTEM_MIGRATIONS: &[Migration] = &[
+  ("system/0001_identities", include_str!("../../../migrations/system/0001_identities.sql")),
+  ("system/0002_channels_and_spaces", include_str!("../../../migrations/system/0002_channels_and_spaces.sql")),
+];
 
-// An identity on this device, as anyone on it may see it: everything but the secret key.
+// An identity on this device, as anyone on it may see it: everything but the
+// secret key. `channel` is its own channel, `personal` its personal one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Identity {
   pub slug: String,
   pub id: String,
-  pub space: String,
+  pub channel: String,
   pub personal: String,
   pub device: String,
 }
@@ -45,15 +52,16 @@ struct IdentityInput {
   code: Option<String>,
 }
 
+const COLUMNS: &str = "slug, id, channel, personal, device";
 
 // An identity on this device, by its slug.
 pub fn find(system: &dyn Db, slug: &str) -> Result<Identity> {
-  one(system.get("SELECT slug, id, space, personal, device FROM carbon_system_identity WHERE slug = ?", &[json!(slug)])?, slug)
+  one(system.get(&format!("SELECT {COLUMNS} FROM carbon_system_identity WHERE slug = ?"), &[json!(slug)])?, slug)
 }
 
 // An identity on this device, by its id: the identity a call acts as, with the device it holds here.
 pub fn acting(system: &dyn Db, id: &str) -> Result<Identity> {
-  one(system.get("SELECT slug, id, space, personal, device FROM carbon_system_identity WHERE id = ?", &[json!(id)])?, id)
+  one(system.get(&format!("SELECT {COLUMNS} FROM carbon_system_identity WHERE id = ?"), &[json!(id)])?, id)
 }
 
 fn one(row: Value, named: &str) -> Result<Identity> {
@@ -64,23 +72,22 @@ fn one(row: Value, named: &str) -> Result<Identity> {
 }
 
 pub fn list(system: &dyn Db) -> Result<Vec<Value>> {
-  system.all("SELECT slug, id, space, personal, device FROM carbon_system_identity ORDER BY slug", &[])
+  system.all(&format!("SELECT {COLUMNS} FROM carbon_system_identity ORDER BY slug"), &[])
 }
 
 // Record an identity on this device, with its first device's secret key.
 fn keep(system: &dyn Db, identity: &Identity, secret: &str) -> Result<()> {
   system.run(
-    "INSERT INTO carbon_system_identity (slug, id, space, personal, device, secret) VALUES (?, ?, ?, ?, ?, ?)",
-    &[json!(identity.slug), json!(identity.id), json!(identity.space), json!(identity.personal), json!(identity.device), json!(secret)],
+    &format!("INSERT INTO carbon_system_identity ({COLUMNS}, secret) VALUES (?, ?, ?, ?, ?, ?)"),
+    &[json!(identity.slug), json!(identity.id), json!(identity.channel), json!(identity.personal), json!(identity.device), json!(secret)],
   )?;
   Ok(())
 }
 
-// Create an identity, recording it in this call's own transaction once both
-// its spaces are set up, so an identity is listed only when it is whole. Its
-// identity space is founded by its first device alone, since the identity's id
-// exists only once `POST [identity]/origin` answers with it; every op after
-// carries the id.
+// Found an identity: its own channel, then its personal channel and the
+// services it runs, then the seal on its own channel; recorded in this call's
+// own transaction once all of it is set up, so an identity is listed only when
+// it is whole.
 pub fn create(call: Rc<ServiceCall>) {
   let founding = match plan(&call) {
     Ok(founding) => founding,
@@ -90,10 +97,10 @@ pub fn create(call: Rc<ServiceCall>) {
     }
   };
   let caller = Rc::clone(&call);
-  steps::run(call, founding.steps(), Box::new(move |founded| {
-    let identity = founded.and_then(|returned| founding.identity(returned.last()));
-    match identity {
-      Ok(identity) => set_up(caller, founding, identity),
+  steps::run(call, founding.own_channel(), Box::new(move |founded| {
+    let personal = founded.and_then(|returned| returned.last().and_then(|reference| reference["channel"].as_str()).map(str::to_string).ok_or_else(|| internal("POST [channel]/channel answered without its channel")));
+    match personal {
+      Ok(personal) => finish(caller, founding, personal),
       Err(error) => {
         let _ = caller.settle(Err(error));
       }
@@ -101,28 +108,29 @@ pub fn create(call: Rc<ServiceCall>) {
   }))
 }
 
-// Set up the rest as the new identity, then keep it on this device.
-fn set_up(call: Rc<ServiceCall>, founding: Founding, identity: Identity) {
+// Add the personal channel's services and seal the identity's own channel, then keep the identity here.
+fn finish(call: Rc<ServiceCall>, founding: Founding, personal: String) {
+  let identity = founding.identity(&personal);
   let caller = Rc::clone(&call);
-  steps::run(call, founding.setup(&identity), Box::new(move |result| {
+  steps::run(call, founding.rest(&personal), Box::new(move |result| {
     let kept = result.and_then(|_| keep(caller.as_ref(), &identity, &founding.keys.secret)).map(|_| json!(identity));
     let _ = caller.settle(kept);
   }))
 }
 
 // An identity about to be founded: its slug, its first device's key pair and
-// name, the ids of its two spaces, and the services its personal space runs.
+// name, its id, its own channel's id, and the services its personal channel runs.
 struct Founding {
   slug: String,
   device_name: String,
   keys: KeyPair,
-  space: String,
-  personal: String,
+  id: String,
+  channel: String,
   personal_services: Vec<String>,
 }
 
-// Check an identity can be created, and plan it. Both spaces are named by this
-// call's op, so a retry after a crash reaches the same spaces.
+// Check an identity can be created, and plan it. Its own channel is named by
+// this call's op, so a retry after a crash reaches the same channel.
 fn plan(call: &ServiceCall) -> Result<Founding> {
   let request: IdentityInput = serde_json::from_value(call.input.clone())?;
   if request.code.is_some() {
@@ -136,52 +144,44 @@ fn plan(call: &ServiceCall) -> Result<Founding> {
   }
   call.carbon().services().require_registered(&request.services)?;
   let op = call.op().map(|op| op.hash.clone()).expect("a POST is an op");
+  let keys = keys::generate()?;
   Ok(Founding {
     slug: request.slug,
     device_name: request.device,
-    keys: keys::generate()?,
-    space: hash(&json!({"op": op, "space": "identity"})),
-    personal: hash(&json!({"op": op, "space": "personal"})),
-    personal_services: [vec!["device".to_string()], request.services.into_iter().filter(|service| service != "device").collect()].concat(),
+    id: id_of(&keys.public),
+    keys,
+    channel: hash(&json!({"op": op, "channel": "identity"})),
+    personal_services: request.services,
   })
 }
 
 impl Founding {
-  // The identity space and its origins, written by the first device alone.
-  fn steps(&self) -> VecDeque<Step> {
-    let device = Actor { identity: None, device: Some(self.keys.public.clone()) };
-    let call = |key: &'static str, input: Value| Step::Call { target: Target::Space(self.space.clone()), actor: device.clone(), key, input };
-    let services = vec!["identity".to_string(), "device".to_string()];
+  // Acting as the new identity, from its first device.
+  fn actor(&self) -> Actor {
+    Actor { identity: Some(self.id.clone()), device: Some(self.keys.public.clone()) }
+  }
+
+  // The identity's own channel, its `[identity]` with the first device, and
+  // the personal channel inside it, whose ref the last step answers.
+  fn own_channel(&self) -> VecDeque<Step> {
+    let call = |key: &'static str, input: Value| Step::Call { space: self.channel.clone(), actor: self.actor(), key, input };
     VecDeque::from([
-      Step::Create(self.space.clone()),
-      call("POST [space]/origin", json!({"kind": "identity", "name": self.slug, "services": services, "manage": ["self"]})),
-      Step::SetUp(self.space.clone(), services),
-      call("POST [identity]/origin", json!({"device": self.keys.public})),
+      Step::Effect { name: "create", input: json!({"space": self.channel, "package": "channel", "name": "channel"}) },
+      call("POST [channel]/origin", json!({"kind": "identity", "name": self.slug, "manage": [self.id]})),
+      call("POST [channel]/services", json!({"name": "identity"})),
+      call("POST [identity]/origin", json!({"device": self.keys.public, "name": self.device_name, "tags": ["manage"]})),
+      call("POST [channel]/channel", json!({"kind": "personal", "name": self.slug, "slug": self.slug})),
     ])
   }
 
-  // The identity, with the id `POST [identity]/origin` answered.
-  fn identity(&self, origin: Option<&Value>) -> Result<Identity> {
-    let id = origin.and_then(|origin| origin["id"].as_str()).ok_or_else(|| internal("POST [identity]/origin answered without an id"))?;
-    Ok(Identity { slug: self.slug.clone(), id: id.to_string(), space: self.space.clone(), personal: self.personal.clone(), device: self.keys.public.clone() })
+  // The personal channel's services, then the seal on the identity's own channel.
+  fn rest(&self, personal: &str) -> VecDeque<Step> {
+    let services = self.personal_services.iter().map(|name| Step::Call { space: personal.to_string(), actor: self.actor(), key: "POST [channel]/services", input: json!({"name": name}) });
+    let seal = Step::Call { space: self.channel.clone(), actor: self.actor(), key: "POST [channel]/seal", input: json!({}) };
+    services.chain(std::iter::once(seal)).collect()
   }
 
-  // The rest of the setup, acting as the new identity from its first device.
-  fn setup(&self, identity: &Identity) -> VecDeque<Step> {
-    let actor = Actor { identity: Some(identity.id.clone()), device: Some(identity.device.clone()) };
-    let call = |space: &str, key: &'static str, input: Value| Step::Call { target: Target::Space(space.to_string()), actor: actor.clone(), key, input };
-    VecDeque::from([
-      call(&self.space, "POST [device]/origin", json!({"pubkey": identity.device})),
-      Step::Create(self.personal.clone()),
-      call(&self.personal, "POST [space]/origin", json!({
-        "kind": "personal",
-        "name": self.slug,
-        "services": self.personal_services,
-        "manage": [identity.id],
-      })),
-      Step::SetUp(self.personal.clone(), self.personal_services.clone()),
-      call(&self.personal, "POST [device]/ref", json!({"pubkey": identity.device, "name": self.device_name, "tags": ["manage"]})),
-      call(&self.space, "POST [space]/ref", json!({"space": self.personal, "kind": "personal", "name": self.slug, "slug": self.slug})),
-    ])
+  fn identity(&self, personal: &str) -> Identity {
+    Identity { slug: self.slug.clone(), id: self.id.clone(), channel: self.channel.clone(), personal: personal.to_string(), device: self.keys.public.clone() }
   }
 }

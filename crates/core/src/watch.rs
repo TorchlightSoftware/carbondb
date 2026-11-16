@@ -161,10 +161,11 @@ impl Carbon {
   // again after every commit that writes a table it read, handing each answer
   // to `deliver`. The id stops it.
   pub fn watch(self: &Rc<Self>, space: &str, identity: Option<&str>, key: &str, deliver: Delivery) -> Result<WatchId> {
+    let call = Call::from_key(key)?;
     let watch = Rc::new(Watch {
-      space: space.to_string(),
+      space: self.service_space(space, &call)?.id.clone(),
       actor: self.actor(identity)?,
-      call: Call::from_key(key)?,
+      call,
       deliver,
       reads: RefCell::new(Reads::unseen()),
       stopped: Cell::new(false),
@@ -342,7 +343,7 @@ mod tests {
     assert_eq!(cases, 16 * (1 + 9 + 81 + 729));
   }
 
-  // What each watch on the personal space has been handed, by its GET.
+  // What each watch on the personal channel has been handed, by its GET.
   #[test]
   fn hands_over_its_get_now_and_after_each_commit_that_wrote_what_it_read_until_stopped() {
     use crate::testing::{alice, carbon, now};
@@ -358,7 +359,7 @@ mod tests {
     };
     let post = |text: &str| now(|answer| carbon.call(Some(&identity.personal), Some(&identity.id), "POST [notes]/run", json!({"do": [{"insert": text}]}), answer)).unwrap();
     let (texts, notes) = watching("GET [notes]/texts");
-    let (_refs, refs) = watching("GET [space]/refs");
+    let (_refs, refs) = watching("GET [channel]/refs");
     post("a");
     carbon.unwatch(texts);
     post("b");
@@ -368,12 +369,12 @@ mod tests {
 
   #[test]
   fn a_write_waits_for_the_watches_its_commit_owes_a_run_and_a_get_for_none() {
-    use crate::testing::{actor, alice, call_now, later, space_now, timed};
+    use crate::testing::{actor, alice, call_now, later, personal_notes, timed};
     use serde_json::json;
 
     let (_directory, carbon, timers) = timed();
     let identity = alice(&carbon);
-    let personal = space_now(&carbon, &identity.personal).unwrap();
+    let personal = personal_notes(&carbon, &identity);
     let (space, acting) = (Some(identity.personal.as_str()), Some(identity.id.as_str()));
     let answers = Rc::new(RefCell::new(vec![]));
     let watching = |key: &str| {
@@ -381,7 +382,7 @@ mod tests {
       carbon.watch(&identity.personal, acting, key, Rc::new(move |answer: Result<Value>| into.borrow_mut().push(answer.map_err(|error| error.status)))).unwrap()
     };
     let insert = |text: &str| json!({"do": [{"insert": text}]});
-    let (texts, _refs) = (watching("GET [notes]/texts"), watching("GET [space]/refs"));
+    let (texts, _refs) = (watching("GET [notes]/texts"), watching("GET [channel]/refs"));
     let post = |text: &str| call_now(&carbon, &personal, &actor(&identity), "POST [notes]/run", insert(text)).unwrap();
     assert_eq!(post("a").watches, [texts], "only the watch that read what it wrote");
     assert_eq!(call_now(&carbon, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap().watches, Vec::<WatchId>::new());

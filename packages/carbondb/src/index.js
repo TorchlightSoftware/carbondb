@@ -1,10 +1,10 @@
 // CarbonDB for Node. An app's main() loads it with its TOML config, registers
-// its services, and reaches its spaces through handles:
+// its services, and reaches its channels through handles:
 //
 //   const carbon = await configure('./carbondb.toml')
 //   carbon.services.add('chat', chat)
-//   const room = carbon.ref('identity:alice').ref('personal:alice').ref('space:lobby')
-//   await room.call('POST [chat]/messages', {text: 'hello'})
+//   const lobby = carbon.ref('identity:alice').ref('personal:alice').ref('channel:lobby')
+//   await lobby.call('POST [chat]/messages', {text: 'hello'})
 //
 // Everything CarbonDB keeps is in the core; this package hands it calls and
 // hosts the app's npm services.
