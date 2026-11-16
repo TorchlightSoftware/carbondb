@@ -1,10 +1,10 @@
-# A service can store files in a space
+# A service can store files
 
 Status: backlog
 
 ## Idea
 
-Services keep more than rows: retained documents, images, exports. A `file` binding in `service.toml` gives a service object storage in the space, the way `sql` gives it a database. The `wrangler.toml` generator translates `r2_buckets` to it. Each service's file store is its own, per space, like its `sql` files (see [packages](../packages.md)).
+Services keep more than rows: retained documents, images, exports. A `file` binding in `service.toml` gives a service object storage, the way `sql` gives it a database. The `wrangler.toml` generator translates `r2_buckets` to it. Each instance of a service has its own file store, as it has its own SQLite file (see [packages](../packages.md)). Unlike `fetch`, which reaches the world outside and is recorded as an effect, a file store is the service's own state, replicated with it.
 
 ## To decide
 

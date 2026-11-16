@@ -4,10 +4,10 @@ Status: backlog
 
 ## Idea
 
-The destination is that a device registers packages, and a space's origin binds each service name it runs to one of them (see [a space's origin naming its packages](../packages.md#a-spaces-origin-names-its-packages)). A package is then known by a name of its own, unique across packages, rather than by the name a call uses in some space. Today an app registers a service under a device-wide name, which overrides the canonical name in its `service.toml`.
+A channel names each of its services by a package registered on this device (see [a channel names its services' packages](../packages.md#a-channel-names-its-services-packages)). A package is then known by a name of its own, unique across packages, rather than by the name a call uses in some channel. Today an app registers a service under a device-wide name, which overrides the canonical name in its `service.toml`.
 
 ## To decide
 
 - How a package is identified across devices: a name unique across packages, as npm scopes give, or its version hash.
-- Whether the app registers a package by its name and CarbonDB finds its `service.toml`, or the package exports where its `service.toml` is, as today. [packages](../packages.md) says CarbonDB never finds npm packages; the app imports and registers them.
-- Whether the local name moves from `services.add` to space creation, which binds each name to a package. Running two copies of one package in an app then needs no special case: two spaces, or two names in one space, bound to the same package.
+- Whether the app registers a package by its name and CarbonDB finds its component, or the app imports the component and registers it, as today.
+- Whether the device-wide name passed to `services.add` gives way to the name `POST [channel]/services` gives each service, binding it to a package. Running two copies of one package in an app then needs no special case: two names, in one channel or two, bound to the same package.

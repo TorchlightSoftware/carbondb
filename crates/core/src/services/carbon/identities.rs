@@ -19,7 +19,7 @@ use carbondb_svc_identity::id_of;
 use crate::error::{Result, bad_request, conflict, internal, not_found, single_node};
 use crate::hash::hash;
 use crate::keys::{self, KeyPair};
-use crate::service_call::ServiceCall;
+use crate::calls::service_call::ServiceCall;
 use carbondb_service_bindings::migrations::Migration;
 use crate::{Actor, Db, HandlerContext};
 

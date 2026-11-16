@@ -26,7 +26,7 @@ CarbonDB is an experiment in creating a general purpose framework for applicatio
 
 ## Status
 
-The core API currently runs in single-node mode (no network). Each service runs in a channel, with its own SQLite file and op log, and services call each other by message. Rewind and replay are built and tested on a single device: ops received from other devices apply in one shared order, a late op rewinds only what it must, and what a service does outside its own tables (an effect) is made once and replayed after ([docs/replication.md](docs/replication.md)). Every service runs as a WebAssembly component on the core's WASM host, whatever language it was written in ([docs/wasm-services.md](docs/wasm-services.md)). Next step is to carry ops between devices with p2panda (on iroh). The design is in [stories/](stories/README.md), and the channel model's interface in [stories/channels/services.md](stories/channels/services.md).
+The core API currently runs in single-node mode (no network). Each service runs in a channel, with its own SQLite file and op log, and services call each other by message. Rewind and replay are built and tested on a single device: ops received from other devices apply in one shared order, a late op rewinds only what it must, and what a service does outside its own tables (an effect) is made once and replayed after ([docs/replication.md](docs/replication.md)). Every service runs as a WebAssembly component on the core's WASM host, whatever language it was written in ([docs/wasm-services.md](docs/wasm-services.md)). Next step is to carry ops between devices with p2panda (on iroh). The design is in [stories/](stories/README.md), and the channel model's interface in [stories/services.md](docs/services.md).
 
 This should be considered a first draft that shows you what the API surface looks like, and what it looks like to build an app on top of CarbonDB.
 
@@ -75,7 +75,7 @@ async function start(config) {
 The app then calls the channel's service, `lobby.call('POST [chat]/messages', {text: 'hello'})`, and watches it, `lobby.watch('GET [chat]/messages', render)`.
 
 **Built on single-node:**
- - create cryptographic identities KeyBase style, with multiple devices attached to an identity
+ - create cryptographic identities KeyBase style, each founded with its first device; adding more devices needs peers
  - secret keys stay on device and are never transmitted over the network
  - an identity's own channel, shared only by its devices, and its "personal channel" for apps and data
  - channels for organizations, or friends & family, nested for teams and departments
@@ -83,8 +83,9 @@ The app then calls the channel's service, `lobby.call('POST [chat]/messages', {t
  - services call each other by message; effects are made once and replayed after
  - every service a WebAssembly component on the core's own thread: the builtins in Rust, [chat] in JavaScript.
  - `fetch` for services over `wasi:http`, each request recorded as an effect.
+ - each service starts before it answers: its package compiled off the core's thread and kept on disk, its setup, and an optional health check, bounded by a startup timeout; calls wait for it, each within its own deadline.
 
-The interface is in [packages/carbondb/README.md](packages/carbondb/README.md).
+The interface is in [packages/carbondb/README.md](packages/carbondb/README.md); how it works, in [docs/](docs/).
 
 **Next:**
     - replication: p2panda carries each service's ops between members' devices, which adding devices and members needs.
@@ -95,8 +96,9 @@ The interface is in [packages/carbondb/README.md](packages/carbondb/README.md).
 
 - [perspectives/brandon/components/](perspectives/brandon/components/README.md): one file per architectural component (identity, device constellation, contacts, private communication, blind relay nodes, state synchronization, storage, wallet, client platform, service calls), with what is agreed and what is open.
 - [perspectives/brandon/platforms/](perspectives/brandon/platforms/README.md): evaluations of the candidate platforms and the feature matrix.
-- [stories/](stories/README.md): what a person can do with CarbonDB, and the agreed design underneath.
-- [crates/core/](crates/core/): the `carbondb` crate, the Rust core: one SQLite file per service with its op log and results, applying each one's pending ops in turn, resolving every call through its channel, effects made once and replayed, the WASM host every service runs on, the runtime that runs the core on a thread of its own, and `[@carbon]`, the part of the core that answers as a local service. The builtins it embeds are committed in `builtins/`.
+- [docs/](docs/): how what is built works: [services.md](docs/services.md), every builtin call; [channels.md](docs/channels.md), channels, refs, access and identities; [lifecycle.md](docs/lifecycle.md), registering, starting and deadlines; [replication.md](docs/replication.md), the shared order, rewind and effects; [wasm-services.md](docs/wasm-services.md), services as WebAssembly components.
+- [stories/](stories/README.md): what a person cannot do yet, the design still to build, and the backlog.
+- [crates/core/](crates/core/): the `carbondb` crate, the Rust core: `calls/`, the one path every call takes, its deadline and watches; `channels/`, each service a channel names as a service space on this device, with its own SQLite file and op log, and its lifecycle; `ops/`, applying ops in the shared order, rewind and effects; `wasm/`, the host every service runs on; `app/`, how an app reaches the core, on a thread of its own; and `services/`, the registry and `[@carbon]`, the part of the core that answers as a local service. The builtins it embeds are committed in `builtins/`.
 - [crates/service-bindings/](crates/service-bindings/): ServiceBindings, the toolkit a Rust service builds with: the `carbondb:service` WIT world every service exports; the API footprint a service exposes, its `setup`, entry point and the handler context each call receives; with its `guest` feature, exporting a Rust service as a component; an opt-in helper that applies D1-style migrations; the content hash every replica agrees on; and `carbondb-package`, which embeds a `service.toml` in a component.
 - [crates/services/](crates/services/): the builtin services `[channel]` and `[identity]`, each a crate with its own `service.toml`, migrations and source, written against ServiceBindings alone and built as components by [scripts/build-components](scripts/build-components); and `[probe]`, a component the core's tests run.
 - [crates/node/](crates/node/): the core's Node bindings, through napi-rs.

@@ -20,7 +20,7 @@ use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
 use crate::error::{Result, internal};
 use crate::ops::fetch::{Request, Response};
-use crate::service_call::{Asked, ServiceCall};
+use crate::calls::service_call::{Asked, ServiceCall};
 
 // What an instance sends its requests through: the core, for what it runs for.
 pub(super) struct Outside {

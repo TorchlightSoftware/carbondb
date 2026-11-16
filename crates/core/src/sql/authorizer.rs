@@ -8,7 +8,7 @@
 //! own statements, outside any call window, reach everything.
 //!
 //! The authorizer also records what statements read: a GET's read set, which
-//! `watch` re-runs on, and an op's, which rewind checks. It reports tables,
+//! a watch re-runs on, and an op's, which rewind checks. It reports tables,
 //! so each statement's reads are settled once it has run: a statement that
 //! `lookup` finds looking up one row by its key, and that read only that
 //! row's table, read that row; any other read the tables it read. What an op
@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::hooks::{AuthAction, Authorization};
 use serde::{Deserialize, Serialize};
 
-use crate::call_window::CallWindow;
+use crate::sql::call_window::CallWindow;
 use crate::store::changeset::Row;
 
 // What a statement read: a whole table, or the one row of it looked up by its whole key.

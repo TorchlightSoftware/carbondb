@@ -657,15 +657,6 @@ Ok, can you test it?
 
 ---
 
-    3. Deeper issues found:
-       - A write that fetches holds its space for the whole request
-
-Is there any avoiding this in our present design?  I mean, in essence we are serializing access to a web service.  That's a major killer to throughput, vs how a web service would normally operate.  Does this point to a deeper flaw in the whole design, or is it something we can optimize?  Traditionally database writes may be serialized, but the application wouldn't operate under such a constraint.  And databases make determinations about whether your operations actually need to be serialized.
-
-This seems to be a constraint that our oplog and CRDT mechanics are forcing.  But we probably don't need to be so heavy handed... there's a lot more that we know about the queries that are running, and we should also be able to ascertain whether they can be run in parallel.  Let's talk further about that.
-
----
-
     Rust services keep working over 0.2 through wasip2
 
 Claude, why are you pinning an older release for Rust?  Why don't you just update everything?
@@ -759,7 +750,145 @@ Maybe we shouldn't be including the service startup/compile time inside the CALL
 
 ---
 
+    3. Deeper issues found:
+       - A write that fetches holds its space for the whole request
+
+Is there any avoiding this in our present design?  I mean, in essence we are serializing access to a web service.  That's a major killer to throughput, vs how a web service would normally operate.  Does this point to a deeper flaw in the whole design, or is it something we can optimize?  Traditionally database writes may be serialized, but the application wouldn't operate under such a constraint.  And databases make determinations about whether your operations actually need to be serialized.
+
+This seems to be a constraint that our oplog and CRDT mechanics are forcing.  But we probably don't need to be so heavy handed... there's a lot more that we know about the queries that are running, and we should also be able to ascertain whether they can be run in parallel.  Let's talk further about that.
+
+---
+
+    - SQLite allows only one writer per file.
+
+Ok, so it's basically a constraint imposed by SQLite, combined with our implicit wrapping of each call in a transaction.
+
+    What already decides whether ops need ordering: every op records what it read and what it wrote.
+
+Yes.  But it sounds like SQLite only allows one writer... does that mean you can't initiate multiple transactions at once, regardless of if they do not overlap?
+
+    Proposal: make effects outside the transaction, using replay
+
+That takes effects outside of the portion that needs to be serialized, which alleviates the symptoms somewhat, but it doesn't change the shape of the serialization itself.  It's an interesting proposal, and I think you could put it in the backlog as a spike... but we would need to performance test and evaluate whether the savings are worthwhile.
+
+    A handler runs once more for each round of new effects
+
+Yes.
+
+Write your proposal as a backlog item, and continue discussing the core question: Can we actually alter the shape of how Ops run, is it possible to do this in parallel if they do not conflict?  I think the answer is no due to the single write per file constraint you just mentioned but I want to be sure.
+
+---
+
+    - Our own core is single-threaded too, so handlers never compute in parallel anyway
+
+Uh... traditional node or browser JS runs an event loop.  But maybe that's not available in WASM?  I assume there's some sort of lightweight event loop available.  Our core is about to start running tokio, as soon as we implement p2panda.  Services in general were designed to run async: they may be single threaded but they are non blocking.
+
+I don't expect handlers to run multithreaded, but I do expect them to run on an event loop.  But please tell me if there's no benefit to that anyway, because of SQLite's lock.
+
+    do you want Turso's concurrent writes evaluated as a backlog item
+
+No, not interested in Turso.
+
+
+---
+
 Let's clean up the project documentation.  First get rid of old stories that have been transitioned to stories/channels, then move the channels stories into stories/.  That branch is gone now, and we've merged to main and committed to this direction.
 
 Close the current agenda, and pop up a new agenda with whatever planning and documentation needs to occur.  Feel free to mark "will implement" anything with obvious outcomes that follow from our code.
 
+---
+
+    Add docs/channels.md
+
+The information you need for that is probably already in stories/channels/services.md.  And since we've went over that document extensively, I think it just needs to be promoted to a doc.  I would still call it services.md however, because that's how it is structured.
+
+Does channels.md still have an independent purpose?  Maybe to talk more about access controls and refs?
+
+Otherwise I agree with you.
+
+    - Other backlog items: should I give you each remaining item with a one-line "reword" or "delete" verdict to confirm?
+
+Yes.
+
+    - The p2panda plan: should it be refreshed into the channel model now
+
+Yes.
+
+---
+
+I'm fine with your backlog verdicts, and docs/channels.md
+
+New topic:
+
+In core, we have the folders:
+
+    ops
+    services
+    sql
+    store
+    wasm
+
+These are good.  Are there any other folders you can suggest that would help to organize our code around?
+
+---
+
+    Treat a cross-service read as a pinned read, not a generic effect.
+
+My mind was going in a similar direction... We need some way of creating causal bindings between spaces.  I think that would be:
+
+    - from channel to sub-channel
+    - from channel to service
+
+They would flow down the hierarchy, but an [identity] service running in the channel could call [channel] to accomplish this.  Reactive DAG model.
+
+    Every member of a channel holds every service in it. So if an op recorded the point in [roles]'s log it read from, every replica could re-check the permission itself instead of trusting the author. A late revocation could then invalidate it through the existing cutoff and rewind machinery.
+
+Not sure if our ideas are compatible: explore with me please.
+
+Do you agree that the needs of access controls actually represent a more general need, which could be accomplished by some kind of causal bindings such as I have described?
+
+---
+
+    1. Every revocation carries a cutoff.
+
+That's fine.
+
+    2. Each fact must have one owner. You proposed [identity] calls [channel], which flows the fact down. But [channel] also has to tell a role service about membership changes
+
+I think your [role] and my [identity] are one and the same, just echoing from planning documents that were written at different times, for different purposes.
+
+I'm not sure why facts having one owner is part of the discussion... I need more information on that.
+
+I guess the sequence might look something like this:
+
+    POST [identity]/roles
+    POST [channel]/broadcast
+    POST [books]/broadcast
+    POST [worklog]/broadcast
+    ...subchannel: POST [channel]/broadcast
+
+Maybe "broadcast" is a better name than "causal binding"?  And is this what we need?  Or is it something more direct like:
+
+    POST [books]/do-something (observed clock: [identity])
+
+    3. Someone has to carry the push. If that device is offline, or isn't a member of the sub-channel, the fact never arrives.
+
+Well yeah, if Dave is offline when he revokes Martha's access, no one else will know about it until he regains connectivity.  We can't violate the laws of physics.  But I'm not sure what your point is.
+
+    4. The trust chain needs a root.
+
+[identity] would be initialized with public/private key.  All the other services would need to have [identity]'s public key in their `origin` Op.
+
+---
+
+The one thing that's annoying about the broadcast is that it necessitates replicating a message recursively down through the spaces.  Could be a footgun, especially if someone accidentally or maliciously posts something large.
+
+If we can establish more of an observation chain, maybe that could be more efficient.
+
+    if roles in [identity] can also grant manage-like rights, [books] needs a rule for combining the two
+
+Again, we're translating RBAC from Otto.  [pull, read, write, manage] on a space doesn't begin to describe fine grained access controls on a per service-key basis, which is what the Otto [identity] service does.  The way that's implemented in Otto uses a JWT from [identity] where all of the accessible routes are embedded in it.  Individual services check that JWT, and if it's good, they perform the change.  Maybe simply ability to sync with the parent channel so that a JWT revocation could be read would be sufficient.  Then the broadcast would only need to reach sub-channels, it wouldn't need to be replicated on each service oplog.
+
+    [identity] has no private key to hold. It runs on many devices and many managers. A service key pair would be a secret shared among them
+
+Its `origin` can hold keys of approved managers.

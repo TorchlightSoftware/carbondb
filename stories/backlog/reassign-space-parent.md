@@ -1,10 +1,10 @@
-# A manager can move a space to a different parent
+# A manager can move a channel to a different parent
 
 Status: backlog
 
 ## Idea
 
-Parenthood is set when a space is created, through the parent's `POST [space]/ref` and the manage list on the child's origin op. Both are fixed today, so a team cannot move from one company to another, or out of a company on its own.
+Parenthood is set when a channel is created, through the parent's ref to it and the manage list on the child's origin op ([docs/channels.md](../../docs/channels.md#reaching-channels-refs-and-handles)). Both are fixed today, so a team cannot move from one company to another, or out of a company on its own.
 
 ## To decide
 

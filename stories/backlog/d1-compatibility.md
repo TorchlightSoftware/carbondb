@@ -4,7 +4,7 @@ Status: backlog
 
 ## Why
 
-Services ported from Cloudflare Workers are written against D1: `env.DB.prepare(sql).bind(...).run()`, `first()`, `all()`, `raw()`, `batch()`, `exec()`, and a result carrying `meta.last_row_id`. A CarbonDB `sql` binding offers `run`, `get` and `all` instead, so a port has to rewrite every query. The [packages](../packages.md) plan already ports a Worker's `wrangler.toml` and its D1 migrations; its queries are the missing piece.
+Services ported from Cloudflare Workers are written against D1: `env.DB.prepare(sql).bind(...).run()`, `first()`, `all()`, `raw()`, `batch()`, `exec()`, and a result carrying `meta.last_row_id`. A CarbonDB `sql` binding offers `run`, `get` and `all` instead, so a port has to rewrite every query. The [packages](../packages.md) plan already ports a Worker's `wrangler.toml`, and a JavaScript service keeps its D1 migration files; its queries are the missing piece.
 
 ## Already agreed
 
@@ -20,7 +20,7 @@ A layer over a service's `sql` binding offering D1's statement API and result sh
 - Which runtimes offer it: the JS runtime first, and whether Rust services get one.
 - What `last_row_id` is when a statement draws several keys from `op_id()`, or none.
 - How `batch()` maps onto an op, which is already one transaction: likely a savepoint, so the batch stays atomic within it.
-- How `init` uses it: D1's API returns promises, while `init` must finish before it returns.
+- How `setup` uses it: D1's API returns promises, while `setup` must finish before it returns.
 
 ## Testing
 

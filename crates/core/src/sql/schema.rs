@@ -53,7 +53,7 @@ fn guidance(table: &str, problem: &str) -> crate::error::ServiceError {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::call_window::CallWindow;
+  use crate::sql::call_window::CallWindow;
   use crate::store::Store;
 
   #[test]

@@ -60,7 +60,7 @@ mod tests {
   fn writes_an_op_at_once_unless_another_applies_then_when_its_turn_ends() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(&directory.path().join("s.db")).unwrap();
-    store.migrate(crate::space::MIGRATIONS).unwrap();
+    store.migrate(crate::channels::service::MIGRATIONS).unwrap();
     let writer = OpWriter::default();
     writer.write(&store, false, row("a", 1)).unwrap();
     writer.write(&store, true, row("b", 2)).unwrap();
@@ -78,7 +78,7 @@ mod tests {
   fn drops_an_op_already_logged_and_keeps_a_received_row_with_its_effects() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(&directory.path().join("s.db")).unwrap();
-    store.migrate(crate::space::MIGRATIONS).unwrap();
+    store.migrate(crate::channels::service::MIGRATIONS).unwrap();
     let writer = OpWriter::default();
     let made = Made { name: "call".into(), input: json!({"key": "GET [tag]/tags"}), output: Ok(json!(["red"])) };
     let received = LogRow { effects: Some(vec![made.clone()]), ..row("l", 1) };

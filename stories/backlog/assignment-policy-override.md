@@ -4,7 +4,7 @@ Status: backlog
 
 ## Idea
 
-An identity's assignment policy reads the tags on its devices and the tags on the services in a space, and assigns which devices hold that space at pull, read, write or manage. The CarbonDB core provides a default policy.
+An identity's assignment policy reads the tags on its devices and the tags on the services in a channel, and assigns which of its devices hold each service at pull, read, write or manage ([p2panda-sync.md](../p2panda-sync.md)). The CarbonDB core provides a default policy.
 
 An identity may later supply its own policy in place of the default. We do not yet know the use cases; testing the default policy will show them.
 

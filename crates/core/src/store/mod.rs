@@ -14,11 +14,12 @@
 //! opens and tracked in `carbon_migrations`.
 //!
 //! Each top-level GET opens its own read-only `Reader`, which in WAL mode sees
-//! only committed state and records every table it reads, the read set `watch`
+//! only committed state and records every table it reads, the read set a watch
 //! re-runs on. Reads therefore never wait for a write, nor for each other.
 //!
-//! A service's statements run inside a call window (`call_window`); the core's
-//! own run outside one. Statements are prepared fresh each time, never from a
+//! A service's statements run inside a call window
+//! (`crate::sql::call_window`); the core's own run outside one. Statements
+//! are prepared fresh each time, never from a
 //! cache, because the authorizer only runs when a statement is prepared.
 //!
 //! No statement waits for a lock: another process holding the file is a system
@@ -42,7 +43,7 @@ use carbondb_service_bindings::migrations::{self, Migration};
 
 pub mod changeset;
 
-use crate::call_window::{CallWindow, Scoped, guard};
+use crate::sql::call_window::{CallWindow, Scoped, guard};
 use crate::sql::Statements;
 use crate::sql::authorizer::{Read, Shared, start_reading, stop_reading, unrecorded};
 use crate::error::{Result, ServiceError, bad_request, is_system_failure, sqlite, system_failure};

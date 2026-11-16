@@ -8,6 +8,7 @@
 //! - `authorizer` refuses a statement that reaches the core's own tables or
 //!   another file, and records what each statement read.
 //! - `schema` checks a service's tables after its `setup`.
+//! - `call_window` says, for each statement, whose tables it may reach.
 //!
 //! This module keeps what is worked out for each statement, once per statement
 //! text and per space, in memory: the row it looks up. The cache is cleared
@@ -16,6 +17,7 @@
 //! more.
 
 pub mod authorizer;
+pub mod call_window;
 pub mod lookup;
 pub mod schema;
 

@@ -8,13 +8,14 @@ Finish the initial prototype first, then carefully consider and revise its secur
 
 ## To review
 
-- What publishing an identity reveals: the identity space holds only its origin, device public keys and proofs, which still shows how many devices it has.
+- What publishing an identity reveals: its device public keys and proofs still show how many devices it has ([public identity proofs](public-identity-proofs.md)).
 - What follows from having no server to order changes, such as two devices revoking each other concurrently, and defences such as a paper key or a hardware key required for device changes.
-- Whether the paper key can stay outside the p2panda group, given that members above Pull need current key bundles.
+- Whether the paper key can stay outside p2panda, given that members above Pull need current key bundles.
 - p2panda's group encryption, which is a custom protocol with no audit found.
 - Dev and test mode, which keep keys in SQLite in plaintext, and the secure secret storage that production requires.
 - Adversarial members, which the design does not yet war-game.
-- Creating a space cannot be undone, and if a rewind rejects a parent's ref the space stays, unattached. Who can create spaces that outlive their attachment, and what that leaves behind.
+- Creating a channel or a service cannot be undone, and if a rewind refuses the op that created it, it stays, unattached. Who can create channels and services that outlive their attachment, and what that leaves behind.
+- Loading compiled components from the cache directory runs them as native code, so whoever can write that directory can run code in the process ([docs/wasm-services.md](../../docs/wasm-services.md)).
 
 ## Other Questions
 

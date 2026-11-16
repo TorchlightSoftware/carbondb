@@ -21,7 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::error::{Result, ServiceError, bad_request};
-use crate::service_call::ServiceCall;
+use crate::calls::service_call::ServiceCall;
 use crate::Reply;
 
 // An outgoing request, as an op's row records it.

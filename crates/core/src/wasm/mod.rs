@@ -35,7 +35,7 @@ use wasmtime::Store;
 use wasmtime::component::InstancePre;
 
 use crate::error::{Result, ServiceError, bad_request, internal};
-use crate::service_call::ServiceCall;
+use crate::calls::service_call::ServiceCall;
 use crate::services::{Service, Setup, startup_timeout, timeout};
 use crate::{Db, HandlerContext};
 use compile::{ENGINE, block_on, compiled};

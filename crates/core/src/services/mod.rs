@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::error::{Result, bad_request, conflict, not_found};
-use crate::service_call::ServiceCall;
+use crate::calls::service_call::ServiceCall;
 use crate::{Db, HandlerContext};
 
 // The packages CarbonDB ships, embedded in the library as the components

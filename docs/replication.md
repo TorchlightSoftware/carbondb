@@ -2,7 +2,7 @@
 
 This is for anyone who needs to know how CarbonDB keeps the copies of a service on different devices identical: what decides the order ops apply in, what happens when an op arrives late, what is undone and re-run, what a handler does outside its own tables, and why.
 
-Each service runs in a channel, in a space of its own: one SQLite file holding its tables, its op log and its results, so an op and its transaction always cover the same data. Services call each other by message; between services only delivery is guaranteed.
+Each service runs in a channel, in a service space of its own: one SQLite file holding its tables, its op log and its results, so an op and its transaction always cover the same data. Services call each other by message; between services only delivery is guaranteed.
 
 Rewind and replay are built and tested on a single device: a device receives rows from other devices through `Carbon::receive`, and applies them in the shared order. Carrying rows between devices over p2panda is not built yet; see [stories/p2panda-sync.md](../stories/p2panda-sync.md).
 

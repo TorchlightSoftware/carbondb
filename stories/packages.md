@@ -1,6 +1,6 @@
 # Services ship as hashed packages that declare their bindings
 
-Status: parked — superseded by the channel model's [packages.md](channels/packages.md); the WASM host and the builtins as committed components are built ([docs/wasm-services.md](../docs/wasm-services.md))
+Status: agreed — every service but `[@carbon]` is a WebAssembly component carrying its service.toml, versioned by its bytes, on the WASM host ([docs/wasm-services.md](../docs/wasm-services.md)): the builtins `[channel]` and `[identity]` committed and embedded, [chat] built from JavaScript; each service a channel names runs with its own SQLite file, with no namespacing; registering compiles a package off the core's thread and keeps its compiled code on disk ([docs/lifecycle.md](../docs/lifecycle.md)); a channel names the package each of its services runs. Open: the `wrangler.toml` generator, and how a package is identified across devices
 
 ## Why
 
@@ -10,12 +10,10 @@ The fix is one package form for every replicated service, builtins included: a s
 
 ## The package
 
-- A package is one artifact with a known entry point: a WebAssembly module (preferred) or an npm package (for code hard to convert).
-- Its hash is its version. It covers the calls the service offers, its schema and its handlers. Implementations in other languages are simply other versions.
-  - WASM: the hash of the module's bytes, computed when CarbonDB loads it.
-  - npm: the integrity npm records in the lockfile, as npm gives it ([backlog](backlog/npm-package-integrity.md)). For now the core hashes every file in the package instead (see Build order).
+- A package is one WebAssembly component of the `carbondb:service` world, carrying its `service.toml`, built from any language: the builtins from Rust, [chat] from JavaScript.
+- Its hash is its version: the hash of the component's bytes, computed when CarbonDB registers it. It covers the calls the service offers, its schema, its handlers and its manifest. Implementations in other languages are simply other versions.
 - CarbonDB is unopinionated about a package's insides. It reads only its `service.toml` and its entry point.
-- The entry point receives every call for its service and routes method and resource itself. CarbonDB routes only to the package, by service name. For npm packages, the JS runtime's route matcher stays as the adapter from a `calls` object to that entry point.
+- The entry point receives every call for its service and routes method and resource itself. CarbonDB routes only to the package, by the name its channel gives the service. For JavaScript, `carbondb/service` routes a `calls` object inside the component.
 
 ## service.toml
 
@@ -25,19 +23,20 @@ CarbonDB's own manifest, baked into the package and covered by its hash: a servi
 - `timeout`: the milliseconds every call to the service must settle within, 200 when it names none (see Timeouts and refusals in [implementation.md](implementation.md));
 - `version`: the version the package declares, semver canonically. It is advisory: CarbonDB records it beside the hash and never trusts it, since only the hash says which code ran. Not built: the runtime refuses it as an unknown field for now;
 - `vars`: constants the handlers read. Not built, and refused for now, like `version`;
-- `sql` bindings: a binding name. How a service shapes its storage, such as by migrations, is internal to it: its own `init` applies and tracks them.
+- `sql` bindings: at most one binding name, since the service's tables, its op log and its results share one file. How a service shapes its storage, such as by migrations, is internal to it: its own `setup` applies and tracks them;
+- `effects`: what the service does outside its own tables, by name, such as `[effects.fetch] replicate = "never"`. `never`, the default, makes the effect on an op's first run only and replays its recorded output; `always` makes it again on every run on every replica, never recorded. An effect left out takes the default. See [docs/replication.md](../docs/replication.md#effects-are-made-once).
 
-The runtime refuses a `service.toml` with any field it does not know. There are no environments: each space and service is isolated already, so one config serves every device.
+The runtime refuses a `service.toml` with any field or value it does not know, so a later setting is an addition. There are no environments: each service is isolated already, so one config serves every device.
 
 A generator writes `service.toml` from a `wrangler.toml` for services ported from Cloudflare Workers. It runs in one mode, such as production, and emits only that environment, without environment sections. `d1_databases` become `sql`, `vars` carry over, and every field it drops is reported as a warning. `r2_buckets` are left for [file bindings](backlog/file-bindings.md).
 
 ## Bindings
 
-- A handler sees only bindings to storage that already exists, as a Worker sees `env.DB`. It never creates storage, generates keys or touches the system database.
-- A space keeps every service's tables in its one database file, namespaced per service, so an op touching several services commits atomically: SQLite commits across attached files atomically per file only in WAL mode. For now a service declares at most one `sql` binding.
-- A device sets up a space's services when it applies the op that creates the space or changes its services, and again on every open: it calls each service's `init` in a transaction of its own, outside any op, then checks its tables' keys. This is internal to the core; nothing calls it directly. Every replica does it locally on receiving the op.
-- Each statement a service runs is rewritten by the core into its namespace, `service/binding/name`, and SQLite's authorizer refuses anything outside it. A statement naming SQLite's own tables or pragma functions, which describe every service in the file, is refused, and a service or binding name may not hold a slash, which would nest one service's namespace inside another's.
-- A WASM module reaches its bindings through host functions linked into its instance: `run`, `get` and `all` on a named `sql` binding, plus `call` for calls on other services, such as `[space]`. The host resolves a binding name to that service's own file, so a module can never name another service's storage. npm packages receive the same shape as JS objects.
+- A handler sees only bindings to storage that already exists, as a Worker sees `env.DB`. It never creates storage, generates keys or touches the system database. Creating a service's storage is an effect of `POST [channel]/services`.
+- Each service runs in a space of its own: one SQLite file holding its tables beside CarbonDB's record of it (its op log and results, named `carbon_`), so an op and its transaction always cover the same data. Data that must change together in one op lives in one service; a call to another service is a message, and atomicity ends at the service.
+- A device sets up a service when it creates the service's space, and again on every open: it calls the service's `setup` in a transaction of its own, outside any op, then checks its tables' keys. This is internal to the core; nothing calls it directly. A replica will do the same when it joins the service's space, which needs peers.
+- A service's statements run as written, with no rewrite into a namespace. SQLite's authorizer refuses a statement that names CarbonDB's `carbon_` tables or reaches another file through ATTACH or a pragma, and records what each statement read.
+- A component reaches its binding through the world's host imports: `run` and `all` on its `sql` binding, `draw` for the op's ids and randomness, `call` for calls on other services, such as `[channel]`, `effect` for its other effects, and `log`. The host resolves the binding to the service's own file, so a component can never name another service's storage.
 
 ## The op
 
@@ -45,61 +44,58 @@ Every op carries the hash of the package that handled its call. This replaces th
 
 ## Builtins
 
-- `[space]`, `[identity]` and `[device]` become WASM packages with their own `service.toml`. Their table definitions become migrations there; their queries stay inline in the handlers.
-- They are embedded in the CarbonDB library as `.wasm` bytes, each keeping the hash of its own bytes. The CarbonDB version doesn't stand in for them, so devices on different CarbonDB releases still agree whenever a builtin is unchanged.
-- Each builtin's `.wasm` is built once and committed, and the library embeds the committed file. A test fails when a builtin's source changed without a rebuild, since a different compiler may emit different bytes from the same source.
-- `[@carbon]` is not a package. Other devices never run its ops, only the sub-calls they carry, so no peer checks its version, and it drives the device's p2panda node, keys and setup. It stays host code in Rust.
+- `[channel]` and `[identity]` are Rust crates under `crates/services/`, each with its own `service.toml` and migrations, built as components. `[device]` is merged into `[identity]`.
+- They are embedded in the CarbonDB library as `.wasm` bytes, each versioned by the hash of its own bytes. The CarbonDB version doesn't stand in for them, so devices on different CarbonDB releases still agree whenever a builtin is unchanged.
+- Each builtin's `.wasm` is built once by `scripts/build-components` and committed, and the library embeds the committed file. A test fails when a builtin's sources changed without a rebuild, since a different compiler may emit different bytes from the same source.
+- `[@carbon]` is not a package. It runs only on this device, its ops go in the system log, which never replicates, and what it changes in channels it changes through their own calls, made as effects, so no peer checks its version. It drives the device's keys, setup and p2panda node, and stays host code in Rust.
 
 ## Registering
 
 ```js
-carbon.services.add('chat', chat)               // an npm service: its module, which exports its manifest
-carbon.services.add_wasm('chat', './chat.wasm') // planned, with the WASM host
+import {component} from '@tlsft/carbondb-svc-chat'
+carbon.services.add('chat', component)          // a package: a file URL, a path, or its bytes
 ```
 
-- CarbonDB never downloads or finds npm packages: the app installs them, imports them and registers them.
-- Planned: a utility that looks up an installed package's integrity in the lockfile, once that integrity is its version. Workspace-linked packages have none.
-- Only WASM packages may later be installed automatically, by a manager, into a space.
+- CarbonDB never downloads or finds packages: the app installs them, imports them and registers them. A package published on npm ships its built component.
+- Only WASM packages may later be installed automatically into a channel's services: CarbonDB's core reads the channels its identity belongs to, joins their services and fetches their WASM.
 
-## A space's origin names its packages
+## A channel names its services' packages
 
-Status: agreed as the destination, not built.
+Status: built single-node for naming and resolving; fetching packages to join a channel needs peers.
 
-A service name means something only inside a space. A space's origin op is its manifest: for each service it runs, the name calls use there and the package that answers them. A device registers packages, and runs a call by looking up its name in the space's origin, then the package in its registry. So CarbonDB's `[identity]` runs in `identity:alice` while an app's own `[identity]`, such as one holding roles, runs in `company:foo-corp`, and each space's tables stay apart, since each space has its own file.
+A service name means something only inside a channel. A channel's `[channel]` keeps an entry for each service it runs: the name calls use there, the service's id, the package registered on this device that runs it, and its version. A call to `[name]` on a channel's handle looks the name up there, then the package in the device's registry. So CarbonDB's `[identity]` runs in `identity:alice` while an app's own role service, registered as `roles`, is named `[identity]` in `company:foo-corp`, and each service's tables stay apart, since each has its own file.
 
-The origin is also what a peer needs to join a space: it says which packages to register before the space's ops can apply.
+The entry is also what a peer needs to join a channel: which packages to register, or fetch, before each service's ops can apply. CarbonDB's core, in its init and maintenance loop, reads the channels its identity belongs to, joins their services and fetches their WASM, at the lower of the identity's grant and the device's policy. Not built: it needs peers and the WASM host.
 
-Today a name is device-wide: the core keeps one registry of names for the whole device, so a name the app registers means the same package in every space, and a name CarbonDB already uses, such as `identity`, cannot be registered by an app.
+A package's registered name is still device-wide: the core keeps one registry for the whole device, so a name CarbonDB already uses, such as `identity`, cannot be registered by an app. The channel gives the local `[name]` with `POST [channel]/services {name, package}`.
 
 Open:
 
-- How a package is identified across devices: a name unique across packages, as npm scopes give (`@tlsft/identity`, `@otto/identity`), or its version hash, which changes on every upgrade (see [moving a space to a new version](backlog/upgrade-package-version.md)).
-- Where a local name is given: at space creation, which binds each name to a package and leaves `services.add` taking only the module, or still at `services.add`, as today.
+- How a package is identified across devices: a name unique across packages, as npm scopes give (`@tlsft/identity`, `@otto/identity`), or its version hash, which changes on every upgrade (see [moving a service to a new version](backlog/upgrade-package-version.md)). Today the entry holds the name it is registered under on the device that created it, and its hash.
 
 ## Build order
 
-1. `service.toml`, table namespacing per service, and the package hash in the op, with npm packages. Built: namespacing, `init`, `service.toml` for the builtins and for npm packages such as [chat], and the package hash. For now the hash covers every file in the package: a Rust package's build script hashes its directory, and the core an npm package's directory, beside its `service.toml` and without `node_modules`. An npm service's module exports `manifest`, where its `service.toml` is, and `carbon.services.add(name, module)` hands it to the core, which refuses a service without one. Open: [an npm package's version from its lockfile integrity](backlog/npm-package-integrity.md), and [registering a package by its name](backlog/package-names.md).
-2. The WASM host: wasmtime, the host functions, and `add_wasm`.
-3. `[space]`, `[identity]` and `[device]` as committed WASM packages embedded in the library.
-4. The `wrangler.toml` generator and the integrity lookup utility.
+1. `service.toml`, a file per service, and the package hash in the op. Built.
+2. The WASM host: wasmtime, the world's host imports, closed WASI, `wasi:http` as the `fetch` effect, and registering a component. Built.
+3. `[channel]` and `[identity]` as committed components embedded in the library. Built.
+4. The `wrangler.toml` generator. Open: [registering a package by its name](backlog/package-names.md).
 
 ## Testing
 
 - Unit tests in the core:
-  - `service.toml` parsing, including refusing unknown fields;
-  - two services' tables are namespaced apart in one file;
+  - `service.toml` parsing, including refusing unknown fields and values, and more than one `sql` binding;
+  - a service's statements cannot reach `carbon_` tables or another file;
   - the op envelope carries the package hash;
-  - a builtin's committed `.wasm` matches its source.
+  - a builtin's committed `.wasm` matches its sources (built);
+  - a package is versioned by its bytes and refused without a service.toml (built).
 - Runtime tests:
-  - `add` refuses a module that exports no manifest (built);
-  - `add_wasm` hashes the module's bytes;
-  - the integrity lookup reads a lockfile;
-  - two services declaring the same table name don't collide in one space.
+  - `add` refuses what is not a component carrying a service.toml (built);
+  - two services declaring the same table name don't collide, each in its own file.
 - Generator tests:
   - a `wrangler.toml` with several environments yields only the chosen one;
   - every dropped field is warned.
-- End to end: the [chat] tests run on the packaged [chat] service, once as npm (built) and once as WASM, unchanged.
+- End to end: the [chat] tests run on the packaged [chat] component (built).
 
 ## Docs this changes
 
-Step 1 is reflected in [story 4](04-register-services.md), [implementation.md](implementation.md) and the [old ops](backlog/old-ops.md) backlog story. When the WASM host is built, update story 4 and the Stack section of implementation.md for `add_wasm`.
+Reflected in [docs/lifecycle.md](../docs/lifecycle.md), [implementation.md](implementation.md), the [old ops](backlog/old-ops.md) backlog story, and [docs/wasm-services.md](../docs/wasm-services.md), which explains the WASM host.

@@ -4,7 +4,7 @@ Status: backlog
 
 ## Idea
 
-iOS forbids JIT, so WASM packages there run in an interpreter such as wasmi, and a JS service compiled to WASM runs in QuickJS inside that interpreter, which is slow. Packages shipped with the app are known when it is built, so they can be compiled ahead of time into it. Only packages installed at runtime would then be interpreted.
+iOS forbids JIT, so WASM packages there run in an interpreter such as wasmi, and a JS service compiled to WASM runs in QuickJS inside that interpreter, which is slow. Packages shipped with the app are known when it is built, so they can be compiled ahead of time into it. Only packages installed at runtime would then be interpreted. Elsewhere, wasmtime compiles each component once and keeps the compiled code on disk in `compiled` beside the system database ([docs/wasm-services.md](../../docs/wasm-services.md)); on iOS that cache would be filled at build time instead.
 
 ## To decide
 

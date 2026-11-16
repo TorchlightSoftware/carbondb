@@ -44,9 +44,10 @@ pub(crate) fn system_failure(message: impl Into<String>) -> ServiceError {
   ServiceError::new(503, "SYSTEM_FAILURE", message)
 }
 
-// What a call to a stopped space fails with: a 503 carrying the failure that stopped it.
-pub(crate) fn stopped(space: &str, failure: &ServiceError) -> ServiceError {
-  ServiceError::new(503, "SPACE_STOPPED", format!("Space {space} stopped, and applies nothing until it is resumed: {}", failure.message))
+// What a call to a stopped service fails with: a 503 carrying the failure
+// that stopped it, the service named as calls name it.
+pub(crate) fn stopped(service: &str, failure: &ServiceError) -> ServiceError {
+  ServiceError::new(503, "SERVICE_STOPPED", format!("{service} stopped, and applies nothing until it is resumed: {}", failure.message))
     .with_details(serde_json::json!({"failure": failure}))
 }
 

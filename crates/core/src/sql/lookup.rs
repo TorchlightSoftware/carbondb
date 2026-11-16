@@ -294,7 +294,7 @@ fn searches_by_key(plan: &[String], shown_as: &str, index: &str, columns: &[KeyC
 mod tests {
   use super::*;
   use crate::Db;
-  use crate::call_window::CallWindow;
+  use crate::sql::call_window::CallWindow;
   use crate::sql::authorizer::Read;
   use crate::store::Store;
   use crate::store::changeset::rows;

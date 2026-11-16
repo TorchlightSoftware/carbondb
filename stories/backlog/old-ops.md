@@ -13,7 +13,7 @@ A rewind re-runs later ops with the handler code a replica has now. If that code
 CarbonDB's side of the contract stays simple:
 
 - A device runs one version of each service at a time. It never keeps an old version around to apply old ops, or to re-run them in a rewind.
-- Every op records the version it was written under: the package's hash, and the version the package declares.
+- Every op records the version it was written under: the hash of its package's bytes, and later the version the package declares.
 - The handler receives that version and decides: it supports the op, migrating its input to the current shape when needed, or refuses it. The same holds for an offline op arriving late and for ops a rewind re-runs across an upgrade.
 - A package declares its version in its `service.toml`, semver canonically. CarbonDB records it but does not trust it: a breaking change labelled as a patch shows up as ops the handler refuses, not through its label.
 - Service code and schema only move forward. CarbonDB never reverts a schema to replay old ops under old code, since any gap in a service's migrations would turn into data loss.
@@ -28,7 +28,7 @@ Handling old writes after a schema change is a solved problem in neighbouring fi
 
 - **Upcasting.** Event-sourced systems keep old events exactly as they were and translate them into the current shape when they are read (Greg Young, *Versioning in an Event Sourced System*). A handler migrating an old op's input is the same move.
 - **Lenses.** Ink & Switch's Cambria project translates data between schema versions with small two-way lenses, so local-first peers on different versions keep working together.
-- **Expand, then contract** (also called parallel change). A breaking change is split in two: first add the new shape and keep the old one working, so writers on the previous version still succeed; remove the old shape only once no writer uses it. In a space, that is once no member still runs the old version.
+- **Expand, then contract** (also called parallel change). A breaking change is split in two: first add the new shape and keep the old one working, so writers on the previous version still succeed; remove the old shape only once no writer uses it. In a service, that is once no member still runs the old version.
 
 One caution is particular to CarbonDB: an op is a call re-run through current code, not a recorded fact, so a migrated input has to lead to the same writes on every replica (see below).
 
@@ -43,5 +43,4 @@ One caution is particular to CarbonDB: an op is a call re-run through current co
 - How every replica applies the same time cutoff, for example through checkpoint ops published by a manage device.
 - When old ops can be pruned, such as old chat messages.
 - Whether a service that migrates an old op's input can guarantee its effect is identical, byte for byte, to what the old handler would have written. If not, migration risks the same drift it is meant to prevent.
-- What is hashed: the handler alone, or the handler with the modules it calls.
-- How a refused op or rewind is reported, likely through the `errors` space (see [rejected after merge](rejected-after-merge.md)).
+- How a refused op or rewind is reported (see [rejected after merge](rejected-after-merge.md)).

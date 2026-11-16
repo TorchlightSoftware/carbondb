@@ -9,7 +9,7 @@ use std::rc::Rc;
 use serde_json::Value;
 
 use crate::error::Result;
-use crate::service_call::ServiceCall;
+use crate::calls::service_call::ServiceCall;
 use crate::{Actor, Call, HandlerContext, Routing};
 
 #[derive(Debug, Clone, PartialEq)]

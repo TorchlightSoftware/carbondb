@@ -4,15 +4,15 @@ Status: backlog
 
 ## Idea
 
-Signing needs this device's private key, which only the system space holds, so signing is a `[@carbon]` call: a replicated service never sees a key and never calls `[@carbon]`. Verifying needs only public keys, which the identity space holds through its `[device]/origin` entries.
+Signing needs this device's private key, which only the system database holds, so signing is a `[@carbon]` call: a replicated service never sees a key and never calls `[@carbon]`. Verifying needs only public keys, which `[identity]` lists in the identity's own channel.
 
-- `POST [@carbon]/sign` in an identity space signs a payload with this device's key, and answers the signature with the device's public key.
-- `POST [@carbon]/verify` checks a signature against a device key, and that key against the identity's `[device]/origin` chain.
+- `POST [@carbon]/sign`, on an identity's handle, signs a payload with this device's key, and answers the signature with the device's public key.
+- `POST [@carbon]/verify` checks a signature against a device key, and that key against the devices `[identity]` lists.
 
 ## To decide
 
 - Whether verifying belongs in `[@carbon]` at all, or is a plain function an app runs, since it needs no private key.
-- Whether verify reads the identity space on this device, or takes an exported identity, for an identity this device does not hold.
+- Whether verify reads `[identity]` on this device, or takes an exported identity, for an identity this device does not hold.
 - Whether a signature names the identity or only the device, and how a verifier treats a device revoked after it signed.
 - Whether a signature is a GET, since it changes nothing, or a POST kept in the op log, as a record of what this device signed.
 - What the payload is: bytes, or JSON in a canonical form, and what the signature is over besides it, such as a purpose, to keep a signature for one use from being replayed in another.

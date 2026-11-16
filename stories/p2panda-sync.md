@@ -1,8 +1,8 @@
-# Syncing spaces over p2panda
+# Syncing services over p2panda
 
-Status: set aside — waits for rewind on a single device and the WASM host; the decisions below are agreed, the open questions are not
+Status: agreed — next; rewind on a single device and the WASM host are built. The decisions below are agreed, the open questions are not
 
-This plan carries a space's ops between devices and identities with p2panda 0.8, behind CarbonDB's identity-level API. It builds on two things that come first: rewind and replay on a single device, which keep every replica in one shared order, and a WASM host running every service, which keeps replicated handlers from repeating outside calls on every replica. [implementation.md](implementation.md) holds the wider design; where the two disagree about p2panda, this file wins.
+This plan carries each service's ops between devices and identities with p2panda 0.8, behind CarbonDB's identity-level API. Every service in a channel is a space of its own, one SQLite file and one op log, and becomes one p2panda space; a channel's own space runs `[channel]`. What it builds on is in place: rewind and replay on a single device keep every replica in one shared order ([docs/replication.md](../docs/replication.md)), and the WASM host runs every service, recording each effect, `fetch` included, so replicated handlers never repeat an outside call ([docs/wasm-services.md](../docs/wasm-services.md)). [implementation.md](implementation.md) holds the wider design; where the two disagree about p2panda, this file wins.
 
 ## What p2panda 0.8 gives us, and what it does not
 
@@ -18,42 +18,51 @@ Checked against p2panda 0.8.1 and the spike's earlier pin:
 - **No direct peer-to-peer channel.** An ephemeral stream broadcasts signed, unstored messages to whoever subscribes to a topic, 4096 bytes by default.
 - **SQLite.** p2panda's store uses sqlx 0.9.0, so rusqlite 0.39.0 keeps linking beside it.
 
+## What is built that this plan uses
+
+- **The core's thread.** The core runs on a single-threaded tokio runtime of its own (`carbondb::Runtime`), with its timers on it; anything on another thread reaches it by sending it work. Received ops can cross into it that way.
+- **Receiving an op.** `Carbon::receive` writes a row from another device to its space's op log, checks its time against this device's clock, and applies it in the shared order, rewinding when it is late. The core's tests deliver rows this way.
+- **Effects that need peers.** The effect registry fails an effect with no handler as unreachable, the same on every replica: `sync`, and membership changes. Replication gives them handlers.
+- **Starting a service.** A space starts by getting its package, running its setup and passing its health check, within its startup timeout; a space whose package this device lacks stops with `PACKAGE_UNAVAILABLE` (crates/core/src/channels/lifecycle.rs).
+
 ## Agreed
 
 ### Dependency
 
 - CarbonDB depends on p2panda 0.8.1 from crates.io instead of the spike's git pin.
 
-### Spaces and ops
+### Services and ops
 
-- In replicated mode a space's id is the id p2panda assigns when it is created; CarbonDB does not choose it. Single-node mode assigns ids itself. See [Creating a space](implementation.md#creating-a-space).
-- An op is a message in its space's p2panda space. A received message is written to the op log by the space's OpWriter, like any other op, and applies in the shared order.
+- Each service's space is one p2panda space, so a channel of three services is four p2panda spaces, its own included. Channels do not nest in p2panda.
+- An op is a message in its service's p2panda space. A received message is written to the op log by the space's OpWriter, like any other op, and applies in the shared order. An op's row carries the effects its first run recorded, so every replica replays them.
+- Getting a package this device lacks becomes fetching it from peers: the first step of a space's start, bounded by its startup timeout like the rest.
 
 ### Identities and devices
 
-- CarbonDB's API operates in terms of identities: an identity is a member of a space, never a device. The identity model stands; only its wiring in p2panda changes.
-- Under the hood, devices are added to each space directly in p2panda.
+- CarbonDB's API operates in terms of identities: an identity is a member of a channel, never a device. The identity model stands; only its wiring in p2panda changes.
+- Under the hood, devices are added to each service's space directly in p2panda.
 - An identity tags its devices, and a service tags its operational requirements.
-- An identity's assignment policy reads the tags on its devices and on the services in a space, and assigns which of its devices hold that space at pull, read, write or manage. Much as a scheduler places jobs on suitable machines by their labels, the policy places a space's work on suitable devices.
+- An identity's assignment policy reads the tags on its devices and on the services in a channel, and assigns which of its devices hold each service at pull, read, write or manage. Much as a scheduler places jobs on suitable machines by their labels, the policy places a channel's work on suitable devices.
 - The CarbonDB core provides a default assignment policy. Letting an identity replace it is [backlogged](backlog/assignment-policy-override.md) until testing shows the use cases.
-- Asking p2panda to accept group-held write access is [backlogged](channels/backlog/upstream-group-write.md), so that we can share a working use case first.
+- Asking p2panda to accept group-held write access is [backlogged](backlog/upstream-group-write.md), so that we can share a working use case first.
 
 ## Open
+
+### Ids
+
+- Whether a service's space id is the id p2panda assigns when it creates the space, or the one the creating op derives, the same on every replica, as single-node does today.
 
 ### The assignment policy
 
 - Where a service declares its tags: in its `service.toml`, or elsewhere.
 - What the default policy assigns, such as the access a device without matching tags gets.
-- When the policy runs (a device enrolled, a tag changed, a space joined or created) and which device carries out the p2panda changes, once.
-- How a replica ties a received op's device to its author identity, now that space access is per device: whether the identity's p2panda group still exists for that, or the identity space's `[device]/origin` entries are read instead.
+- When the policy runs (a device enrolled, a tag changed, a channel joined or created) and which device carries out the p2panda changes, once.
+- How a replica ties a received op's device to its author identity, now that access is per device: through the identity's p2panda group, or the devices `[identity]` lists in the identity's own channel.
 - Whether the existing `manage` device tag becomes one input to the policy, or stays separate.
 
-### The crossing into the core
+### The p2panda node and the core
 
-The core is single-threaded and runs on the host's thread, asking the host for timers through `Schedule`. A p2panda node needs a tokio runtime and runs its own threads.
-
-- What the crossing looks like to the core: one host-supplied hook like `Schedule`, carrying received ops and network events in and publish requests out. On Node, a napi ThreadsafeFunction can wake the core's thread; Rust tests can run the core and p2panda together on one thread.
-- Whether call deadlines move onto tokio timers in the same change, settling [the core-timers backlog story](backlog/core-timers.md).
+- Whether each p2panda node runs on the core's tokio runtime or on one of its own, sending received ops and network events to the core's thread as work, and taking publish requests back.
 
 ### Checking received ops
 
@@ -74,24 +83,30 @@ The op log is the outbox: a publisher drains this device's applied ops, also aft
 
 - Where this device records that an op was published.
 - Whether acknowledging a received op once it is written to the op log, rather than after it applies, is enough, since the log is the durable queue.
+- Whether CarbonDB keeps a sync API of its own, independent of the transport, with p2panda one transport over it ([manual sync](backlog/manual-sync.md)).
+
+### Fetching packages
+
+- How a device learns which package a service runs and fetches its bytes from peers, and how it checks them against the version the service's ops carry.
 
 ### Membership and enrollment
 
-- [Story 7](07-add-members.md), inviting and admitting a member: what a contact holds now that an identity is not one p2panda group id, its devices or a way to learn them. Admitting an identity means admitting the devices its assignment policy places in the space, and p2panda needs each device's key bundle before it can be added.
-- [Story 2](02-add-device.md), enrolling a device over an ephemeral pairing topic derived from a secret in the code, with the payload encrypted by us: how the device that showed its code learns the exchange finished, and which spaces the new device is added to, by which device, under the assignment policy.
+- [Story 7](07-add-members.md), inviting and admitting a member: what a contact holds now that an identity is not one p2panda group id, its devices or a way to learn them. Admitting an identity means admitting the devices its assignment policy places in each service, and p2panda needs each device's key bundle before it can be added.
+- [Story 2](02-add-device.md), enrolling a device over an ephemeral pairing topic derived from a secret in the code, with the payload encrypted by us: how the device that showed its code learns the exchange finished, and which services the new device is added to, by which device, under the assignment policy.
 
 ### Status
 
-- Where `GET [@carbon]/status` reads access from, now that p2panda access is per device and CarbonDB speaks in identities. It also reports sync as off, waiting or on, and the peers this device has synced the space with; the `ref` sync mode starts syncing a space the first time a ref reaches it.
+- Where `GET [@carbon]/status` reads access from, now that p2panda access is per device and CarbonDB speaks in identities. It already reports each service's lifecycle state; it also reports sync as off, waiting or on, and the peers this device has synced each service with. The `ref` sync mode starts syncing a channel the first time a ref reaches it.
 
 ## Build order
 
 1. Move to p2panda 0.8.1, and run one node per identity with persisted credentials.
-2. The crossing into the core, publishing applied ops, receiving ops into the op log, and acknowledgements; proved with two nodes in one process.
-3. The assignment policy and its default, then inviting and admitting members (story 7).
-4. Device enrollment (story 2).
-5. Status, peers and sync modes.
+2. Publishing applied ops, receiving ops into the op log through the core's thread, and acknowledgements; proved with two nodes in one process.
+3. Fetching packages from peers.
+4. The assignment policy and its default, then inviting and admitting members (story 7).
+5. Device enrollment (story 2).
+6. Status, peers and sync modes.
 
 ## Docs this changes
 
-Once the assignment policy is settled, these passages, which describe an identity as a p2panda group of its devices, are rewritten for devices added directly: the Identity term in [README.md](README.md); Identity and devices, No secrets in replicated ops, Publishing an identity and Invitations in [implementation.md](implementation.md); `POST [@carbon]/devices` in [services.md](services.md); [story 2](02-add-device.md) and [story 7](07-add-members.md); and the [revoke device](backlog/revoke-device.md), [paper key](backlog/paper-key.md), [security review](backlog/security-review.md) and [public identity proofs](backlog/public-identity-proofs.md) backlog stories.
+Once the assignment policy is settled, these passages, which describe an identity as a p2panda group of its devices, are rewritten for devices added directly: the Identity term in [README.md](README.md); Identity and devices, No secrets in replicated ops, Publishing an identity and Invitations in [implementation.md](implementation.md); the device calls in [docs/services.md](../docs/services.md); [story 2](02-add-device.md) and [story 7](07-add-members.md); and the [revoke device](backlog/revoke-device.md), [paper key](backlog/paper-key.md), [security review](backlog/security-review.md) and [public identity proofs](backlog/public-identity-proofs.md) backlog stories.

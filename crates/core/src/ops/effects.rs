@@ -27,7 +27,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 
 use crate::error::{Result, ServiceError};
-use crate::service_call::ServiceCall;
+use crate::calls::service_call::ServiceCall;
 use crate::Reply;
 
 // An effect made on an op's first run: its name, its input and its output.

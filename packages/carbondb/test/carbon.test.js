@@ -138,7 +138,7 @@ describe('services', () => {
     assert.deepStrictEqual(await texts(restarted), ['kept', 'kept again'])
     const bare = await configure(config)
     const unregistered = bare.ref('identity:alice').ref('personal:alice')
-    await assert.rejects(unregistered.call('GET [notes]/notes'), (error) => [error.status, error.code, error.details.failure.code].join() === '503,SPACE_STOPPED,PACKAGE_UNAVAILABLE')
+    await assert.rejects(unregistered.call('GET [notes]/notes'), (error) => [error.status, error.code, error.details.failure.code].join() === '503,SERVICE_STOPPED,PACKAGE_UNAVAILABLE')
     assert.strictEqual(unregistered.runState('notes').state, 'stopped')
     assert.deepStrictEqual(unregistered.runState(), {state: 'idle'})
     await bare.services.add('notes', component('notes'))
@@ -432,9 +432,9 @@ describe('run state', () => {
 
     const release = await holdLock(await serviceOf(personal, 'notes'))
     const stopped = arrival()
-    await assert.rejects(personal.call('POST [notes]/notes', {text: 'lost'}), {status: 503, code: 'SPACE_STOPPED'})
+    await assert.rejects(personal.call('POST [notes]/notes', {text: 'lost'}), {status: 503, code: 'SERVICE_STOPPED'})
     await stopped
-    assert.deepStrictEqual(results.at(-1), {error: 'SPACE_STOPPED'})
+    assert.deepStrictEqual(results.at(-1), {error: 'SERVICE_STOPPED'})
     const {state, error} = personal.runState('notes')
     assert.deepStrictEqual([state, error.code], ['stopped', 'SYSTEM_FAILURE'])
     await assert.rejects(personal.call('GET [notes]/notes'), {status: 503})

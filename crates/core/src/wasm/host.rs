@@ -16,7 +16,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::error::{bad_request, internal};
-use crate::service_call::ServiceCall;
+use crate::calls::service_call::ServiceCall;
 use crate::{Db, HandlerContext, Reply, Routing};
 
 // What an instance holds: the id of what it runs for, its closed WASI, and
