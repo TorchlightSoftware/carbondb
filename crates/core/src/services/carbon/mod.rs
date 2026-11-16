@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 use crate::error::{Result, bad_request};
 use crate::service_call::ServiceCall;
 use crate::services::Service;
+use crate::space::RunState;
+use crate::Carbon;
 use crate::{Db, HandlerContext, Routing};
 
 pub use identities::{Identity, SYSTEM_MIGRATIONS, acting, find};
@@ -34,6 +36,8 @@ pub fn service() -> Service {
     binding: None,
     timeout: crate::services::DEFAULT_TIMEOUT,
     always: vec![],
+    health: None,
+    startup: crate::services::DEFAULT_STARTUP_TIMEOUT,
     setup: Rc::new(|_: Rc<dyn Db>| Ok(())),
     entry: Rc::new(entry),
   }
@@ -77,20 +81,38 @@ fn target(call: &ServiceCall) -> Result<Target> {
 }
 
 // A channel's or a service's state on this device, for the acting
-// identity. Single-node: sync is off and there are no peers.
+// identity: where it is in its lifecycle, and the access the identity has.
+// Single-node: sync is off and there are no peers.
 fn status(call: &ServiceCall, target: &Target) -> Result<Value> {
   let carbon = call.carbon();
   let channel = target.channel.clone().unwrap_or_default();
-  carbon.space(&channel)?;
   let access = access(call, &channel)?;
   if let Some(name) = &target.service {
-    carbon.space(&carbon.named(&channel, name)?)?;
-    return Ok(json!({"name": name, "access": access, "sync": "off", "peers": []}));
+    let state = lifecycle(carbon, &carbon.named(&channel, name)?)?;
+    return Ok(with_state(json!({"name": name, "access": access, "sync": "off", "peers": []}), state));
   }
   let origin = carbon.read_tables(&channel, |db| db.get("SELECT kind, name FROM origin", &[]))?;
-  let services = carbon.read_tables(&channel, |db| db.all("SELECT name FROM service ORDER BY name", &[]))?;
-  let services: Vec<Value> = services.iter().map(|service| json!({"name": service["name"], "access": access, "sync": "off"})).collect();
-  Ok(json!({"channel": channel, "kind": origin["kind"], "name": origin["name"], "access": access, "sync": "off", "peers": [], "services": services}))
+  let named = carbon.read_tables(&channel, |db| db.all("SELECT name, space FROM service ORDER BY name", &[]))?;
+  let services = named.iter().map(|service| Ok(with_state(json!({"name": service["name"], "access": access, "sync": "off"}), lifecycle(carbon, service["space"].as_str().unwrap_or_default())?))).collect::<Result<Vec<Value>>>()?;
+  let status = json!({"channel": channel, "kind": origin["kind"], "name": origin["name"], "access": access, "sync": "off", "peers": [], "services": services});
+  Ok(with_state(status, lifecycle(carbon, &channel)?))
+}
+
+// Where a space is in its lifecycle on this device, opening it to see:
+// `{state}`, initializing, idle, applying or stopped, and `error`, why it stopped.
+fn lifecycle(carbon: &Rc<Carbon>, space: &str) -> Result<Value> {
+  carbon.space(space)?;
+  Ok(match carbon.run_state(space) {
+    RunState::Stopped { error } => json!({"state": "stopped", "error": error}),
+    state => json!({"state": json!(state)["state"]}),
+  })
+}
+
+fn with_state(mut status: Value, state: Value) -> Value {
+  if let (Some(status), Value::Object(state)) = (status.as_object_mut(), state) {
+    status.extend(state);
+  }
+  status
 }
 
 // The acting identity's access to a channel's services, on this device:

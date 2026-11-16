@@ -147,7 +147,7 @@ mod oplog_entries {
 
     let restarted = crate::testing::reopen(&directory);
     let space = space_now(&restarted, &id).unwrap();
-    assert_eq!(space.run_state(), crate::RunState::Initializing { services: vec!["notes".into()] });
+    assert!(matches!(space.run_state(), crate::RunState::Stopped { error } if error.code == "PACKAGE_UNAVAILABLE"), "this device lacks its package");
     assert_eq!(outcomes(&space), vec![Err(0)]);
     crate::testing::register_notes(&restarted);
     assert_eq!(outcomes(&space), vec![Ok(())]);
@@ -265,11 +265,11 @@ mod run_states {
     answer
   }
 
-  // A call to a service this device does not run is made with no version of
-  // it: it is logged like any other while its space waits for the service,
-  // then refused when its turn comes, and its refusal is kept as its result.
+  // A space whose package this device lacks cannot get it single-node, so it
+  // stops at once, refusing calls with why; registering the package later
+  // initializes it again.
   #[test]
-  fn logs_a_call_to_a_service_this_device_does_not_run_and_refuses_it_in_turn() {
+  fn a_space_whose_package_this_device_lacks_stops_until_the_package_is_registered() {
     let (directory, carbon) = carbon();
     let identity = alice(&carbon);
     let space = room(&carbon, &identity);
@@ -277,15 +277,14 @@ mod run_states {
     drop((space, carbon));
     let restarted = crate::testing::reopen(&directory);
     let space = space_now(&restarted, &id).unwrap();
-    let answer = submitted(&restarted, &space, &actor(&identity), "POST [notes]/run", insert("a"));
-    assert!(answer.borrow().is_none(), "its space waits for its service");
-    assert_eq!(oplog::entries(space.store()).unwrap()[0].version, crate::services::SERVICE_MISSING);
+    let refused = now(|reply| restarted.submit(&space, actor(&identity), crate::Call::from_key("POST [notes]/run").unwrap(), insert("a"), reply)).unwrap_err();
+    assert_eq!((refused.status, refused.code.as_str(), refused.details.unwrap()["failure"]["code"].clone()), (503, "SPACE_STOPPED", json!("PACKAGE_UNAVAILABLE")));
+    assert_eq!(oplog::entries(space.store()).unwrap(), vec![], "nothing is logged for a stopped space");
 
     crate::testing::register_notes(&restarted);
-    assert_eq!(answer.borrow_mut().take(), Some(Err(404)));
-    assert_eq!(outcomes(&space), vec![Err(404)]);
-    assert_eq!(texts(&space.store().reader().unwrap()).unwrap(), json!([]));
-    let elsewhere = submitted(&restarted, &space, &actor(&identity), "POST [elsewhere]/run", insert("b"));
+    assert_eq!(space.run_state(), crate::RunState::Idle);
+    assert_eq!(submitted(&restarted, &space, &actor(&identity), "POST [notes]/run", insert("b")).borrow_mut().take(), Some(Ok(json!([]))));
+    let elsewhere = submitted(&restarted, &space, &actor(&identity), "POST [elsewhere]/run", insert("c"));
     assert_eq!(elsewhere.borrow_mut().take(), Some(Err(404)), "a space answers only its own service");
   }
 }
@@ -405,6 +404,7 @@ mod channels {
       (&status["name"], &status["kind"], &status["access"], &status["sync"], &status["peers"], &status["services"]),
       (&json!("Randall's Playhouse"), &json!("channel"), &json!(["manage"]), &json!("off"), &json!([]), &json!([]))
     );
+    assert_eq!(status["state"], json!("idle"));
   }
 
   #[test]
@@ -413,9 +413,9 @@ mod channels {
     let identity = alice(&carbon);
     let room = room_channel(&carbon, &identity);
     let channel = on(&carbon, &room, &identity, "GET [@carbon]/status", Value::Null).unwrap();
-    assert_eq!(channel["services"], json!([{"name": "notes", "access": ["manage"], "sync": "off"}]));
+    assert_eq!(channel["services"], json!([{"name": "notes", "access": ["manage"], "sync": "off", "state": "idle"}]));
     let notes = on(&carbon, &room, &identity, "GET [@carbon]/status", json!({"service": "notes"})).unwrap();
-    assert_eq!(notes, json!({"name": "notes", "access": ["manage"], "sync": "off", "peers": []}));
+    assert_eq!(notes, json!({"name": "notes", "access": ["manage"], "sync": "off", "peers": [], "state": "idle"}));
     let stranger = now(|answer| carbon.call(Some(&room), None, "GET [@carbon]/status", Value::Null, answer)).unwrap();
     assert_eq!(stranger["access"], json!([]), "no one acting has no access, and no identity's access is borrowed");
     let refused = [("GET [@carbon]/status", json!({"service": "chat"}), 404), ("GET [@carbon]/status", json!("notes"), 400)];
@@ -686,21 +686,11 @@ mod deadlines {
 // is a fixture component that reports what it sees of its host.
 mod components {
   use super::*;
-  use crate::testing::{NOTES_TIMEOUT, later, timed};
+  use crate::testing::{NOTES_TIMEOUT, PROBE, add, afresh, later, probed, until};
   use crate::wasm::{self, Package};
   use carbondb_service_bindings::manifest::sources;
   use std::path::Path;
 
-  const PROBE: &[u8] = include_bytes!("../fixtures/probe.wasm");
-
-  // A personal channel running `[probe]` beside `[notes]`.
-  fn probed() -> (tempfile::TempDir, Rc<crate::Carbon>, crate::testing::Timers, crate::Identity) {
-    let (directory, carbon, timers) = timed();
-    carbon.register(Package::read(PROBE).unwrap().service("probe")).unwrap();
-    let identity = alice(&carbon);
-    on(&carbon, &identity.personal, &identity, "POST [channel]/services", json!({"name": "probe"})).unwrap();
-    (directory, carbon, timers, identity)
-  }
 
   fn probe(carbon: &Rc<crate::Carbon>, identity: &crate::Identity, key: &str, input: Value) -> crate::Result<Value> {
     on(carbon, &identity.personal, identity, key, input)
@@ -715,6 +705,32 @@ mod components {
       let built = std::fs::read_to_string(root.join("crates/core").join(directory).join(format!("{name}.source"))).unwrap();
       assert_eq!(built.trim(), sources(&roots).unwrap(), "{name} is stale: run scripts/build-components");
     }
+  }
+
+  #[test]
+  fn calls_to_a_service_still_compiling_wait_for_it_and_answer_once_it_has() {
+    let (_directory, carbon, _timers) = crate::testing::timed();
+    let identity = alice(&carbon);
+    let package = Package::read(&afresh(PROBE)).unwrap();
+    let added = later(|added| carbon.add("probe", package, added));
+    on(&carbon, &identity.personal, &identity, "POST [channel]/services", json!({"name": "probe"})).unwrap();
+    let call = |key: &'static str, input: Value| later(|answer| carbon.call(Some(&identity.personal), Some(&identity.id), key, input, answer));
+    let (wrote, read) = (call("POST [probe]/note", json!({"text": "early"})), call("GET [probe]/notes", Value::Null));
+    on(&carbon, &identity.personal, &identity, "POST [notes]/run", json!({"do": [{"insert": "meanwhile"}]})).unwrap();
+    until(|| [added.borrow().is_some(), wrote.borrow().is_some(), read.borrow().is_some()] == [true; 3]);
+    assert!(added.borrow_mut().take().unwrap().is_ok());
+    assert!(wrote.borrow_mut().take().unwrap().is_ok(), "the write waited in its space's log");
+    assert!(read.borrow_mut().take().unwrap().is_ok(), "the read was held, not refused");
+    assert_eq!(probe(&carbon, &identity, "GET [probe]/notes", Value::Null).unwrap(), json!([{"text": "early"}]));
+  }
+
+  #[test]
+  fn a_package_that_does_not_compile_is_refused_once_it_has_tried_and_its_name_left_free() {
+    let (_directory, carbon, _timers) = crate::testing::timed();
+    let broken = crate::wasm::package(b"\0asm\x0d\x00\x01\x00\x7f\x01\x00", "name = \"broken\"\n").unwrap();
+    let refused = add(&carbon, "broken", &broken).unwrap_err();
+    assert_eq!((refused.status, refused.message.starts_with("Not a component this host can run")), (400, true), "{refused:?}");
+    assert!(carbon.services().find("broken").is_none());
   }
 
   #[test]
@@ -797,24 +813,106 @@ mod components {
   }
 }
 
+// A space's lifecycle: it starts (its package, its setup, its health check)
+// before it applies anything, holding its calls meanwhile, and ends ready or
+// stopped with why. Starting is bounded by its service's startup timeout; a
+// call's own deadline begins once its space is ready.
+mod lifecycle {
+  use super::*;
+  use crate::testing::{Timers, later, timed};
+  use std::cell::Cell;
+  use std::time::Duration;
+
+  // How long a call to [gauge] may take, longer than a health check's retry.
+  const TIMEOUT: Duration = Duration::from_millis(1000);
+  const RETRY: Duration = Duration::from_millis(100);
+
+  // `[gauge]`: notes, a GET that never settles, and a health check that
+  // passes once the test says it is healthy.
+  fn gauge(healthy: Rc<Cell<bool>>, startup: Duration) -> crate::Service {
+    let setup = Rc::new(|db: Rc<dyn Db>| db.run("CREATE TABLE IF NOT EXISTS note (id TEXT PRIMARY KEY, text TEXT NOT NULL) WITHOUT ROWID", &[]).map(|_| ()));
+    let entry = Rc::new(move |context: crate::testing::Context| {
+      let result = match (context.method(), context.resource()) {
+        (_, "/hang") => return,
+        (_, "/health") if healthy.get() => Ok(json!("ok")),
+        (_, "/health") => Err(crate::error::system_failure("not yet")),
+        ("POST", "/notes") => context.run("INSERT INTO note (id, text) VALUES (?, ?)", &[json!(context.op().map(|op| op.id())), context.input()["text"].clone()]).map(|_| Value::Null),
+        _ => texts(context.as_ref()),
+      };
+      let _ = context.settle(result);
+    });
+    let service = crate::Service::replicated("gauge", "gauge-v1", Some("db"), TIMEOUT, setup, entry);
+    crate::Service { health: Some("/health".into()), startup, ..service }
+  }
+
+  // A room naming [gauge], which starts as the room names it.
+  fn room_with_gauge(startup: Duration) -> (tempfile::TempDir, Rc<crate::Carbon>, Timers, crate::Identity, String, Rc<Cell<bool>>) {
+    let (directory, carbon, timers) = timed();
+    let healthy = Rc::new(Cell::new(false));
+    carbon.register(gauge(Rc::clone(&healthy), startup)).unwrap();
+    let identity = alice(&carbon);
+    let room = room_channel(&carbon, &identity);
+    on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "gauge"})).unwrap();
+    (directory, carbon, timers, identity, room, healthy)
+  }
+
+  fn gauge_state(carbon: &Rc<crate::Carbon>, room: &str, identity: &crate::Identity) -> Value {
+    on(carbon, room, identity, "GET [@carbon]/status", json!({"service": "gauge"})).unwrap()
+  }
+
+  #[test]
+  fn calls_wait_out_a_start_longer_than_their_own_timeout_and_are_answered_once_it_is_ready() {
+    let (_directory, carbon, timers, identity, room, healthy) = room_with_gauge(Duration::from_secs(10));
+    assert_eq!(gauge_state(&carbon, &room, &identity)["state"], json!("initializing"));
+    let call = |key: &'static str, input: Value| later(|answer| carbon.call(Some(&room), Some(&identity.id), key, input, answer));
+    let (wrote, read) = (call("POST [gauge]/notes", json!({"text": "early"})), call("GET [gauge]/notes", Value::Null));
+    timers.pass(TIMEOUT);
+    assert!(wrote.borrow().is_none() && read.borrow().is_none(), "starting does not count against a call's own timeout");
+
+    healthy.set(true);
+    timers.pass(RETRY);
+    assert_eq!(gauge_state(&carbon, &room, &identity)["state"], json!("idle"));
+    assert_eq!(wrote.borrow_mut().take().unwrap().unwrap(), Value::Null);
+    assert_eq!(read.borrow_mut().take().unwrap().unwrap(), json!(["early"]), "the write waiting in its log applied first");
+  }
+
+  #[test]
+  fn a_call_held_while_its_space_starts_has_its_whole_timeout_once_the_space_is_ready() {
+    let (_directory, carbon, timers, identity, room, healthy) = room_with_gauge(Duration::from_secs(10));
+    let hanging = later(|answer| carbon.call(Some(&room), Some(&identity.id), "GET [gauge]/hang", Value::Null, answer));
+    healthy.set(true);
+    timers.pass(RETRY);
+    assert!(hanging.borrow().is_none(), "it runs once the space is ready, and hangs");
+    timers.pass(TIMEOUT);
+    let error = hanging.borrow_mut().take().unwrap().unwrap_err();
+    assert_eq!((error.status, error.code.as_str()), (504, "TIMED_OUT"));
+  }
+
+  #[test]
+  fn a_space_not_ready_within_its_startup_timeout_stops_and_its_waiting_calls_fail_with_why() {
+    let startup = Duration::from_millis(3000);
+    let (_directory, carbon, timers, identity, room, _healthy) = room_with_gauge(startup);
+    let waiting = later(|answer| carbon.call(Some(&room), Some(&identity.id), "POST [gauge]/notes", json!({"text": "lost"}), answer));
+    timers.pass(startup);
+    let state = gauge_state(&carbon, &room, &identity);
+    assert_eq!((&state["state"], &state["error"]["code"], &state["error"]["details"]["failure"]["message"]), (&json!("stopped"), &json!("STARTUP_TIMEOUT"), &json!("not yet")));
+    let failed = waiting.borrow_mut().take().unwrap().unwrap_err();
+    assert_eq!((failed.status, failed.code.as_str(), failed.details.unwrap()["failure"]["code"].clone()), (503, "SPACE_STOPPED", json!("STARTUP_TIMEOUT")));
+  }
+}
+
 // A service reaches the outside world over wasi:http, every request the
 // `fetch` effect: made once in a write and replayed after, made every time in
 // a GET.
 mod fetch {
   use super::*;
   use crate::ops::effects::Made;
-  use crate::testing::{Outside, awaited, hanging_up, timed, until};
-  use crate::wasm::Package;
+  use crate::testing::{Outside, awaited, hanging_up, until};
   use std::net::TcpListener;
 
-  const PROBE: &[u8] = include_bytes!("../fixtures/probe.wasm");
-
-  // A personal channel running `[probe]`, which sends requests over wasi:http.
+  // A personal channel running `[probe]`, which sends requests over wasi:http, and its space.
   fn probed() -> (tempfile::TempDir, Rc<crate::Carbon>, crate::Identity, Rc<crate::Space>) {
-    let (directory, carbon, _timers) = timed();
-    carbon.register(Package::read(PROBE).unwrap().service("probe")).unwrap();
-    let identity = alice(&carbon);
-    on(&carbon, &identity.personal, &identity, "POST [channel]/services", json!({"name": "probe"})).unwrap();
+    let (directory, carbon, _timers, identity) = crate::testing::probed();
     let probe = service(&carbon, &identity.personal, "probe");
     (directory, carbon, identity, probe)
   }

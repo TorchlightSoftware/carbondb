@@ -30,7 +30,7 @@ A local builtin service that manages cryptographic identities and system calls.
 |---|---|---|
 | `POST [@carbon]/identity` | `slug`, `device` (this device's name), `services` (the personal channel's), `code` (to join an existing identity) | `{slug, id, channel, personal, device}`: the identity, its own and personal channels, and this device's public key. Without a `code`, founds the identity and its personal channel; with one, joins it once a device already in it accepts |
 | `GET [@carbon]/identities` | | `[{slug, id, channel, personal, device}]`: the identities on this device |
-| `GET [@carbon]/status` | `service` (optional) | `{name, access, sync, peers}` for a service; for the channel, also `services: [{name, access, sync}]`. `access` is the acting identity's; `sync` is `off`, `waiting` or `on`; `peers` are the devices this one has synced with, and when |
+| `GET [@carbon]/status` | `service` (optional) | `{name, access, sync, peers, state}` for a service, and `error` once stopped; for the channel, its own `state` and also `services: [{name, access, sync, state}]`. `state` is `initializing`, `idle`, `applying` or `stopped`. `access` is the acting identity's; `sync` is `off`, `waiting` or `on`; `peers` are the devices this one has synced with, and when |
 | `POST [@carbon]/sync/start`, `/sync/stop` | `service` (optional) | `{sync}`. For the channel, starts or stops it and each of its services this device runs |
 | `DELETE [@carbon]/data` | `service` (optional) | `{}`. Deletes this device's copy of the service, or of the channel with its services |
 

@@ -24,6 +24,7 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::carbon::{Cancel, Carbon};
+use crate::deadline::Deadline;
 use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal, timed_out};
 use crate::ops::effects::{EffectLog, Turn};
 use crate::space::Space;
@@ -100,8 +101,8 @@ pub struct ServiceCall {
   calls: RefCell<Vec<CallRecord>>,
   pending: Cell<usize>,
   settle: RefCell<Option<Settle>>,
-  // Cancels its deadline, when it is a top-level call.
-  deadline: RefCell<Option<Cancel>>,
+  // Its deadline, when it is a top-level call.
+  deadline: RefCell<Option<Rc<Deadline>>>,
   // Whether the core settled it when its deadline passed.
   expired: Cell<bool>,
   // Drops whatever runs its handler, when it expires first.
@@ -184,8 +185,9 @@ impl ServiceCall {
   }
 
   // The deadline it must settle by, which settling cancels.
-  pub(crate) fn set_deadline(&self, cancel: Cancel) {
-    self.deadline.replace(Some(cancel));
+  pub(crate) fn set_deadline(self: &Rc<Self>, deadline: Rc<Deadline>) {
+    deadline.running(self);
+    self.deadline.replace(Some(deadline));
   }
 
   // Its deadline passed: settle it with a timeout, unless it has settled.
@@ -356,8 +358,8 @@ impl HandlerContext for ServiceCall {
         false => Err(conflict(format!("{} has already settled", self.call.key()))),
       };
     };
-    if let Some(cancel) = self.deadline.take() {
-      cancel();
+    if let Some(deadline) = self.deadline.take() {
+      deadline.answered();
     }
     let result = match result {
       Ok(_) if self.pending.get() > 0 => Err(internal(format!("{} finished before the calls it made", self.call.key()))),

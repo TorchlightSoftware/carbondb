@@ -154,6 +154,8 @@ A service is a package: its `service.toml`, its schema, set up by its own `setup
 # services/chat/service.toml
 name = "chat"      # its canonical name; the name the app registers it under overrides it
 timeout = 200      # milliseconds every call to it must settle within; 200 when left out
+health = "/health" # a GET each of its spaces answers before it is ready; ready once set up when left out
+startup_timeout = 10000 # milliseconds each of its spaces may take to start: compiling, setup, health check
 
 [[sql]]
 binding = "db"     # the storage it asks for, handed to its handlers as env.db; at most one

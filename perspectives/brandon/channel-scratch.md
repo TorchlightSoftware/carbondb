@@ -556,3 +556,210 @@ You can update readme and docs/.  Other than that, replicate stories that need t
     4. Checkpoints.
 
 I'm just going to have you do it all at once.  I know it's a lot, but that works better for me right now.  I'm going to head to bed and check it in the morning.
+
+---
+
+    componentize-qjs's init can't run our setup
+
+Can you just call it "setup" rather than "set-up"?
+
+    Only the WIT file and the Rust serve! macro see set-up
+
+Just call it "setup" consistently through the stack.  I wasn't stuck on "init".
+
+    Every instance therefore began from the same seed and returned the same sequence, even though WASI's random source was available
+
+Can we correct that?  Because you may write our code around it, sure, but other service developers we do not control are likely to use Math.random, and it would be nicer if it functioned correctly.
+
+    Compiling is CPU work on the one core thread, not waiting, so nothing else moves while it runs
+
+Why don't you do it on another thread?
+
+    "Compiled" meant wasmtime's machine code, not the .wasm.
+
+Ah.  I see.
+
+I think you should have a thread pool dedicated to this, and compile the builtins on CarbonDB boot, because you know for sure you're going to use them.  Other services could be lazy loaded, but should still use the thread pool.
+
+Let's put that aside and implement it in its own commit.
+
+    Each effect takes its slot in the log when it's asked for, and its output fills that slot when it finishes
+
+So let it be written.  So let it be done.
+
+---
+
+    so the per-call fix applies to every developer's code.
+
+I don't know what the "per-call fix" is.
+
+    a library that draws a random number while it loads
+
+Are you talking about "setup"?  Oh.  You said at import.  Ok...  I think there are tradeoffs either way:
+
+- if you don't have entropy in builds, developers have to know that and work around it
+- if you do have entropy in builds...  then you have entropy in builds.  They are non-deterministic, hash function is unreliable, etc.
+
+Do we have deterministic builds now?  If we do I would say let's keep them deterministic.  If we don't, and we can't get them to be deterministic regardless of what we do, then I would lean towards providing proper entropy during build, because you can't get the benefits of determinism anyway.
+
+---
+
+    The two components are the same size (1,543,487 bytes) but differ in 160 bytes, in small clusters. That pattern looks like clock or random state read while the snapshot was taken.
+
+Thank you for gathering evidence.  Please add this to docs/wasm-services.md
+
+    The "per-call fix" is a line in carbondb/service that replaces Math.random at the start of every call
+
+Interesting.  Document that in the same place.
+
+---
+
+    - Wasmtime's WASI HTTP hook takes the request and hands back a response that may finish on another thread.
+
+Yeah, you're gonna have to wait for it to finish.
+
+    componentize-qjs has no fetch of its own
+
+We knew that when we decided to use it.  You agreed to implement fetch.
+
+I don't understand your A and B.  I think what you're saying is there's a WASI implementation of fetch, but you don't like how it works in terms of async.  We could just provide our own implementation in Rust and bind it to "fetch" in the WASM boundary, but then services would have to know about this and explicitly call it.  I don't know if that's true... you could still provide an internal wrapping, right?  That's what service-bindings is for... and... whatever the node equavalent is?  Do we have a similar wrapper for node, that runs inside the WASM boundary and provides interface bindings to the service?
+
+---
+
+    there's no Node inside the boundary. JS runs in QuickJS, so it has no Node http or undici, only the globals carbondb/service installs
+
+Fair.  Add a note for exploring the consequences to this in perspectives/brandon/porting-otto.md.
+
+    2. Rust services reach it through WASI HTTP.
+    3. JS services reach it through a global fetch
+
+I still don't understand.  Why the split?
+
+    That rules out streaming responses inside a write.
+
+Document inside docs/wasm-services.md
+
+---
+
+    writing JS's fetch over our own effect import is simpler, because it's just JSON in and out. Writing it over WASI HTTP means handling its request, headers, body streams and future responses.
+
+Ok, that makes sense.  Yes, let's just use the WASI implementation and move on.
+
+---
+
+       - Fixing that needs WASI 0.3's async HTTP, or componentize-qjs support for waiting on WASI 0.2 events.
+
+Sounds like you know the solution.  Are you waiting on something?
+
+       - HTTPS is untested. The tests use plain HTTP; HTTPS goes through wasmtime's built-in TLS with bundled root certificates.
+
+Ok, can you test it?
+
+---
+
+    3. Deeper issues found:
+       - A write that fetches holds its space for the whole request
+
+Is there any avoiding this in our present design?  I mean, in essence we are serializing access to a web service.  That's a major killer to throughput, vs how a web service would normally operate.  Does this point to a deeper flaw in the whole design, or is it something we can optimize?  Traditionally database writes may be serialized, but the application wouldn't operate under such a constraint.  And databases make determinations about whether your operations actually need to be serialized.
+
+This seems to be a constraint that our oplog and CRDT mechanics are forcing.  But we probably don't need to be so heavy handed... there's a lot more that we know about the queries that are running, and we should also be able to ascertain whether they can be run in parallel.  Let's talk further about that.
+
+---
+
+    Rust services keep working over 0.2 through wasip2
+
+Claude, why are you pinning an older release for Rust?  Why don't you just update everything?
+
+---
+
+    no test replays a JS write's fetch, because the JS API can't trigger a rewind or read the op log
+
+Huh?  I don't understand why you can't create a test scenario that reproduces this.
+
+    A guest built against a newer 0.3 may not run
+
+I don't want to finick any further with this.  Just document for now.
+
+---
+
+    The JS API can't deliver a late op, but a core test can
+
+Well.  Sync between two nodes is entirely manual right?  So you can produce any sequence of events you wish?  Even without access to the core internal APIs.
+
+---
+
+     compiling starts on the pool as soon as the service is registered
+
+Yes.
+
+    My proposal: a dedicated pool of two threads that only compile, plus parallel-compilation turned on. The pool keeps compiling off the core thread, and parallel compilation shortens each JS compile from the current ~2 s.
+
+Yes.
+
+    The alternative: wasmtime's built-in cache
+
+Is it a problem that it's shared?
+
+---
+
+    - A schema error can arrive later than before. If an app names a service in a channel before its compile finishes, the space is created first. A schema that fails to set up then rejects services.add's promise
+
+Why doesn't space creation await the compilation/readiness of all services?  And the same should happen any time the space is resumed.  Calls in the channel should queue and wait for services that are initializing.  You implemented "status" on channels and services right?  So... enforce the lifecycles.
+
+---
+
+    What's missing:
+    1. A failed compile or setup leaves waiting spaces Initializing forever, silently. The lifecycle already has a Stopped state carrying an error: calls fail with 503 SPACE_STOPPED naming the cause, and resume retries. It should be used here.
+
+Yes.
+
+    2. Status doesn't report the lifecycle. [@carbon] status returns name, access, sync and peers, but no state (crates/core/src/services/carbon/mod.rs:81-94).
+
+That's a regression from the pre-channel implementation.  Please fix.
+
+    3. A GET to a space whose service was never registered answers 404 instead of waiting.
+
+I'm not sure "a space whose service was never registered" makes any sense to me.  That made sense in the pre-channel model, when you were adding multiple services to a space.  In the service=space=actor model, the target service should be defined as part of the constructor.
+
+And again... calls need to abide by the lifecycle and queue until the service is ready.
+
+---
+
+    a call to a space whose package this device never gets waits indefinitely
+
+No.  Please don't intentionally break the spec when you have clear and obvious solutions right in front of you.
+
+---
+
+    start a call's deadline when the call is taken, not when it runs
+
+I agree, but it doesn't address the more fundamental and direct cause you were complaining about.
+
+You said:
+
+    a call to a space whose package this device never gets waits indefinitely
+
+And what I was hoping you would realize is: getting a package is a bounded operation.  It either succeeds, or fails, or times out.  And therefore, whatever is waiting on it should not wait forever.
+
+---
+
+    Initializing means "getting the package", and that always finishes.
+
+It means:
+
+- getting the package
+- running setup()
+- waiting until a health check passes (otto services have a builtin health check for instance at /health.  And the API root prints out capabilities.  see: https://identity.tlsft.com/api)
+
+The health check URI can be configured through service.toml.
+
+---
+
+Maybe we shouldn't be including the service startup/compile time inside the CALL timeout?  Those really are independent expectations.
+
+---
+
+Let's clean up the project documentation.  First get rid of old stories that have been transitioned to stories/channels, then move the channels stories into stories/.  That branch is gone now, and we've merged to main and committed to this direction.
+
+Close the current agenda, and pop up a new agenda with whatever planning and documentation needs to occur.  Feel free to mark "will implement" anything with obvious outcomes that follow from our code.
+

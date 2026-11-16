@@ -9,12 +9,14 @@
 //!
 //! Every service but `[@carbon]` is a package, a component the WASM host runs
 //! (`crate::wasm`), registered under the name the app gives it, which
-//! overrides the canonical name in its service.toml.
+//! overrides the canonical name in its service.toml. A package is registered
+//! as soon as it is read, so ops on it carry its version, but it is ready
+//! only once its component has compiled: until then no space sets it up.
 
 pub mod carbon;
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -22,17 +24,24 @@ use serde_json::json;
 
 use crate::error::{Result, bad_request, conflict, not_found};
 use crate::service_call::ServiceCall;
-use crate::wasm::Package;
 use crate::{Db, HandlerContext};
 
 // The packages CarbonDB ships, embedded in the library as the components
-// `scripts/build-builtins` built and packaged from `crates/services/`. Each
+// `scripts/build-components` built and packaged from `crates/services/`. Each
 // is versioned by the hash of its bytes, so devices on different releases of
 // CarbonDB agree whenever a builtin is unchanged.
 pub const BUILTINS: [(&str, &[u8]); 2] = [("channel", include_bytes!("../../builtins/channel.wasm")), ("identity", include_bytes!("../../builtins/identity.wasm"))];
 
 // How long a call to a service may take to settle when its service.toml names no timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
+
+// How long each space of a service may take to start when its service.toml names no time.
+pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_millis(10000);
+
+// A service's startup timeout, from the milliseconds its service.toml names.
+pub(crate) fn startup_timeout(milliseconds: Option<u64>) -> Duration {
+  milliseconds.map_or(DEFAULT_STARTUP_TIMEOUT, Duration::from_millis)
+}
 
 // What sets up a service's schema, given its `db` binding.
 pub type Setup = Rc<dyn Fn(Rc<dyn Db>) -> Result<()>>;
@@ -52,6 +61,12 @@ pub struct Service {
   // The effects it makes again on every run of an op, by name; every other is
   // made on an op's first run only.
   pub always: Vec<String>,
+  // Its health check, a path its spaces answer a GET on once set up before
+  // they are ready; none, ready once set up.
+  pub health: Option<String>,
+  // How long each of its spaces may take to start: its package compiling, its
+  // setup and its health check. Its calls' own deadlines start once it has.
+  pub startup: Duration,
   pub setup: Setup,
   // Every service but `[@carbon]` sees its service call only as a handler context.
   pub(crate) entry: Rc<dyn Fn(Rc<ServiceCall>)>,
@@ -66,6 +81,8 @@ impl Service {
       binding: binding.map(str::to_string),
       timeout,
       always: vec![],
+      health: None,
+      startup: DEFAULT_STARTUP_TIMEOUT,
       setup,
       entry: Rc::new(move |call: Rc<ServiceCall>| entry(call)),
     }
@@ -75,19 +92,20 @@ impl Service {
 #[derive(Default)]
 pub struct Services {
   registered: RefCell<BTreeMap<String, Rc<Service>>>,
+  // The registered services whose component is still compiling.
+  compiling: RefCell<BTreeSet<String>>,
 }
 
 impl Services {
-  // The services every CarbonDB starts with.
+  // What every CarbonDB starts with: `[@carbon]`; the builtin packages are
+  // registered as they compile, as an app's are.
   pub fn builtin() -> Result<Services> {
     let services = Services::default();
     services.register(carbon::service())?;
-    for (name, bytes) in BUILTINS {
-      services.register(Package::read(bytes)?.service(name))?;
-    }
     Ok(services)
   }
 
+  // Register a service ready to run.
   pub fn register(&self, service: Service) -> Result<Rc<Service>> {
     let mut registered = self.registered.borrow_mut();
     if registered.contains_key(&service.name) {
@@ -98,6 +116,28 @@ impl Services {
     Ok(service)
   }
 
+  // Register a service whose component is still compiling.
+  pub fn register_compiling(&self, service: Service) -> Result<Rc<Service>> {
+    let name = service.name.clone();
+    let service = self.register(service)?;
+    self.compiling.borrow_mut().insert(name);
+    Ok(service)
+  }
+
+  // A service's component has compiled: it is ready, or, failing, not registered after all.
+  pub fn compiled(&self, name: &str, result: &Result<()>) {
+    self.compiling.borrow_mut().remove(name);
+    if result.is_err() {
+      self.registered.borrow_mut().remove(name);
+    }
+  }
+
+  // Whether a service is registered but still compiling.
+  pub fn is_compiling(&self, name: &str) -> bool {
+    self.compiling.borrow().contains(name)
+  }
+
+  // A registered service, compiled or still compiling.
   pub fn find(&self, name: &str) -> Option<Rc<Service>> {
     self.registered.borrow().get(name).cloned()
   }
@@ -152,22 +192,35 @@ mod tests {
   }
 
   #[test]
-  fn starts_with_the_builtins_and_registers_each_name_once() {
+  fn starts_with_carbon_and_registers_each_name_once() {
     let services = Services::builtin().unwrap();
-    let builtins: Vec<(String, bool, Option<String>)> =
-      ["carbon", "channel", "identity"].iter().map(|name| services.get(name).unwrap()).map(|service| (service.name.clone(), service.local, service.binding.clone())).collect();
-    let db = || Some("db".to_string());
-    assert_eq!(builtins, [("carbon".into(), true, None), ("channel".into(), false, db()), ("identity".into(), false, db())]);
+    let carbon = services.get("carbon").unwrap();
+    assert_eq!((carbon.local, carbon.binding.clone()), (true, None));
     services.register(service("chat")).unwrap();
-    for name in ["chat", "channel"] {
+    for name in ["chat", "carbon"] {
       assert_eq!(services.register(service(name)).err().unwrap().status, 409, "{name}");
     }
     assert_eq!(services.version("chat"), "v1");
   }
 
   #[test]
+  fn a_service_still_compiling_is_registered_but_not_ready_and_is_dropped_if_it_fails() {
+    let services = Services::builtin().unwrap();
+    for name in ["chat", "crm"] {
+      services.register_compiling(service(name)).unwrap();
+    }
+    assert!(services.require_registered(&["chat".into()]).is_ok());
+    assert_eq!((services.version("chat"), services.is_compiling("chat")), ("v1".into(), true), "ops on it carry its version");
+    services.compiled("chat", &Ok(()));
+    assert_eq!((services.find("chat").is_some(), services.is_compiling("chat")), (true, false));
+    services.compiled("crm", &Err(bad_request("not a component")));
+    assert_eq!((services.find("crm").is_none(), services.is_compiling("crm")), (true, false));
+  }
+
+  #[test]
   fn names_what_is_missing() {
     let services = Services::builtin().unwrap();
+    services.register(service("channel")).unwrap();
     assert!(services.require_registered(&["channel".into()]).is_ok());
     let error = services.require_registered(&["channel".into(), "crm".into()]).unwrap_err();
     assert_eq!((error.status, error.details), (400, Some(json!({"services": ["crm"]}))));

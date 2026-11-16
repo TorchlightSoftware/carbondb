@@ -2,6 +2,7 @@
 //!
 //! ```toml
 //! system = "data/system.db"   # relative to this file; space files sit beside it
+//! compiled = "data/compiled"  # where compiled components are kept; beside the system database by default
 //!
 //! [sync]
 //! mode = "none"               # single-node; or "ref" (the default), "all", "manual"
@@ -26,6 +27,9 @@ pub enum SyncMode {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
   pub system: PathBuf,
+  // Where compiled components are kept, for every CarbonDB the process opens
+  // after this one too (`crate::wasm::keep_in`).
+  pub compiled: PathBuf,
   pub sync: SyncMode,
 }
 
@@ -33,6 +37,7 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 struct File {
   system: String,
+  compiled: Option<String>,
   #[serde(default)]
   sync: SyncSection,
 }
@@ -53,7 +58,9 @@ impl Config {
   // A config from TOML text, with paths resolved against the file's directory.
   pub fn parse(text: &str, base: &Path) -> Result<Config> {
     let file: File = toml::from_str(text).map_err(|error| bad_request(format!("Malformed config: {error}")))?;
-    Ok(Config { system: base.join(file.system), sync: file.sync.mode })
+    let system = base.join(file.system);
+    let compiled = file.compiled.map_or_else(|| system.parent().unwrap_or(base).join("compiled"), |compiled| base.join(compiled));
+    Ok(Config { system, compiled, sync: file.sync.mode })
   }
 
   // The directory the system database and space files live in.
@@ -67,7 +74,7 @@ mod tests {
   use super::*;
 
   #[test]
-  fn reads_the_system_path_and_sync_mode() {
+  fn reads_the_system_path_where_compiled_components_are_kept_and_the_sync_mode() {
     let cases = [
       ("system = \"data/system.db\"\n[sync]\nmode = \"none\"", SyncMode::None),
       ("system = \"data/system.db\"", SyncMode::Ref),
@@ -75,9 +82,11 @@ mod tests {
     ];
     for (text, sync) in cases {
       let config = Config::parse(text, Path::new("/app")).unwrap();
-      assert_eq!(config, Config { system: PathBuf::from("/app/data/system.db"), sync });
+      assert_eq!(config, Config { system: PathBuf::from("/app/data/system.db"), compiled: PathBuf::from("/app/data/compiled"), sync });
       assert_eq!(config.directory(), Path::new("/app/data"));
     }
+    let kept = Config::parse("system = \"data/system.db\"\ncompiled = \"/var/cache/carbondb\"", Path::new("/app")).unwrap();
+    assert_eq!(kept.compiled, PathBuf::from("/var/cache/carbondb"));
   }
 
   #[test]

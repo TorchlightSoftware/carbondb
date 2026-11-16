@@ -49,10 +49,44 @@ pub fn carbon() -> (tempfile::TempDir, Rc<Carbon>) {
   (directory, carbon)
 }
 
+// A test's config: single-node, its compiled components kept where every
+// test's are, so a run compiles each component once.
+pub fn config() -> String {
+  let compiled = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/carbondb-compiled");
+  format!("system = \"data/system.db\"\ncompiled = {:?}\n[sync]\nmode = \"none\"\n", compiled.display().to_string())
+}
+
+// The core's test fixture `[probe]`, a Rust component that reports what it sees of its host.
+pub const PROBE: &[u8] = include_bytes!("../fixtures/probe.wasm");
+
+// A package's bytes with a custom section of its own appended, so its version
+// is new and this process compiles it afresh.
+pub fn afresh(bytes: &[u8]) -> Vec<u8> {
+  static FRESH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+  let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let name = format!("carbondb:test:{since}:{}", FRESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+  [bytes, &[0, name.len() as u8 + 1, name.len() as u8], name.as_bytes()].concat()
+}
+
+// Register a package under `name`, once it has compiled.
+pub fn add(carbon: &Rc<Carbon>, name: &str, bytes: &[u8]) -> Result<()> {
+  let package = crate::wasm::Package::read(bytes)?;
+  awaited(|added| carbon.add(name, package, added))
+}
+
+// A personal channel running `[probe]` beside `[notes]`, with the timers.
+pub fn probed() -> (tempfile::TempDir, Rc<Carbon>, Timers, Identity) {
+  let (directory, carbon, timers) = timed();
+  add(&carbon, "probe", PROBE).unwrap();
+  let identity = alice(&carbon);
+  on(&carbon, &identity.personal, &identity, "POST [channel]/services", json!({"name": "probe"})).unwrap();
+  (directory, carbon, timers, identity)
+}
+
 // The same, with the timers it schedules on.
 pub fn timed() -> (tempfile::TempDir, Rc<Carbon>, Timers) {
   let directory = tempfile::tempdir().unwrap();
-  std::fs::write(directory.path().join("carbondb.toml"), "system = \"data/system.db\"\n[sync]\nmode = \"none\"\n").unwrap();
+  std::fs::write(directory.path().join("carbondb.toml"), config()).unwrap();
   let timers = Timers::default();
   let carbon = Carbon::open(&directory.path().join("carbondb.toml"), timers.schedule(), tasks()).unwrap();
   register_notes(&carbon);
@@ -91,6 +125,17 @@ impl Timers {
   // The delays of what is scheduled and has neither run nor been cancelled.
   pub fn delays(&self) -> Vec<Duration> {
     self.scheduled.borrow().values().map(|(delay, _)| *delay).collect()
+  }
+
+  // Run what was scheduled to run within `delay`, as though that much time had
+  // passed, and the tasks it set going; what that schedules waits.
+  pub fn pass(&self, delay: Duration) {
+    let due: Vec<usize> = self.scheduled.borrow().iter().filter(|(_, (scheduled, _))| *scheduled <= delay).map(|(id, _)| *id).collect();
+    let due: Vec<Scheduled> = due.into_iter().filter_map(|id| self.scheduled.borrow_mut().remove(&id)).collect();
+    for (_, then) in due {
+      then();
+    }
+    drive();
   }
 
   // Run everything scheduled so far, and the tasks it set going.

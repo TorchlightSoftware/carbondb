@@ -102,8 +102,9 @@ export class NativeCarbon {
     return carbon
   }
 
-  register(name, bytes) {
-    this.#native.register(name, bytes)
+  register(name, bytes, reply) {
+    const id = this.#courier.once(reply)
+    this.#dispatch(id, () => this.#native.register(name, bytes, id))
   }
 
   call(channel, identity, key, input, reply) {

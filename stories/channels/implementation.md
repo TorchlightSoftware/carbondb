@@ -329,7 +329,7 @@ mode = "ref"   # the default; or "all", "manual", or "none" for single-node
 | Arrived, not a member | `on` | `[]` |
 | Arrived, member | `on` | The level, in a list |
 
-It also returns the name and `peers`, the devices this one has synced with and when, and for a channel its kind and `services: [{name, access, sync}]`. It cannot know about peers it has never met. p2panda's `created` resolves for a non-member once the space arrives, and `joined` never resolves for one, so neither can be awaited without a timeout.
+It also returns the name and `peers`, the devices this one has synced with and when, its lifecycle `state` (and `error` once stopped), and for a channel its kind and `services: [{name, access, sync, state}]`. It cannot know about peers it has never met. p2panda's `created` resolves for a non-member once the space arrives, and `joined` never resolves for one, so neither can be awaited without a timeout.
 
 During a partition, GETs read the local copy, and writes apply locally and publish later if the last known access allows them. If the member was removed meanwhile, the cutoff discards them. A call on a `waiting` service is rejected.
 

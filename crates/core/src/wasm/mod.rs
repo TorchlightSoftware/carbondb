@@ -16,66 +16,30 @@
 //! effect (`http`). An instance that computes without yielding is made to yield
 //! every epoch tick, so a call's deadline can pass and abandon it.
 //!
-//! The engine and the compiled components are kept for the whole process:
-//! compiling is slow, and a component's compiled form depends only on its bytes.
+//! A component compiles off the core's thread, once per process, and its
+//! compiled code is kept on disk (`compile`).
 
+mod compile;
 mod host;
 mod http;
 mod wasi;
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::pin;
+pub use compile::{Compiled, keep_in};
+
 use std::rc::Rc;
-use std::sync::{LazyLock, Mutex};
-use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 
 use carbondb_service_bindings::manifest::Manifest;
 use carbondb_service_bindings::package::{embed, manifest_of};
 use serde_json::{Value, json};
-use wasmtime::component::{Component, InstancePre, Linker};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::Store;
+use wasmtime::component::InstancePre;
 
 use crate::error::{Result, ServiceError, bad_request, internal};
 use crate::service_call::ServiceCall;
-use crate::services::{Service, Setup, timeout};
+use crate::services::{Service, Setup, startup_timeout, timeout};
 use crate::{Db, HandlerContext};
+use compile::{ENGINE, block_on, compiled};
 use host::{Running, Turn};
-
-// How often an instance that computes without yielding is made to yield.
-const TICK: Duration = Duration::from_millis(10);
-
-// The engine every component compiles and runs on, and the epoch it ticks.
-static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
-  let mut config = Config::new();
-  config.wasm_component_model_async(true).epoch_interruption(true);
-  let engine = Engine::new(&config).expect("the host's configuration is valid");
-  let ticking = engine.weak();
-  std::thread::spawn(move || {
-    while let Some(engine) = ticking.upgrade() {
-      engine.increment_epoch();
-      drop(engine);
-      std::thread::sleep(TICK);
-    }
-  });
-  engine
-});
-
-// What every instance links: the world's host imports, closed WASI, and
-// HTTP through the core.
-static LINKER: LazyLock<Linker<Turn>> = LazyLock::new(|| {
-  let mut linker = Linker::new(&ENGINE);
-  host::link(&mut linker).expect("the host imports link");
-  wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("WASI 0.2 links");
-  wasmtime_wasi::p3::add_to_linker(&mut linker).expect("WASI 0.3 links");
-  wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).expect("WASI 0.2 HTTP links");
-  wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("WASI 0.3 HTTP links");
-  linker
-});
-
-// Every component compiled so far, by version.
-static COMPILED: LazyLock<Mutex<HashMap<String, InstancePre<Turn>>>> = LazyLock::new(Mutex::default);
 
 // A built component with its service.toml embedded: a package to register.
 pub fn package(component: &[u8], manifest: &str) -> Result<Vec<u8>> {
@@ -83,22 +47,33 @@ pub fn package(component: &[u8], manifest: &str) -> Result<Vec<u8>> {
   embed(component, manifest).map_err(bad_request)
 }
 
-// A package, read and compiled: what it asks of the host, its version, and
-// its component, ready to instantiate.
+// A package, read: what it asks of the host, its version, and its
+// component, compiling on the pool from the moment it is read.
 pub struct Package {
   pub manifest: Manifest,
   pub version: String,
-  ready: InstancePre<Turn>,
+  compiled: Compiled,
 }
 
 impl Package {
-  // A package from its bytes: refused unless it is a component of the
-  // `carbondb:service` world carrying a service.toml.
+  // A package from its bytes, refused unless it carries a service.toml; it
+  // starts compiling, and a component of another world than
+  // `carbondb:service` fails to.
   pub fn read(bytes: &[u8]) -> Result<Package> {
     let text = manifest_of(bytes).map_err(bad_request)?.ok_or_else(|| bad_request("This component carries no service.toml; package it first"))?;
     let manifest = Manifest::parse(&text).map_err(bad_request)?;
     let version = carbondb_service_bindings::hash::of_bytes(bytes);
-    Ok(Package { manifest, ready: compiled(&version, bytes)?, version })
+    Ok(Package { manifest, compiled: compiled(&version, bytes), version })
+  }
+
+  // Its component, compiling or compiled.
+  pub fn compiled(&self) -> Compiled {
+    self.compiled.clone()
+  }
+
+  // Its compiled component: a service is set up and called only once it is.
+  fn ready(&self) -> Result<InstancePre<Turn>> {
+    self.compiled.now().unwrap_or_else(|| Err(internal("A service ran before its component compiled")))
   }
 
   // The service it runs, registered under `name`.
@@ -114,17 +89,21 @@ impl Package {
       binding: package.manifest.binding().map(str::to_string),
       timeout: timeout(package.manifest.timeout),
       always: package.manifest.replicated_always(),
+      health: package.manifest.health.clone(),
+      startup: startup_timeout(package.manifest.startup_timeout),
       setup,
       entry,
     }
   }
 
-  // Set the service's schema up: `setup`, run to completion.
+  // Set the service's schema up: `setup`, run to completion. It reaches
+  // nothing but its binding, so it never waits on anything else.
   fn setup(&self, db: Rc<dyn Db>) -> Result<()> {
+    let ready = self.ready()?;
     let running = Running::register(host::Context::Setup(db));
     let mut store = self.store(running.id(), None);
-    finish(async {
-      let instance = self.ready.instantiate_async(&mut store).await?;
+    block_on(async {
+      let instance = ready.instantiate_async(&mut store).await?;
       let setup = instance.get_typed_func::<(), (std::result::Result<(), String>,)>(&mut store, "setup")?;
       setup.call_async(&mut store, ()).await
     })
@@ -150,8 +129,9 @@ impl Package {
   }
 
   async fn handle(&self, store: &mut Store<Turn>, request: String) -> Result<Value> {
+    let ready = self.ready()?;
     let answered = async {
-      let instance = self.ready.instantiate_async(&mut *store).await?;
+      let instance = ready.instantiate_async(&mut *store).await?;
       let handle = instance.get_typed_func::<(String,), (std::result::Result<String, String>,)>(&mut *store, "handle")?;
       store.run_concurrent(async |accessor| handle.call_concurrent(accessor, (request,)).await).await?
     };
@@ -177,17 +157,6 @@ pub(crate) fn running() -> usize {
   host::count()
 }
 
-// A component compiled once per process, by version.
-fn compiled(version: &str, bytes: &[u8]) -> Result<InstancePre<Turn>> {
-  if let Some(ready) = COMPILED.lock().expect("the compile cache is never poisoned").get(version) {
-    return Ok(ready.clone());
-  }
-  let component = Component::new(&ENGINE, bytes).map_err(|error| bad_request(format!("Not a component this host can run: {error}")))?;
-  let ready = LINKER.instantiate_pre(&component).map_err(|error| bad_request(format!("A component of another world than carbondb:service: {error}")))?;
-  COMPILED.lock().expect("the compile cache is never poisoned").insert(version.to_string(), ready.clone());
-  Ok(ready)
-}
-
 // A call as `handle` receives it, with the name the service gives its binding.
 fn request_of(call: &ServiceCall, binding: Option<&str>) -> String {
   json!({"method": call.method(), "resource": call.resource(), "input": call.input(), "actor": call.actor(), "op": call.op(), "binding": binding}).to_string()
@@ -196,17 +165,4 @@ fn request_of(call: &ServiceCall, binding: Option<&str>) -> String {
 // A trap inside an instance, as the call's failure.
 fn trapped(error: wasmtime::Error) -> ServiceError {
   internal(format!("The service failed: {error:?}"))
-}
-
-// Run a future to completion here and now. Only `setup` runs this way: it
-// reaches nothing but its binding, so it never waits on anything else, and
-// an epoch yield is ready to poll again at once.
-fn finish<F: Future>(future: F) -> F::Output {
-  let mut future = pin!(future);
-  let mut context = Context::from_waker(Waker::noop());
-  loop {
-    if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
-      return output;
-    }
-  }
 }

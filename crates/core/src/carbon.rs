@@ -17,7 +17,7 @@
 //! peers have no handler here, and are unreachable.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::future::Future;
 use std::pin::Pin;
@@ -35,10 +35,12 @@ use crate::ops::oplog::{self, LogRow};
 use crate::config::{Config, SyncMode};
 use crate::service_call::ServiceCall;
 use crate::services::carbon::{self as local, Identity};
-use crate::services::{Service, Services};
+use crate::services::{BUILTINS, Service, Services};
 use crate::space::{self, RunState, Runs, Space};
 use crate::store::Store;
+use crate::wasm::{self, Package};
 use crate::watch::Watches;
+use crate::lifecycle::{Held, Starting};
 use crate::{Actor, Call, Db, Op, Reply};
 
 // How an opened space reaches whoever asked for it.
@@ -68,6 +70,10 @@ pub struct Carbon {
   system: Rc<Space>,
   spaces: RefCell<HashMap<String, Rc<Space>>>,
   pub(crate) watches: Watches,
+  // The GETs held while their spaces start, by space.
+  holding: RefCell<BTreeMap<String, Vec<Held>>>,
+  // The spaces starting, by id.
+  starting: RefCell<HashMap<String, Rc<Starting>>>,
 }
 
 impl Carbon {
@@ -77,6 +83,8 @@ impl Carbon {
       return Err(not_built("Replicated mode"));
     }
     std::fs::create_dir_all(config.directory()).map_err(|error| bad_request(format!("Cannot create {}: {error}", config.directory().display())))?;
+    wasm::keep_in(&config.compiled);
+    let builtins = BUILTINS.iter().map(|(name, bytes)| Package::read(bytes).map(|package| (*name, package))).collect::<Result<Vec<_>>>()?;
     let services = Services::builtin()?;
     let system = Rc::new(Space::root(Store::open(&config.system)?, local::SYSTEM_MIGRATIONS, services.get("carbon")?)?);
     let carbon = Rc::new(Carbon {
@@ -89,7 +97,13 @@ impl Carbon {
       system,
       spaces: RefCell::default(),
       watches: Watches::default(),
+      holding: RefCell::default(),
+      starting: RefCell::default(),
     });
+    for (name, package) in builtins {
+      package.compiled().wait()?;
+      carbon.register(package.service(name))?;
+    }
     carbon.drain(&carbon.system);
     Ok(carbon)
   }
@@ -107,15 +121,67 @@ impl Carbon {
     &self.system
   }
 
-  // Register an app's service, and set it up in every open space that runs it.
+  // Register a service ready to run, and initialize the open spaces waiting for it.
   pub fn register(self: &Rc<Self>, service: Service) -> Result<()> {
     let service = self.services.register(service)?;
-    let running: Vec<Rc<Space>> = self.spaces.borrow().values().filter(|space| space.not_set_up().as_deref() == Some(service.name.as_str())).cloned().collect();
-    for space in running {
-      space.set_up(&service)?;
-      self.drain(&space);
-    }
+    self.package_ready(&service.name);
     Ok(())
+  }
+
+  // Register an app's package under `name`, answering once its component has
+  // compiled on the pool, or failed to. It is registered at once, so ops on
+  // it carry its version, and its spaces initialize while it compiles.
+  pub fn add(self: &Rc<Self>, name: &str, package: Package, added: Box<dyn FnOnce(Result<()>)>) {
+    let compiled = package.compiled();
+    if let Err(error) = self.services.register_compiling(package.service(name)) {
+      return added(Err(error));
+    }
+    let (carbon, name) = (Rc::clone(self), name.to_string());
+    let _ = self.spawn(Box::pin(async move {
+      let result = compiled.ready().await;
+      added(carbon.compiled(&name, result));
+    }));
+  }
+
+  // A package's component has compiled, and the spaces waiting for it
+  // initialize on; or it failed to, so it is not registered after all, and
+  // they stop with why.
+  fn compiled(self: &Rc<Self>, name: &str, result: Result<()>) -> Result<()> {
+    self.services.compiled(name, &result);
+    match &result {
+      Ok(()) => self.package_ready(name),
+      Err(error) => self.package_failed(name, error),
+    }
+    result
+  }
+
+  // Keep a GET held on a space until it is ready or stopped.
+  pub(crate) fn keep_held(&self, space: &str, held: Held) {
+    self.holding.borrow_mut().entry(space.to_string()).or_default().push(held);
+  }
+
+  // Take the GETs held on a space again, now it is ready or stopped.
+  pub(crate) fn release(&self, space: &str) {
+    let held = self.holding.borrow_mut().remove(space).unwrap_or_default();
+    held.into_iter().for_each(|held| held());
+  }
+
+  // A space's startup under way, replaced by `now`: the one it replaces.
+  pub(crate) fn starting_now(&self, space: &str, now: Option<Rc<Starting>>) -> Option<Rc<Starting>> {
+    match now {
+      Some(now) => self.starting.borrow_mut().insert(space.to_string(), now),
+      None => self.starting.borrow_mut().remove(space),
+    }
+  }
+
+  // A space's startup under way, if it is starting.
+  pub(crate) fn starting_of(&self, space: &str) -> Option<Rc<Starting>> {
+    self.starting.borrow().get(space).cloned()
+  }
+
+  // The spaces open on this device, the root space aside.
+  pub(crate) fn open_spaces(&self) -> Vec<Rc<Space>> {
+    self.spaces.borrow().values().cloned().collect()
   }
 
   // Run a task on the core's thread, unless dropped first.
@@ -151,8 +217,9 @@ impl Carbon {
     }
     let runs = self.held(id)?.ok_or_else(|| space::missing(id))?;
     let space = Rc::new(Space::open(&self.space_path(id), id, runs)?);
-    self.set_up(&space)?;
-    Ok(self.keep_open(space))
+    self.spaces.borrow_mut().insert(space.id.clone(), Rc::clone(&space));
+    self.initialize(&space);
+    Ok(space)
   }
 
   // What this device recorded a space runs, if it holds the space.
@@ -165,30 +232,23 @@ impl Carbon {
     }))
   }
 
-  // Set a space's service up, when it is registered here.
-  fn set_up(&self, space: &Rc<Space>) -> Result<()> {
-    self.services.find(&space.runs.package).map_or(Ok(()), |service| space.set_up(&service))
-  }
-
-  // Keep a space open, and apply what is pending in it.
-  fn keep_open(self: &Rc<Self>, space: Rc<Space>) -> Rc<Space> {
-    self.spaces.borrow_mut().insert(space.id.clone(), Rc::clone(&space));
-    self.drain(&space);
-    space
-  }
-
   // A new space on this device, running a registered package, recorded here
-  // with what it runs. One whose service fails to set up is deleted again.
+  // with what it runs, kept open and initializing. One whose package is here
+  // is set up at once, and deleted again when that fails; one whose package
+  // is still compiling is set up once it has.
   pub(crate) fn create_space(self: &Rc<Self>, id: &str, runs: Runs) -> Result<Rc<Space>> {
-    let service = self.services.get(&runs.package)?;
+    self.services.get(&runs.package)?;
     let created = Rc::new(Space::create(&self.space_path(id), id, runs.clone())?);
     self.system.store().run("INSERT INTO carbon_system_space (id, package, name, channel) VALUES (?, ?, ?, ?)", &[json!(id), json!(runs.package), json!(runs.name), json!(runs.channel)])?;
-    if let Err(error) = created.set_up(&service) {
+    self.spaces.borrow_mut().insert(id.to_string(), Rc::clone(&created));
+    self.begin_starting(&created);
+    if let Err(error) = self.prepare(&created) {
+      self.starting_now(id, None);
       drop(created);
       self.forget(id)?;
       return Err(error);
     }
-    Ok(self.keep_open(created))
+    Ok(created)
   }
 
   // The channel a space belongs to, through which its calls to other services resolve.

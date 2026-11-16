@@ -1,20 +1,23 @@
 //! One path for every call, whoever makes it and whichever service answers it.
 //!
-//! A call submitted to a space either reads or writes. A GET reads at once, on
-//! its own snapshot of committed state, and never waits. Anything else is an op:
+//! A call submitted to a space either reads or writes. A GET reads on its own
+//! snapshot of committed state: at once, or, while its space initializes,
+//! once it is ready (`crate::lifecycle`). Anything else is an op:
 //! stamped as it arrives, written to the op log by the space's OpWriter, and
 //! applied in one transaction, which commits its result with its writes. A
 //! refused op rolls back and keeps only its result. Either way the call is
 //! routed by service name to the service's entry point, which settles it.
 //!
 //! Every call it is handed must settle within its service's timeout. One
-//! deadline covers a call and every call it makes inside it; when it passes,
+//! deadline, armed when the call is taken (`crate::deadline`), covers the
+//! call wherever it waits and every call it makes inside it; when it passes,
 //! the core settles the call with a timeout, rolling an op back like any other
-//! failure, and drops whatever its handler answers later.
+//! failure, refusing one still waiting in the log, and dropping whatever its
+//! handler answers later.
 //!
 //! Which op applies next is read from the log: the first of the pending ops,
 //! the op log minus results, in the shared order. They apply one at a time,
-//! and only once the space's service is set up here. An op that sorts before
+//! and only once the space is ready. An op that sorts before
 //! ops already applied is late: it is tried in place, and when that run would
 //! not match applying it at its place the space rewinds (`rewind`). An op's
 //! first run makes its effects and records them on its row; every later run,
@@ -22,7 +25,8 @@
 //!
 //! A system failure stops the space: the file or disk failed, not the op. It
 //! neither logs nor applies another op, and every call to it fails with a 503,
-//! until the problem is fixed by hand and the space is resumed. Writing an op
+//! until the problem is fixed by hand and the space is resumed. So does a
+//! space that cannot become ready (`crate::lifecycle`). Writing an op
 //! to the log or its result is never refused as the op's own failure.
 
 use std::cell::{Cell, RefCell};
@@ -32,6 +36,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::carbon::Carbon;
+use crate::deadline::Deadline;
 use crate::error::{Result, ServiceError, conflict, not_found, stopped};
 use crate::ops::effects::{EffectLog, Made};
 use crate::ops::op::actor;
@@ -61,23 +66,68 @@ pub struct Settled {
 // How a submitted call answers whoever submitted it.
 pub type Reply = Box<dyn FnOnce(Result<Settled>)>;
 
+// A call the core has taken: who makes it, what it asks, the spaces whose
+// ops wait on it, the deadline it must settle by, and where it answers.
+pub(crate) struct Taken {
+  pub(crate) actor: Actor,
+  pub(crate) call: Call,
+  pub(crate) input: Value,
+  pub(crate) awaiting: Vec<String>,
+  pub(crate) deadline: Rc<Deadline>,
+  pub(crate) reply: Reply,
+}
+
 impl Carbon {
-  // Take a call on a space: a GET reads now, anything else is an op that waits its turn.
+  // Take a call on a space: a GET reads once the space is ready, anything
+  // else is an op that waits its turn.
   pub fn submit(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, reply: Reply) {
     self.post(space, actor, call, input, vec![], reply)
   }
 
-  // Take a call that the ops of the spaces in `awaiting` wait on.
+  // Take a call that the ops of the spaces in `awaiting` wait on, under a
+  // deadline that begins once the space is ready, which answering it cancels.
   pub(crate) fn post(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, awaiting: Vec<String>, reply: Reply) {
+    let deadline = Deadline::new(call.key(), self.timeout_of(space));
+    let answering = Rc::clone(&deadline);
+    let reply: Reply = Box::new(move |settled| {
+      answering.answered();
+      reply(settled)
+    });
+    self.take(space, Taken { actor, call, input, awaiting, deadline, reply })
+  }
+
+  // A call taken: refused by a stopped space; a GET held while its space
+  // initializes and read once it is ready; an op queued in the log. Its
+  // deadline begins now, unless its space is still starting.
+  pub(crate) fn take(self: &Rc<Self>, space: &Rc<Space>, taken: Taken) {
     if let Err(error) = accepting(space) {
-      return reply(Err(error));
+      return (taken.reply)(Err(error));
     }
-    if !call.writes() {
-      return self.read(space, actor, call, input, awaiting, reply);
+    if !matches!(space.run_state(), RunState::Initializing { .. }) {
+      taken.deadline.begin(self);
     }
+    match (taken.call.writes(), space.run_state()) {
+      (true, _) => self.queue(space, taken),
+      (false, RunState::Initializing { .. }) => self.hold(space, taken),
+      (false, _) => self.read(space, taken),
+    }
+  }
+
+  // Log an op to wait its turn; should its caller's deadline pass first, the
+  // caller is answered and the op refused when its turn comes.
+  fn queue(self: &Rc<Self>, space: &Rc<Space>, taken: Taken) {
+    let Taken { actor, call, input, awaiting, deadline, reply } = taken;
     let op = self.stamp(&actor, &call, &input, &space.runs.package);
-    space.wait_for(&op.hash, awaiting, reply);
+    let (here, hash) = (Rc::clone(space), op.hash.clone());
+    deadline.waiting(Box::new(move |error| here.give_up(&hash, error)));
+    space.wait_for(&op.hash, awaiting, reply, deadline);
     self.log(space, LogRow::new(op));
+  }
+
+  // The timeout a call to a space must settle within: its service's, once
+  // this device has its package, compiled or compiling; the default before.
+  fn timeout_of(&self, space: &Space) -> std::time::Duration {
+    space.service().or_else(|| self.services().find(&space.runs.package)).map_or(services::DEFAULT_TIMEOUT, |service| service.timeout)
   }
 
   // Write a row to a space's log, then apply what is pending.
@@ -89,18 +139,14 @@ impl Carbon {
   }
 
   // Apply a space's pending ops in turn, until one is still applying, none is
-  // pending, its service is not set up yet, or it stops.
+  // pending, or the space is not ready.
   pub(crate) fn drain(self: &Rc<Self>, space: &Rc<Space>) {
     if space.draining.replace(true) {
       return;
     }
-    while matches!(space.run_state(), RunState::Idle | RunState::Initializing { .. }) {
+    while space.run_state() == RunState::Idle {
       if let Err(failure) = between_turns(space) {
         self.stop(space, failure);
-        break;
-      }
-      self.initialize(space);
-      if space.run_state() != RunState::Idle {
         break;
       }
       match oplog::next_pending(space.store()) {
@@ -112,29 +158,22 @@ impl Carbon {
     space.draining.set(false);
   }
 
-  // Move a space between Initializing and Idle: Initializing while its
-  // service is not set up here.
-  fn initialize(self: &Rc<Self>, space: &Space) {
-    let state = match space.not_set_up() {
-      None => RunState::Idle,
-      Some(service) => RunState::Initializing { services: vec![service] },
-    };
-    if space.run_state() != state {
-      self.set_run_state(space, state);
-    }
-  }
-
   // Apply one op, with the version of its service it was made for: a first
-  // run, or a replay of the effects its row carries.
+  // run, or a replay of the effects its row carries. An op its caller gave
+  // up on is refused with what the caller got.
   fn apply(self: &Rc<Self>, space: &Rc<Space>, row: LogRow) {
+    if let Some(expired) = space.expired(&row.op.hash) {
+      return self.refuse(space, &row.op, expired);
+    }
     let call = match Call::from_key(&row.op.key) {
       Ok(call) => call,
       Err(error) => return self.refuse(space, &row.op, error),
     };
     match self.same_version(space, &call, &row.op) {
       Ok(()) => {
+        let deadline = space.deadline_of(&row.op.hash);
         if let Some(service_call) = self.begin(space, row.op, call, row.effects) {
-          self.start(service_call);
+          self.start(service_call, deadline);
         }
       }
       Err(error) => self.refuse(space, &row.op, error),
@@ -239,16 +278,21 @@ impl Carbon {
     space.op_writer.discard();
     self.set_run_state(space, RunState::Stopped { error: failure.clone() });
     space.answer_all(&stopped(&space.id, &failure));
+    self.release(&space.id);
   }
 
-  // Resume a stopped space once its failure is fixed: its pending ops apply
-  // again from the first, the op that was applying when it stopped included.
-  // Returns the watches it ran again.
+  // Resume a stopped space once its failure is fixed: one never set up
+  // initializes again; any other applies its pending ops again from the
+  // first, the op that was applying when it stopped included. Returns the
+  // watches it ran again.
   pub fn resume(self: &Rc<Self>, space: &Rc<Space>) -> Vec<WatchId> {
     if !matches!(space.run_state(), RunState::Stopped { .. }) {
       return vec![];
     }
     space.store().clear_failure();
+    if space.service().is_none() {
+      return self.initialize(space);
+    }
     let rerun = self.set_run_state(space, RunState::Idle);
     self.drain(space);
     rerun
@@ -266,9 +310,10 @@ impl Carbon {
     Err(conflict(format!("{} was made with version {} of [{}], and this device runs version {}", op.key, op.version, service.name, service.version)))
   }
 
-  // Run a GET on its own snapshot of committed state. A system failure met on
-  // the way stops the space, as an op's would.
-  fn read(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, awaiting: Vec<String>, reply: Reply) {
+  // Run a GET on its own snapshot of committed state, under its deadline. A
+  // system failure met on the way stops the space, as an op's would.
+  pub(crate) fn read(self: &Rc<Self>, space: &Rc<Space>, taken: Taken) {
+    let Taken { actor, call, input, awaiting, deadline, reply } = taken;
     let reader = match space.store().reader() {
       Ok(reader) => Rc::new(reader),
       Err(error) => return self.answer_read(space, reply, Err(error)),
@@ -281,7 +326,7 @@ impl Carbon {
       let tables = snapshot.end();
       carbon.answer_read(&here, reply, result.and_then(|value| Ok(Settled { value, tables: tables?, watches: vec![] })));
     });
-    self.start(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, effects, awaiting, live, settle));
+    self.start(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, effects, awaiting, live, settle), Some(deadline));
   }
 
   fn answer_read(self: &Rc<Self>, space: &Space, reply: Reply, settled: Result<Settled>) {
@@ -291,13 +336,14 @@ impl Carbon {
     reply(settled)
   }
 
-  // Hand a call to its service, under the deadline its service's timeout sets.
-  // The timer keeps the call until it settles, so a handler that drops it is
-  // still settled.
-  fn start(&self, service_call: Rc<ServiceCall>) {
+  // Hand a call to its service, under its caller's deadline, or, for an op
+  // no caller waits on, one its service's timeout sets now. The deadline
+  // keeps the call until it settles, so a handler that drops it is still
+  // settled.
+  fn start(&self, service_call: Rc<ServiceCall>, deadline: Option<Rc<Deadline>>) {
     if let Ok(service) = answering(self, service_call.space(), &service_call.call) {
-      let (expiring, timeout) = (Rc::clone(&service_call), service.timeout);
-      service_call.set_deadline(self.after(timeout, Box::new(move || expiring.expire(timeout))));
+      let deadline = deadline.unwrap_or_else(|| Deadline::arm(self, service_call.call.key(), service.timeout));
+      service_call.set_deadline(deadline);
     }
     self.route(service_call);
   }
@@ -371,12 +417,9 @@ pub(crate) fn accepting(space: &Space) -> Result<()> {
   }
 }
 
-// Between two ops: write the ops that arrived while the last applied, and set
-// up the services that waited for it. A service whose set-up fails stays
-// unset, which holds the space's ops back until it is registered again.
+// Between two ops: write the ops that arrived while the last applied.
 fn between_turns(space: &Rc<Space>) -> Result<()> {
   space.op_writer.write_held(space.store())?;
-  let _ = space.set_up_awaiting();
   space.store().failure().map_or(Ok(()), Err)
 }
 

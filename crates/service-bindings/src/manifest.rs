@@ -6,6 +6,10 @@
 //! ```toml
 //! name = "space"     # its canonical name; the name a host registers it under overrides it
 //! timeout = 200      # milliseconds every call to it must settle within; the core defaults it
+//! health = "/health" # a GET each of its spaces answers once set up; it is ready when the GET
+//!                    # answers without an error, and ready once set up when it names none
+//! startup_timeout = 10000 # milliseconds each of its spaces may take to start: compiling its
+//!                    # package, its setup and its health check; the core defaults it
 //!
 //! [[sql]]
 //! binding = "db"     # the storage it asks for; how it shapes it is its own `setup`'s concern
@@ -35,6 +39,10 @@ pub struct Manifest {
   pub name: String,
   #[serde(default)]
   pub timeout: Option<u64>,
+  #[serde(default)]
+  pub health: Option<String>,
+  #[serde(default)]
+  pub startup_timeout: Option<u64>,
   #[serde(default)]
   pub sql: Vec<Sql>,
   #[serde(default)]
@@ -71,6 +79,9 @@ impl Manifest {
     let manifest: Manifest = toml::from_str(text).map_err(|error| format!("Malformed service.toml: {error}"))?;
     if manifest.sql.len() > 1 {
       return Err("A service declares at most one sql binding, since its tables, op log and results share one file".into());
+    }
+    if manifest.health.as_ref().is_some_and(|path| !path.starts_with('/')) {
+      return Err("A service's health check is a path on it, starting with /, such as \"/health\"".into());
     }
     Ok(manifest)
   }
@@ -145,7 +156,7 @@ mod tests {
   #[test]
   fn reads_a_name_a_timeout_and_at_most_one_sql_binding_by_name() {
     let manifest = Manifest::parse("name = \"space\"\ntimeout = 50\n[[sql]]\nbinding = \"db\"\n").unwrap();
-    assert_eq!(manifest, Manifest { name: "space".into(), timeout: Some(50), sql: vec![Sql { binding: "db".into() }], effects: BTreeMap::new() });
+    assert_eq!(manifest, Manifest { name: "space".into(), timeout: Some(50), health: None, startup_timeout: None, sql: vec![Sql { binding: "db".into() }], effects: BTreeMap::new() });
     assert_eq!(manifest.binding(), Some("db"));
     let bare = Manifest::parse("name = \"carbon\"\n").unwrap();
     assert_eq!((bare.timeout, bare.binding()), (None, None));
@@ -161,6 +172,13 @@ mod tests {
     for text in refused {
       assert!(Manifest::parse(text).is_err(), "{text}");
     }
+  }
+
+  #[test]
+  fn reads_a_health_check_as_a_path_on_the_service() {
+    let manifest = Manifest::parse("name = \"identity\"\nhealth = \"/health\"\nstartup_timeout = 2000\n").unwrap();
+    assert_eq!((manifest.health.as_deref(), manifest.startup_timeout), (Some("/health"), Some(2000)));
+    assert!(Manifest::parse("name = \"identity\"\nhealth = \"health\"\n").is_err(), "a path starts with /");
   }
 
   #[test]

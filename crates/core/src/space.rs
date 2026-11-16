@@ -21,6 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::call_window::CallWindow;
+use crate::deadline::Deadline;
 use crate::dispatch::{Reply, Settled};
 use crate::error::{Result, ServiceError, conflict, internal, not_found};
 use crate::ops::op_writer::OpWriter;
@@ -40,10 +41,10 @@ pub const MIGRATIONS: &[Migration] = &[
   ("space/0004_effects", include_str!("../migrations/space/0004_effects.sql")),
 ];
 
-// Where a space is in applying its ops: initializing until its service is
-// registered and set up here, then idle, or applying one; or stopped by a
-// system failure until it is fixed by hand and resumed. Its ops wait in every
-// state but idle.
+// Where a space is in applying its ops: initializing until its package is
+// here and compiled, set up and healthy (`crate::lifecycle`), then idle, or
+// applying one; or stopped, with why, until it is resumed. Its ops wait in
+// every state but idle.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum RunState {
@@ -68,14 +69,16 @@ pub struct Space {
   root: bool,
   store: Store,
   pub runs: Runs,
-  // Its service, once registered and set up here; until then its ops wait.
+  // Its service, once set up here; until then its ops wait.
   service: RefCell<Option<Rc<Service>>>,
-  // Its service, registered while an op applied, to set up once that op is done.
-  registered: RefCell<Option<Rc<Service>>>,
   pub(crate) op_writer: OpWriter,
-  // The callers waiting on an op's result, by op hash. An op resumed from the
-  // log has none.
+  // The callers waiting on an op's result, by op hash, and the deadline each
+  // was taken under. An op resumed from the log has none.
   waiting_ops: RefCell<HashMap<String, Reply>>,
+  deadlines: RefCell<HashMap<String, Rc<Deadline>>>,
+  // The ops whose callers' deadlines passed before they ran, with the 504
+  // their callers got: each is refused with it when its turn comes.
+  expired: RefCell<HashMap<String, ServiceError>>,
   // The spaces whose ops wait on an op, by op hash, when another service's
   // call posted it: a write it posts back into one of them would wait forever.
   awaiting: RefCell<HashMap<String, Vec<String>>>,
@@ -115,9 +118,10 @@ impl Space {
       store,
       runs,
       service: RefCell::default(),
-      registered: RefCell::default(),
       op_writer: OpWriter::default(),
       waiting_ops: RefCell::default(),
+      deadlines: RefCell::default(),
+      expired: RefCell::default(),
       awaiting: RefCell::default(),
       run_state: RefCell::new(RunState::Idle),
       draining: Cell::new(false),
@@ -143,11 +147,6 @@ impl Space {
     call.confined == self.root && call.service == self.runs.name
   }
 
-  // The service this space waits for, until it is set up here.
-  pub fn not_set_up(&self) -> Option<String> {
-    self.service.borrow().is_none().then(|| self.runs.package.clone())
-  }
-
   pub fn run_state(&self) -> RunState {
     self.run_state.borrow().clone()
   }
@@ -160,12 +159,40 @@ impl Space {
     matches!(*self.run_state.borrow(), RunState::Applying { .. })
   }
 
-  // Wait for an op's result, posted by a call that the ops of these spaces wait on.
-  pub(crate) fn wait_for(&self, op: &str, awaiting: Vec<String>, reply: Reply) {
+  // Wait for an op's result, posted under `deadline` by a call that the ops
+  // of these spaces wait on.
+  pub(crate) fn wait_for(&self, op: &str, awaiting: Vec<String>, reply: Reply, deadline: Rc<Deadline>) {
     self.waiting_ops.borrow_mut().insert(op.to_string(), reply);
+    self.deadlines.borrow_mut().insert(op.to_string(), deadline);
     if !awaiting.is_empty() {
       self.awaiting.borrow_mut().insert(op.to_string(), awaiting);
     }
+  }
+
+  // The deadlines of the ops waiting here for their callers, to begin once the space is ready.
+  pub(crate) fn waiting_deadlines(&self) -> Vec<Rc<Deadline>> {
+    self.deadlines.borrow().values().cloned().collect()
+  }
+
+  // The deadline an op's caller took it under, as the op begins.
+  pub(crate) fn deadline_of(&self, op: &str) -> Option<Rc<Deadline>> {
+    self.deadlines.borrow_mut().remove(op)
+  }
+
+  // An op's caller's deadline passed before it ran: answer the caller, and
+  // refuse the op with the same failure when its turn comes.
+  pub(crate) fn give_up(&self, op: &str, error: ServiceError) {
+    self.deadlines.borrow_mut().remove(op);
+    let waiting = self.waiting_ops.borrow_mut().remove(op);
+    if let Some(reply) = waiting {
+      self.expired.borrow_mut().insert(op.to_string(), error.clone());
+      reply(Err(error))
+    }
+  }
+
+  // Why an op is refused before it runs, when its caller gave up on it.
+  pub(crate) fn expired(&self, op: &str) -> Option<ServiceError> {
+    self.expired.borrow_mut().remove(op)
   }
 
   // The spaces whose ops wait on an op, as it begins.
@@ -175,6 +202,7 @@ impl Space {
 
   // Answer whoever waits on an op's result.
   pub(crate) fn answer(&self, op: &str, settled: Result<Settled>) {
+    self.deadlines.borrow_mut().remove(op);
     let waiting = self.waiting_ops.borrow_mut().remove(op);
     if let Some(reply) = waiting {
       reply(settled)
@@ -183,6 +211,7 @@ impl Space {
 
   // Answer everyone waiting on this space's ops with the same failure.
   pub(crate) fn answer_all(&self, error: &ServiceError) {
+    self.deadlines.borrow_mut().clear();
     let waiting = std::mem::take(&mut *self.waiting_ops.borrow_mut());
     for reply in waiting.into_values() {
       reply(Err(error.clone()))
@@ -190,13 +219,9 @@ impl Space {
   }
 
   // Set up its service here: its `setup` in a transaction of its own, outside
-  // any op, then the check every table's keys must pass. While an op is
-  // applying, it waits until that op is done.
+  // any op, then the check every table's keys must pass. A space is set up
+  // only while it initializes, so no op is applying.
   pub fn set_up(self: &Rc<Self>, service: &Rc<Service>) -> Result<()> {
-    if self.is_applying() {
-      self.registered.replace(Some(Rc::clone(service)));
-      return Ok(());
-    }
     self.store.write(|store| {
       let binding = Rc::new(DbBinding { space: Rc::clone(self), window: CallWindow { service: true, op: None }, open: Cell::new(true) });
       let initialized = (service.setup)(Rc::clone(&binding) as Rc<dyn Db>);
@@ -206,12 +231,6 @@ impl Space {
     })?;
     self.service.replace(Some(Rc::clone(service)));
     Ok(())
-  }
-
-  // Set up the service that was registered while an op applied.
-  pub(crate) fn set_up_awaiting(self: &Rc<Self>) -> Result<()> {
-    let registered = self.registered.take();
-    registered.iter().try_for_each(|service| self.set_up(service))
   }
 }
 
@@ -316,11 +335,11 @@ mod tests {
   #[test]
   fn sets_up_its_one_service_through_its_init_under_plain_names() {
     let (_directory, space) = space();
-    assert_eq!(space.not_set_up(), Some("notes".into()));
+    assert_eq!(space.service().map(|service| service.name.clone()), None);
     let notes = service("notes", "CREATE TABLE IF NOT EXISTS note (id TEXT PRIMARY KEY, text TEXT) WITHOUT ROWID");
     space.set_up(&notes).unwrap();
     space.set_up(&notes).unwrap();
-    assert_eq!(space.not_set_up(), None);
+    assert_eq!(space.service().map(|service| service.name.clone()), Some("notes".into()));
     assert_eq!(space.store().all("SELECT id, text FROM note", &[]).unwrap(), Vec::<Value>::new());
     let answered: Vec<bool> = ["GET [notes]/texts", "GET [chat]/messages", "GET [@notes]/texts"].iter().map(|key| space.answers(&Call::from_key(key).unwrap())).collect();
     assert_eq!(answered, [true, false, false]);
@@ -332,6 +351,6 @@ mod tests {
     let error = space.set_up(&service("notes", "CREATE TABLE note (id INTEGER PRIMARY KEY, text TEXT)")).unwrap_err();
     assert_eq!((error.status, error.details), (400, Some(json!({"table": "note"}))));
     assert!(space.store().get("SELECT name FROM sqlite_schema WHERE name = 'note'", &[]).unwrap().is_null());
-    assert_eq!(space.not_set_up(), Some("notes".into()));
+    assert_eq!(space.service().map(|service| service.name.clone()), None);
   }
 }

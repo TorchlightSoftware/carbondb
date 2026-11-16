@@ -112,7 +112,7 @@ mod tests {
   fn config() -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("carbondb.toml");
-    std::fs::write(&path, "system = \"data/system.db\"\n[sync]\nmode = \"none\"\n").unwrap();
+    std::fs::write(&path, crate::testing::config()).unwrap();
     (directory, path)
   }
 

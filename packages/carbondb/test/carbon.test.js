@@ -1,6 +1,6 @@
 import {describe, it, before, after, beforeEach} from 'node:test'
 import assert from 'node:assert'
-import {mkdtempSync, writeFileSync} from 'node:fs'
+import {mkdtempSync, readFileSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {spawn} from 'node:child_process'
 import {createServer} from 'node:http'
@@ -8,12 +8,20 @@ import {createServer as createTcpServer} from 'node:net'
 import {once} from 'node:events'
 import {dirname, join} from 'node:path'
 import {configure} from '../src/index.js'
+import {packageComponent} from '../src/native.js'
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // A test service's package: the component `pretest` built from its source
 // under fixtures/, with its service.toml.
 const component = (name) => new URL(`../fixtures/${name}/${name}.wasm`, import.meta.url)
+
+// A package's bytes with a custom section of its own appended, so its version
+// is new and this process compiles it afresh.
+const afresh = (bytes) => {
+  const name = new TextEncoder().encode(`carbondb:test:${Date.now()}:${Math.random()}`)
+  return Uint8Array.from([...bytes, 0, name.length + 1, name.length, ...name])
+}
 
 function configFile(text = 'system = "data/system.db"\n[sync]\nmode = "none"\n') {
   const directory = mkdtempSync(join(tmpdir(), 'carbondb-'))
@@ -24,7 +32,7 @@ function configFile(text = 'system = "data/system.db"\n[sync]\nmode = "none"\n')
 
 async function start(path) {
   const carbon = await configure(path)
-  carbon.services.add('notes', component('notes'))
+  await carbon.services.add('notes', component('notes'))
   return carbon
 }
 
@@ -82,23 +90,41 @@ describe('identities', () => {
 })
 
 describe('services', () => {
-  it('refuses registering a service twice, or under a CarbonDB service name', () => {
-    assert.throws(() => carbon.services.add('notes', component('notes')), {status: 409})
-    assert.throws(() => carbon.services.add('channel', component('notes')), {status: 409})
+  it('refuses registering a service twice, or under a CarbonDB service name', async () => {
+    await assert.rejects(carbon.services.add('notes', component('notes')), {status: 409})
+    await assert.rejects(carbon.services.add('channel', component('notes')), {status: 409})
   })
 
   it('hands a handler its binding in env, under the name its service.toml gives it', async () => {
-    carbon.services.add('stash', component('stash'))
+    await carbon.services.add('stash', component('stash'))
     const stash = await channelIn(personal, {name: 'Stash', services: ['stash']})
     await stash.call('POST [stash]/items', {name: 'kept'})
     assert.deepStrictEqual(await stash.call('GET [stash]/items'), {bindings: ['store'], items: [{name: 'kept'}]})
   })
 
-  it('refuses what is not a component carrying a service.toml, and a package it cannot read', () => {
+  it('refuses what is not a component carrying a service.toml, and a package it cannot read', async () => {
     const unpackaged = Uint8Array.from([0, 0x61, 0x73, 0x6d, 0x0d, 0, 1, 0])
-    assert.throws(() => carbon.services.add('bare', unpackaged), {status: 400, message: /carries no service.toml/})
-    assert.throws(() => carbon.services.add('text', new TextEncoder().encode('name = "text"')), {status: 400, message: /Not a WebAssembly component/})
-    assert.throws(() => carbon.services.add('lost', component('lost')), {code: 'ENOENT'})
+    await assert.rejects(carbon.services.add('bare', unpackaged), {status: 400, message: /carries no service.toml/})
+    await assert.rejects(carbon.services.add('text', new TextEncoder().encode('name = "text"')), {status: 400, message: /Not a WebAssembly component/})
+    await assert.rejects(carbon.services.add('lost', component('lost')), {code: 'ENOENT'})
+  })
+
+  it('refuses a component that does not compile once it has tried, leaving its name free', async () => {
+    const broken = packageComponent(Uint8Array.from([0, 0x61, 0x73, 0x6d, 0x0d, 0, 1, 0, 0x7f, 1, 0]), 'name = "broken"\n')
+    await assert.rejects(carbon.services.add('broken', broken), {status: 400, message: /Not a component this host can run/})
+    await assert.rejects(carbon.services.add('broken', broken), {status: 400}, 'refused again, not as a name already taken')
+  })
+
+  it('holds the calls to a service until it has compiled, however long that takes against their own timeout, then answers them', async () => {
+    // [stash] gives a call 200 ms, less than this process takes to compile it afresh.
+    const adding = carbon.services.add('stash', afresh(readFileSync(component('stash'))))
+    const stash = await channelIn(personal, {name: 'Stash', services: ['stash']})
+    assert.strictEqual((await stash.call('GET [@carbon]/status', {service: 'stash'})).state, 'initializing')
+    const [wrote, read] = [stash.call('POST [stash]/items', {name: 'early'}), stash.call('GET [stash]/items')]
+    await adding
+    await wrote
+    assert.deepStrictEqual((await read).items, [{name: 'early'}])
+    assert.strictEqual((await stash.call('GET [@carbon]/status', {service: 'stash'})).state, 'idle')
   })
 
   it('refuses an identity or channel naming a service this device has not registered', async () => {
@@ -106,14 +132,17 @@ describe('services', () => {
     await assert.rejects(personal.call('POST [channel]/services', {name: 'crm'}), {status: 404, details: {service: 'crm'}})
   })
 
-  it('keeps data across a restart that registers the service again, and holds its calls back when it does not', async () => {
+  it('keeps data across a restart that registers the service again, and stops its spaces until it does', async () => {
     await personal.call('POST [notes]/notes', {text: 'kept'})
     const restarted = (await start(config)).ref('identity:alice').ref('personal:alice')
     assert.deepStrictEqual(await texts(restarted), ['kept', 'kept again'])
-    const unregistered = (await configure(config)).ref('identity:alice').ref('personal:alice')
-    await assert.rejects(unregistered.call('GET [notes]/notes'), {status: 404, details: {service: 'notes'}})
-    assert.deepStrictEqual(unregistered.runState('notes'), {state: 'initializing', services: ['notes']})
+    const bare = await configure(config)
+    const unregistered = bare.ref('identity:alice').ref('personal:alice')
+    await assert.rejects(unregistered.call('GET [notes]/notes'), (error) => [error.status, error.code, error.details.failure.code].join() === '503,SPACE_STOPPED,PACKAGE_UNAVAILABLE')
+    assert.strictEqual(unregistered.runState('notes').state, 'stopped')
     assert.deepStrictEqual(unregistered.runState(), {state: 'idle'})
+    await bare.services.add('notes', component('notes'))
+    assert.deepStrictEqual(await texts(unregistered), ['kept', 'kept again'], 'adding its package initializes it again')
   })
 })
 
@@ -241,7 +270,7 @@ describe('fetch', () => {
   after(() => world.close())
   beforeEach(async () => {
     world.asked.length = 0
-    carbon.services.add('fetcher', component('fetcher'))
+    await carbon.services.add('fetcher', component('fetcher'))
     fetcher = await channelIn(personal, {name: 'Outside', services: ['fetcher']})
   })
 
@@ -290,7 +319,7 @@ describe('channels', () => {
     const status = await room.call('GET [@carbon]/status')
     assert.deepStrictEqual(
       {name: status.name, services: status.services, access: status.access, sync: status.sync, peers: status.peers},
-      {name: "Randall's Playhouse", services: [{name: 'notes', access: ['manage'], sync: 'off'}], access: ['manage'], sync: 'off', peers: []}
+      {name: "Randall's Playhouse", services: [{name: 'notes', access: ['manage'], sync: 'off', state: 'idle'}], access: ['manage'], sync: 'off', peers: []}
     )
     await room.call('POST [notes]/notes', {text: 'in the room'})
     assert.deepStrictEqual(await texts(room), ['in the room', 'in the room again'])
@@ -434,12 +463,12 @@ describe('schema', () => {
   it("is set up by a service's setup, which applies only the migrations not applied yet", async () => {
     await personal.call('POST [notes]/tags', {name: 'red'})
     const restarted = await configure(config)
-    restarted.services.add('notes', component('grown'))
+    await restarted.services.add('notes', component('grown'))
     assert.deepStrictEqual(await restarted.ref('identity:alice').ref('personal:alice').call('GET [notes]/tags'), [{name: 'red', color: 'none'}])
   })
 
   it('refuses a service whose table takes its keys from SQLite, and says how to fix it', async () => {
-    carbon.services.add('counter', component('counter'))
+    await carbon.services.add('counter', component('counter'))
     await assert.rejects(personal.call('POST [channel]/services', {name: 'counter'}), (error) => {
       assert.deepStrictEqual([error.status, error.details], [400, {table: 'hit'}])
       assert.match(error.message, /must come from the op that creates it.*op_id\(\)/)
@@ -448,7 +477,7 @@ describe('schema', () => {
   })
 
   it("keeps a service out of the core's own tables in its file", async () => {
-    carbon.services.add('snoop', component('snoop'))
+    await carbon.services.add('snoop', component('snoop'))
     const room = await channelIn(personal, {name: 'Snooped', services: ['snoop']})
     await assert.rejects(room.call('GET [snoop]/log'), {status: 403})
   })

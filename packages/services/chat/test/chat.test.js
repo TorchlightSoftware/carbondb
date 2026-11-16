@@ -19,7 +19,7 @@ function configFile() {
 // channel running [chat], made on the first start and found again on later ones.
 async function start(config) {
   const carbon = await configure(config)
-  carbon.services.add('chat', component)
+  await carbon.services.add('chat', component)
   const identities = await carbon.call('GET [@carbon]/identities')
   const known = identities.some((identity) => identity.slug === 'app')
   if (known) {
@@ -102,7 +102,7 @@ describe('errors', () => {
 describe('status', () => {
   it('describes the lobby: its name, services and single-node state', async () => {
     const {kind, name, services, access, sync, peers} = await lobby.call('GET [@carbon]/status')
-    assert.deepStrictEqual({kind, name, services, access, sync, peers}, {kind: 'channel', name: 'Lobby', services: [{name: 'chat', access: ['manage'], sync: 'off'}], access: ['manage'], sync: 'off', peers: []})
+    assert.deepStrictEqual({kind, name, services, access, sync, peers}, {kind: 'channel', name: 'Lobby', services: [{name: 'chat', access: ['manage'], sync: 'off', state: 'idle'}], access: ['manage'], sync: 'off', peers: []})
   })
 })
 

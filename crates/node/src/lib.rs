@@ -12,7 +12,8 @@
 //!   and the core answers each run, until `unwatch`. The core keeps every
 //!   watch; JS only hands answers to the app.
 //! - JS registers a service with `register`: the bytes of its package, a
-//!   component carrying its service.toml.
+//!   component carrying its service.toml, answered once it has compiled, off
+//!   the core's thread.
 //!
 //! Every later answer crosses back to Node's thread through one courier, a
 //! thread-safe function JS gave at open, in the order the core gave them, with
@@ -83,11 +84,18 @@ impl Carbon {
     }
   }
 
-  // Register a service under a name: the bytes of its package.
+  // Register a service under a name: the bytes of its package; answered at
+  // `id` once its component has compiled.
   #[napi]
-  pub fn register(&self, name: String, package: Buffer) -> Result<()> {
-    let bytes = package.to_vec();
-    self.runtime.ask(move |carbon| carbon.register(core::wasm::Package::read(&bytes)?.service(&name))).map_err(to_napi)
+  pub fn register(&self, name: String, package: Buffer, id: u32) {
+    let (bytes, courier) = (package.to_vec(), Arc::clone(&self.courier));
+    self.runtime.with(move |carbon| {
+      let added = Box::new(move |result: core::Result<()>| deliver(&courier, id, result.map(|_| Value::Null)));
+      match core::wasm::Package::read(&bytes) {
+        Ok(package) => carbon.add(&name, package, added),
+        Err(error) => added(Err(error)),
+      }
+    });
   }
 
   // Make a call by its service key on a channel, or on the system handle when

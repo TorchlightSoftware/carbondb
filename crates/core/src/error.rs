@@ -46,7 +46,7 @@ pub(crate) fn system_failure(message: impl Into<String>) -> ServiceError {
 
 // What a call to a stopped space fails with: a 503 carrying the failure that stopped it.
 pub(crate) fn stopped(space: &str, failure: &ServiceError) -> ServiceError {
-  ServiceError::new(503, "SPACE_STOPPED", format!("Space {space} stopped after a system failure, and applies nothing until it is resumed: {}", failure.message))
+  ServiceError::new(503, "SPACE_STOPPED", format!("Space {space} stopped, and applies nothing until it is resumed: {}", failure.message))
     .with_details(serde_json::json!({"failure": failure}))
 }
 
