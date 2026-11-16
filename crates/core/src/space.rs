@@ -71,11 +71,14 @@ pub struct Space {
   // Its service, once registered and set up here; until then its ops wait.
   service: RefCell<Option<Rc<Service>>>,
   // Its service, registered while an op applied, to set up once that op is done.
-  awaiting: RefCell<Option<Rc<Service>>>,
+  registered: RefCell<Option<Rc<Service>>>,
   pub(crate) op_writer: OpWriter,
   // The callers waiting on an op's result, by op hash. An op resumed from the
   // log has none.
   waiting_ops: RefCell<HashMap<String, Reply>>,
+  // The spaces whose ops wait on an op, by op hash, when another service's
+  // call posted it: a write it posts back into one of them would wait forever.
+  awaiting: RefCell<HashMap<String, Vec<String>>>,
   run_state: RefCell<RunState>,
   // Whether pending ops are being applied further up the stack, since an op
   // can settle while it is being started.
@@ -112,9 +115,10 @@ impl Space {
       store,
       runs,
       service: RefCell::default(),
-      awaiting: RefCell::default(),
+      registered: RefCell::default(),
       op_writer: OpWriter::default(),
       waiting_ops: RefCell::default(),
+      awaiting: RefCell::default(),
       run_state: RefCell::new(RunState::Idle),
       draining: Cell::new(false),
     })
@@ -156,8 +160,17 @@ impl Space {
     matches!(*self.run_state.borrow(), RunState::Applying { .. })
   }
 
-  pub(crate) fn wait_for(&self, op: &str, reply: Reply) {
+  // Wait for an op's result, posted by a call that the ops of these spaces wait on.
+  pub(crate) fn wait_for(&self, op: &str, awaiting: Vec<String>, reply: Reply) {
     self.waiting_ops.borrow_mut().insert(op.to_string(), reply);
+    if !awaiting.is_empty() {
+      self.awaiting.borrow_mut().insert(op.to_string(), awaiting);
+    }
+  }
+
+  // The spaces whose ops wait on an op, as it begins.
+  pub(crate) fn awaiting(&self, op: &str) -> Vec<String> {
+    self.awaiting.borrow_mut().remove(op).unwrap_or_default()
   }
 
   // Answer whoever waits on an op's result.
@@ -181,7 +194,7 @@ impl Space {
   // applying, it waits until that op is done.
   pub fn set_up(self: &Rc<Self>, service: &Rc<Service>) -> Result<()> {
     if self.is_applying() {
-      self.awaiting.replace(Some(Rc::clone(service)));
+      self.registered.replace(Some(Rc::clone(service)));
       return Ok(());
     }
     self.store.write(|store| {
@@ -197,8 +210,8 @@ impl Space {
 
   // Set up the service that was registered while an op applied.
   pub(crate) fn set_up_awaiting(self: &Rc<Self>) -> Result<()> {
-    let awaiting = self.awaiting.take();
-    awaiting.iter().try_for_each(|service| self.set_up(service))
+    let registered = self.registered.take();
+    registered.iter().try_for_each(|service| self.set_up(service))
   }
 }
 

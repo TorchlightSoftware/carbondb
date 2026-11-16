@@ -1,7 +1,8 @@
 //! `[@carbon]`, the device's local service: host code that runs once, on this
-//! device, and never replicates. It answers only on the system handle: it
-//! founds and lists the identities here, and reads the status of, syncs, or
-//! deletes this device's copy of a channel or a service, named in its input.
+//! device, and never replicates. It runs in the system: on the system handle
+//! it founds and lists the identities here; on a channel's handle, acting as
+//! that handle's identity, it reads the status of, syncs, or deletes this
+//! device's copy of the channel, or of one service it names.
 //!
 //! It is part of the core, not a service like the others: it reaches keys,
 //! space files and the system database directly. Everything it changes in a
@@ -58,7 +59,8 @@ fn entry(call: Rc<ServiceCall>) {
   }
 }
 
-// The channel or the service a call about this device's copy names.
+// What a call about this device's copy is about: the channel whose handle it
+// was made on, and one service that channel names, or the channel itself.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Target {
@@ -68,55 +70,49 @@ struct Target {
 
 fn target(call: &ServiceCall) -> Result<Target> {
   let target: Target = serde_json::from_value(call.input.clone())?;
-  match (&target.channel, &target.service) {
-    (Some(_), None) | (None, Some(_)) => Ok(target),
-    _ => Err(bad_request("Name one channel or one service")),
+  match target.channel {
+    Some(_) => Ok(target),
+    None => Err(bad_request("Make this call on a channel's handle")),
   }
 }
 
-// A channel's or a service's state on this device. Single-node: sync is off,
-// there are no peers, and an identity managing the channel has manage access.
+// A channel's or a service's state on this device, for the acting
+// identity. Single-node: sync is off and there are no peers.
 fn status(call: &ServiceCall, target: &Target) -> Result<Value> {
   let carbon = call.carbon();
-  if let Some(service) = &target.service {
-    let space = carbon.space(service)?;
-    let channel = carbon.channel_of(&space)?;
-    return Ok(json!({"service": service, "name": space.runs.name, "access": access(call, &channel)?, "sync": "off", "peers": []}));
-  }
   let channel = target.channel.clone().unwrap_or_default();
   carbon.space(&channel)?;
-  let origin = carbon.read_tables(&channel, |db| db.get("SELECT kind, name, manage FROM origin", &[]))?;
-  let services = carbon.read_tables(&channel, |db| db.all("SELECT name FROM service ORDER BY name", &[]))?;
   let access = access(call, &channel)?;
+  if let Some(name) = &target.service {
+    carbon.space(&carbon.named(&channel, name)?)?;
+    return Ok(json!({"name": name, "access": access, "sync": "off", "peers": []}));
+  }
+  let origin = carbon.read_tables(&channel, |db| db.get("SELECT kind, name FROM origin", &[]))?;
+  let services = carbon.read_tables(&channel, |db| db.all("SELECT name FROM service ORDER BY name", &[]))?;
   let services: Vec<Value> = services.iter().map(|service| json!({"name": service["name"], "access": access, "sync": "off"})).collect();
   Ok(json!({"channel": channel, "kind": origin["kind"], "name": origin["name"], "access": access, "sync": "off", "peers": [], "services": services}))
 }
 
-// This device's access to a channel's services: manage, when the acting
-// identity, or with none acting, any identity on this device, manages the
-// channel; and otherwise write.
+// The acting identity's access to a channel's services, on this device:
+// manage for a manager, write for anyone else acting, none for no one.
 fn access(call: &ServiceCall, channel: &str) -> Result<Value> {
+  let Some(identity) = &call.actor.identity else { return Ok(json!([])) };
   let manage = call.carbon().read_tables(channel, |db| db.get("SELECT manage FROM origin", &[]))?;
   let managers: Vec<String> = serde_json::from_str(manage["manage"].as_str().unwrap_or("[]"))?;
-  let here: Vec<String> = match &call.actor.identity {
-    Some(identity) => vec![identity.clone()],
-    None => identities::list(call)?.iter().filter_map(|identity| identity["id"].as_str().map(str::to_string)).collect(),
-  };
-  let manages = here.iter().any(|identity| managers.contains(identity));
-  Ok(json!(if manages { ["manage"] } else { ["write"] }))
+  Ok(json!(if managers.contains(identity) { ["manage"] } else { ["write"] }))
 }
 
-// Delete this device's copy of a service, or of a channel and its services.
+// Delete this device's copy of a service the channel names, or of the channel and its services.
 fn delete(call: &ServiceCall, target: &Target) -> Result<Value> {
   let carbon = call.carbon();
-  let held = match (&target.channel, &target.service) {
-    (Some(channel), _) => {
-      carbon.space(channel)?;
-      let services = carbon.read_tables(channel, |db| db.all("SELECT space FROM service", &[]))?;
-      services.iter().filter_map(|service| service["space"].as_str().map(str::to_string)).chain(std::iter::once(channel.clone())).collect()
+  let channel = target.channel.clone().unwrap_or_default();
+  let held = match &target.service {
+    Some(name) => vec![carbon.named(&channel, name)?],
+    None => {
+      carbon.space(&channel)?;
+      let services = carbon.read_tables(&channel, |db| db.all("SELECT space FROM service", &[]))?;
+      services.iter().filter_map(|service| service["space"].as_str().map(str::to_string)).chain(std::iter::once(channel)).collect()
     }
-    (_, Some(service)) => vec![service.clone()],
-    _ => vec![],
   };
   held.iter().try_for_each(|id| carbon.forget(id))?;
   Ok(json!({}))

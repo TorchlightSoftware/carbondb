@@ -8,7 +8,7 @@ use std::rc::Rc;
 use serde_json::{Value, json};
 
 use crate::ops::results::{self, Outcome};
-use crate::testing::{actor, alice, call_now, carbon, on, room, room_channel, service, space_now, texts};
+use crate::testing::{actor, alice, call_now, carbon, now, on, room, room_channel, service, space_now, texts};
 use crate::ops::oplog;
 use crate::{Actor, Db, Routing};
 
@@ -400,11 +400,30 @@ mod channels {
     let playhouse = space_now(&carbon, channel).unwrap();
     assert_eq!(logged(&playhouse), vec!["POST [channel]/origin"]);
     assert_eq!(playhouse.runs.channel.as_deref(), Some(channel), "a channel's space belongs to itself");
-    let status = call_now(&carbon, carbon.system(), &actor(&identity), "GET [@carbon]/status", json!({"channel": channel})).unwrap().value;
+    let status = on(&carbon, channel, &identity, "GET [@carbon]/status", Value::Null).unwrap();
     assert_eq!(
       (&status["name"], &status["kind"], &status["access"], &status["sync"], &status["peers"], &status["services"]),
       (&json!("Randall's Playhouse"), &json!("channel"), &json!(["manage"]), &json!("off"), &json!([]), &json!([]))
     );
+  }
+
+  #[test]
+  fn reports_the_status_of_a_channel_or_one_of_its_services_for_the_identity_acting() {
+    let (_directory, carbon) = carbon();
+    let identity = alice(&carbon);
+    let room = room_channel(&carbon, &identity);
+    let channel = on(&carbon, &room, &identity, "GET [@carbon]/status", Value::Null).unwrap();
+    assert_eq!(channel["services"], json!([{"name": "notes", "access": ["manage"], "sync": "off"}]));
+    let notes = on(&carbon, &room, &identity, "GET [@carbon]/status", json!({"service": "notes"})).unwrap();
+    assert_eq!(notes, json!({"name": "notes", "access": ["manage"], "sync": "off", "peers": []}));
+    let stranger = now(|answer| carbon.call(Some(&room), None, "GET [@carbon]/status", Value::Null, answer)).unwrap();
+    assert_eq!(stranger["access"], json!([]), "no one acting has no access, and no identity's access is borrowed");
+    let refused = [("GET [@carbon]/status", json!({"service": "chat"}), 404), ("GET [@carbon]/status", json!("notes"), 400)];
+    for (key, input, status) in refused {
+      assert_eq!(on(&carbon, &room, &identity, key, input.clone()).unwrap_err().status, status, "{input}");
+    }
+    let system = call_now(&carbon, carbon.system(), &actor(&identity), "GET [@carbon]/status", json!({})).unwrap_err();
+    assert_eq!(system.message, "Make this call on a channel's handle");
   }
 
   #[test]
@@ -461,13 +480,12 @@ mod channels {
       ("POST [channel]/ref", json!({"channel": "c1", "kind": "team", "name": "!!"}), "BAD_REQUEST"),
       ("GET [channel]/nothing", Value::Null, "NOT_FOUND"),
       ("GET [channel]/ref", json!({"kind": "team", "slug": "sales"}), "NOT_FOUND"),
-      ("GET [@carbon]/status", json!({}), "NOT_FOUND"),
+      ("POST [@carbon]/sync/start", Value::Null, "UNREACHABLE"),
     ];
     for (key, input, code) in cases {
       assert_eq!(alice_on(key, input), code, "{key}");
     }
     let system = |key: &str, input: Value| call_now(&carbon, carbon.system(), &actor(&identity), key, input).unwrap_err().code;
-    assert_eq!(system("POST [@carbon]/sync/start", json!({"channel": identity.personal})), "UNREACHABLE");
     assert_eq!(system("GET [@carbon]/status", json!({})), "BAD_REQUEST");
     assert_eq!(system("GET [@carbon]/nothing", Value::Null), "NOT_FOUND");
     assert_eq!(system("GET [channel]/refs", Value::Null), "NOT_FOUND");
@@ -487,12 +505,17 @@ mod channels {
   }
 
   #[test]
-  fn deletes_this_devices_copy_of_a_channel_and_its_services() {
+  fn deletes_this_devices_copy_of_a_service_or_of_a_channel_and_its_services() {
     let (directory, carbon) = carbon();
+    crate::testing::register_script(&carbon, "jots");
     let identity = alice(&carbon);
     let room = room_channel(&carbon, &identity);
-    let notes = service(&carbon, &room, "notes").id.clone();
-    call_now(&carbon, carbon.system(), &actor(&identity), "DELETE [@carbon]/data", json!({"channel": room})).unwrap();
+    on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "jots"})).unwrap();
+    let (notes, jots) = (service(&carbon, &room, "notes").id.clone(), service(&carbon, &room, "jots").id.clone());
+    on(&carbon, &room, &identity, "DELETE [@carbon]/data", json!({"service": "jots"})).unwrap();
+    assert!(!directory.path().join("data").join(format!("{jots}.db")).exists());
+    assert!(directory.path().join("data").join(format!("{notes}.db")).exists());
+    on(&carbon, &room, &identity, "DELETE [@carbon]/data", Value::Null).unwrap();
     for id in [&room, &notes] {
       assert!(!directory.path().join("data").join(format!("{id}.db")).exists(), "{id}");
       assert_eq!(space_now(&carbon, id).err().map(|error| error.status), Some(404), "{id}");
@@ -503,7 +526,7 @@ mod channels {
 mod effects {
   use super::*;
   use crate::ops::effects::Made;
-  use crate::testing::{now, register_script, register_script_making};
+  use crate::testing::{register_script, register_script_making};
 
   // A room running `[notes]` and `[jots]`, and alice.
   fn room_with_jots(always: &[&str]) -> (tempfile::TempDir, Rc<crate::Carbon>, crate::Identity, String) {
@@ -552,6 +575,35 @@ mod effects {
     assert_eq!(oplog::effects(loud.store(), &oplog::entries(loud.store()).unwrap()[0].hash).unwrap(), Some(vec![]), "nothing is recorded");
     late(&carbon, &loud, json!([{"insert": "early"}]), Some(vec![]));
     assert_eq!(logged(&jots), vec!["POST [jots]/run", "POST [jots]/run"]);
+  }
+
+  #[test]
+  fn a_write_back_into_a_service_waiting_on_the_call_is_refused_at_once_and_a_read_is_answered() {
+    let (_directory, carbon, identity, room) = room_with_jots(&[]);
+    let back = |via: Value| json!({"do": [{"insert": "n"}, {"call": "POST [jots]/run", "input": {"do": via}}]});
+    let cases = [
+      ("a write straight back", json!([{"call": "POST [notes]/run", "input": {"do": []}, "catch": true}]), json!([[{"error": 508}]])),
+      ("a write back through a third service", json!([{"call": "POST [loud]/run", "input": {"do": [{"call": "POST [notes]/run", "input": {"do": []}, "catch": true}]}}]), json!([[[{"error": 508}]]])),
+      ("a read back, which never waits and sees what is committed, not the calling op's own write", json!([{"call": "GET [notes]/texts"}]), json!([[["n", "n"]]])),
+    ];
+    for (why, via, expected) in cases {
+      let answered = on(&carbon, &room, &identity, "POST [notes]/run", back(via)).unwrap();
+      assert_eq!(answered, expected, "{why}");
+    }
+  }
+
+  #[test]
+  fn a_refused_founding_leaves_no_channel_or_service_behind() {
+    let (directory, carbon) = carbon();
+    let init = Rc::new(|db: Rc<dyn Db>| db.run("CREATE TABLE IF NOT EXISTS hit (id INTEGER PRIMARY KEY)", &[]).map(|_| ()));
+    carbon.register(crate::Service::replicated("counter", "counter-v1", Some("db"), crate::testing::NOTES_TIMEOUT, init, Rc::new(|_| {}))).unwrap();
+    let input = json!({"slug": "alice", "device": "Pixel9", "services": ["counter"]});
+    let refused = call_now(&carbon, carbon.system(), &Actor::default(), "POST [@carbon]/identity", input).unwrap_err();
+    assert_eq!(refused.details, Some(json!({"table": "hit"})));
+    let files: Vec<String> = std::fs::read_dir(directory.path().join("data")).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().to_string()).filter(|name| name.ends_with(".db")).collect();
+    assert_eq!(files, ["system.db"]);
+    let held = carbon.system().store().reader().unwrap().all("SELECT id FROM carbon_system_space", &[]).unwrap();
+    assert_eq!(held, Vec::<Value>::new());
   }
 
   #[test]

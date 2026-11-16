@@ -27,9 +27,9 @@ use serde_json::{Value, json};
 use crate::dispatch::call_effect;
 use crate::error::{Result, bad_request, not_built, not_found};
 use crate::ops::clock::{self, Clock};
-use crate::ops::effects::Effects;
+use crate::ops::effects::{Effects, Made};
 use crate::ops::op::stamp;
-use crate::ops::oplog::LogRow;
+use crate::ops::oplog::{self, LogRow};
 use crate::config::{Config, SyncMode};
 use crate::service_call::ServiceCall;
 use crate::services::carbon::{self as local, Identity};
@@ -162,12 +162,16 @@ impl Carbon {
   }
 
   // A new space on this device, running a registered package, recorded here
-  // with what it runs.
+  // with what it runs. One whose service fails to set up is deleted again.
   pub(crate) fn create_space(self: &Rc<Self>, id: &str, runs: Runs) -> Result<Rc<Space>> {
     let service = self.services.get(&runs.package)?;
     let created = Rc::new(Space::create(&self.space_path(id), id, runs.clone())?);
     self.system.store().run("INSERT INTO carbon_system_space (id, package, name, channel) VALUES (?, ?, ?, ?)", &[json!(id), json!(runs.package), json!(runs.name), json!(runs.channel)])?;
-    created.set_up(&service)?;
+    if let Err(error) = created.set_up(&service) {
+      drop(created);
+      self.forget(id)?;
+      return Err(error);
+    }
     Ok(self.keep_open(created))
   }
 
@@ -211,6 +215,19 @@ impl Carbon {
     Ok(())
   }
 
+  // Delete the spaces a run created, by the `create` effects it made, and
+  // every space their own ops created in turn.
+  pub(crate) fn unmake(self: &Rc<Self>, made: &[Made]) -> Result<()> {
+    created(made).iter().try_for_each(|id| self.unmake_space(id))
+  }
+
+  fn unmake_space(self: &Rc<Self>, id: &str) -> Result<()> {
+    let rows = oplog::rows(self.space(id)?.store())?;
+    let made: Vec<Made> = rows.into_iter().flat_map(|row| row.effects.unwrap_or_default()).collect();
+    self.unmake(&made)?;
+    self.forget(id)
+  }
+
   // A row another device sent for a space this device holds: once its time is
   // admitted and its space accepts ops, the time moves this device's clock
   // past it, and it is logged like any other op and applied in the shared order.
@@ -246,6 +263,11 @@ impl Carbon {
 // The `create` effect: the space of a new channel or service, created on this
 // device running the package named. A channel's space belongs to itself; a
 // service's to the channel of the space that creates it.
+// The spaces `create` effects made.
+fn created(made: &[Made]) -> Vec<String> {
+  made.iter().filter(|made| made.name == "create").filter_map(|made| made.output.as_ref().ok()?["space"].as_str().map(str::to_string)).collect()
+}
+
 fn create_effect(caller: Rc<ServiceCall>, input: Value, reply: Reply) {
   reply(create(&caller, &input))
 }

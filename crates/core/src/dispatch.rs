@@ -64,14 +64,19 @@ pub type Reply = Box<dyn FnOnce(Result<Settled>)>;
 impl Carbon {
   // Take a call on a space: a GET reads now, anything else is an op that waits its turn.
   pub fn submit(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, reply: Reply) {
+    self.post(space, actor, call, input, vec![], reply)
+  }
+
+  // Take a call that the ops of the spaces in `awaiting` wait on.
+  pub(crate) fn post(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, awaiting: Vec<String>, reply: Reply) {
     if let Err(error) = accepting(space) {
       return reply(Err(error));
     }
     if !call.writes() {
-      return self.read(space, actor, call, input, reply);
+      return self.read(space, actor, call, input, awaiting, reply);
     }
     let op = self.stamp(&actor, &call, &input, &space.runs.package);
-    space.wait_for(&op.hash, reply);
+    space.wait_for(&op.hash, awaiting, reply);
     self.log(space, LogRow::new(op));
   }
 
@@ -161,7 +166,8 @@ impl Carbon {
       carbon.finish(&here, &applied, &later, result, calls, made);
       carbon.drain(&here);
     });
-    Some(ServiceCall::new(self, space, actor(&op), call, op.input.clone(), Conn::Writer, Some(op), effects, live, settle))
+    let awaiting = space.awaiting(&op.hash);
+    Some(ServiceCall::new(self, space, actor(&op), call, op.input.clone(), Conn::Writer, Some(op), effects, awaiting, live, settle))
   }
 
   // An op settled. A late op whose run would not match applying it at its
@@ -176,13 +182,21 @@ impl Carbon {
     if !rewind::fits_in_place(&ran.sets, later) {
       return self.rewind(space, op, made, later);
     }
-    match end(space.store(), op, &ran, result, calls, made) {
+    match end(space.store(), op, &ran, result, calls, made.as_deref()).and_then(|settled| self.unmake_refused(&settled, made.as_deref()).map(|_| settled)) {
       Ok(settled) => {
         self.set_run_state(space, RunState::Idle);
         let settled = settled.map(|settled| Settled { watches: self.committed(&space.id, &settled.tables), ..settled });
         space.answer(&op.hash, settled);
       }
       Err(failure) => self.stop(space, failure),
+    }
+  }
+
+  // A refused op's first run leaves nothing behind: the spaces it created are deleted.
+  fn unmake_refused(self: &Rc<Self>, settled: &Result<Settled>, made: Option<&[Made]>) -> Result<()> {
+    match (settled, made) {
+      (Err(_), Some(made)) => self.unmake(made),
+      _ => Ok(()),
     }
   }
 
@@ -252,7 +266,7 @@ impl Carbon {
 
   // Run a GET on its own snapshot of committed state. A system failure met on
   // the way stops the space, as an op's would.
-  fn read(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, reply: Reply) {
+  fn read(self: &Rc<Self>, space: &Rc<Space>, actor: Actor, call: Call, input: Value, awaiting: Vec<String>, reply: Reply) {
     let reader = match space.store().reader() {
       Ok(reader) => Rc::new(reader),
       Err(error) => return self.answer_read(space, reply, Err(error)),
@@ -265,7 +279,7 @@ impl Carbon {
       let tables = snapshot.end();
       carbon.answer_read(&here, reply, result.and_then(|value| Ok(Settled { value, tables: tables?, watches: vec![] })));
     });
-    self.start(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, effects, live, settle));
+    self.start(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, effects, awaiting, live, settle));
   }
 
   fn answer_read(self: &Rc<Self>, space: &Space, reply: Reply, settled: Result<Settled>) {
@@ -311,7 +325,9 @@ fn answering(_carbon: &Carbon, space: &Space, call: &Call) -> Result<Rc<Service>
 // The `call` effect: a call to another service, posted to its space as the
 // caller's actor, or, for a local service, as the actor it names. The space
 // is the one named, or the one the caller's channel names for the call's
-// service; a channel's space answers for the services it names.
+// service; a channel's space answers for the services it names. A write into
+// a space whose op waits on this call, directly or through other calls, would
+// wait behind that op until the timeout, so it is refused at once.
 pub(crate) fn call_effect(caller: Rc<ServiceCall>, input: Value, reply: crate::Reply) {
   let carbon = Rc::clone(caller.carbon());
   let made = Call::from_key(input["key"].as_str().unwrap_or_default()).and_then(|call| {
@@ -329,10 +345,20 @@ pub(crate) fn call_effect(caller: Rc<ServiceCall>, input: Value, reply: crate::R
     Ok(made) => made,
     Err(error) => return reply(Err(error)),
   };
-  match carbon.service_space(&space, &call) {
-    Ok(target) => carbon.submit(&target, actor, call, input["input"].clone(), Box::new(move |settled| reply(settled.map(|settled| settled.value)))),
+  let awaiting: Vec<String> = caller.awaiting().iter().cloned().chain(std::iter::once(caller.space().id.clone())).collect();
+  let target = carbon.service_space(&space, &call).and_then(|target| match call.writes() && awaiting.contains(&target.id) {
+    true => Err(looped(&call)),
+    false => Ok(target),
+  });
+  match target {
+    Ok(target) => carbon.post(&target, actor, call, input["input"].clone(), awaiting, Box::new(move |settled| reply(settled.map(|settled| settled.value)))),
     Err(error) => reply(Err(error)),
   }
+}
+
+// A write posted back into a service whose op waits on the call posting it.
+fn looped(call: &Call) -> ServiceError {
+  ServiceError::new(508, "LOOP_DETECTED", format!("{} writes to a service whose op is waiting on this call, which would wait for itself", call.key()))
 }
 
 // Calls to a stopped space fail with the failure that stopped it, and so do rows received for it.
@@ -374,7 +400,7 @@ impl Ran {
 // op's read set and changeset, and on its first run the effects it made.
 // Fails, leaving the op pending, when the store met a system failure or the
 // result could not be written: then the space stops.
-fn end(store: &Store, op: &Op, ran: &Ran, result: Result<Value>, calls: Vec<CallRecord>, made: Option<Vec<Made>>) -> Result<Result<Settled>> {
+fn end(store: &Store, op: &Op, ran: &Ran, result: Result<Value>, calls: Vec<CallRecord>, made: Option<&[Made]>) -> Result<Result<Settled>> {
   // Rolling back while stopping: the space stops with the first failure,
   // whatever the rollback meets.
   if let Some(failure) = store.failure() {

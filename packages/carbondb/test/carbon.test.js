@@ -273,7 +273,7 @@ describe('calls', () => {
     {key: 'DELETE [notes]/notes', status: 405, why: 'a method the resource does not answer'},
     {key: 'not a key', status: 400, why: 'something that is not a service key'},
     {key: 'GET [@elsewhere]/x', status: 404, why: 'a local service this device does not run'},
-    {key: 'POST [@carbon]/status', status: 404, why: 'a call to [@carbon] on a channel, which it never answers'},
+    {key: 'POST [@carbon]/status', status: 404, why: 'a [@carbon] call it does not answer'},
     {key: 'POST [channel]/members', status: 503, why: 'a call that needs peers'},
     {key: 'POST [notes]/reach', status: 503, why: 'an effect a handler makes that needs peers'}
   ]
@@ -292,7 +292,7 @@ describe('channels', () => {
     assert.deepStrictEqual([listed.slug, listed.channel], ['randalls-playhouse', room.channel])
     assert.strictEqual(personal.ref('channel:randalls-playhouse').channel, room.channel)
 
-    const status = await carbon.call('GET [@carbon]/status', {channel: room.channel})
+    const status = await room.call('GET [@carbon]/status')
     assert.deepStrictEqual(
       {name: status.name, services: status.services, access: status.access, sync: status.sync, peers: status.peers},
       {name: "Randall's Playhouse", services: [{name: 'notes', access: ['manage'], sync: 'off'}], access: ['manage'], sync: 'off', peers: []}

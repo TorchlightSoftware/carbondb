@@ -18,7 +18,7 @@ function configFile() {
 // An app's start: load CarbonDB, register [chat], and reach the lobby, a
 // channel running [chat], made on the first start and found again on later ones.
 async function start(config) {
-  carbon = await configure(config)
+  const carbon = await configure(config)
   carbon.services.add('chat', chat)
   const identities = await carbon.call('GET [@carbon]/identities')
   const known = identities.some((identity) => identity.slug === 'app')
@@ -34,7 +34,7 @@ async function start(config) {
   }
 }
 
-let config, carbon, lobby
+let config, lobby
 beforeEach(async () => {
   config = configFile()
   lobby = await start(config)
@@ -101,7 +101,7 @@ describe('errors', () => {
 
 describe('status', () => {
   it('describes the lobby: its name, services and single-node state', async () => {
-    const {kind, name, services, access, sync, peers} = await carbon.call('GET [@carbon]/status', {channel: lobby.channel})
+    const {kind, name, services, access, sync, peers} = await lobby.call('GET [@carbon]/status')
     assert.deepStrictEqual({kind, name, services, access, sync, peers}, {kind: 'channel', name: 'Lobby', services: [{name: 'chat', access: ['manage'], sync: 'off'}], access: ['manage'], sync: 'off', peers: []})
   })
 })

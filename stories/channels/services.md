@@ -22,15 +22,15 @@ await foocorp.call('POST [chat]/messages', {text: 'hi'})
 
 ## [@carbon]
 
-This device's own service: what needs this device's keys or its own settings. Its calls are made on `carbon`.
+This device's own service: what needs this device's keys or its own settings. It founds and lists identities on `carbon`; on a channel's handle, acting as that handle's identity, it reads the status of, syncs, or deletes this device's copy of the channel, or of one `service` the channel names.
 
 | Call | Input | Output |
 |---|---|---|
 | `POST [@carbon]/identity` | `slug`, `device` (this device's name), `services` (the personal channel's), `code` (to join an existing identity) | `{slug, id, channel, personal, device}`: the identity, its own and personal channels, and this device's public key. Without a `code`, founds the identity and its personal channel; with one, joins it once a device already in it accepts |
 | `GET [@carbon]/identities` | | `[{slug, id, channel, personal, device}]`: the identities on this device |
-| `GET [@carbon]/status` | `channel` or `service` | `{name, access, sync, peers}` for a service; for a channel, also `services: [{name, access, sync}]`. `sync` is `off`, `waiting` or `on`; `peers` are the devices this one has synced with, and when |
-| `POST [@carbon]/sync/start`, `/sync/stop` | `channel` or `service` | `{sync}`. For a channel, starts or stops the channel and each of its services this device runs |
-| `DELETE [@carbon]/data` | `channel` or `service` | `{}`. Deletes this device's copy, of a channel with its services |
+| `GET [@carbon]/status` | `service` (optional) | `{name, access, sync, peers}` for a service; for the channel, also `services: [{name, access, sync}]`. `access` is the acting identity's; `sync` is `off`, `waiting` or `on`; `peers` are the devices this one has synced with, and when |
+| `POST [@carbon]/sync/start`, `/sync/stop` | `service` (optional) | `{sync}`. For the channel, starts or stops it and each of its services this device runs |
+| `DELETE [@carbon]/data` | `service` (optional) | `{}`. Deletes this device's copy of the service, or of the channel with its services |
 
 ## [identity]
 

@@ -86,6 +86,8 @@ pub struct ServiceCall {
   op: Option<Op>,
   // The effects of the run it belongs to, shared by every call within it.
   effects: Rc<RefCell<EffectLog>>,
+  // The spaces whose ops wait on the run it belongs to.
+  awaiting: Vec<String>,
   // Whether the top-level call it belongs to is still open; nothing queries after.
   live: Rc<Cell<bool>>,
   calls: RefCell<Vec<CallRecord>>,
@@ -108,6 +110,7 @@ impl ServiceCall {
     conn: Conn,
     op: Option<Op>,
     effects: Rc<RefCell<EffectLog>>,
+    awaiting: Vec<String>,
     live: Rc<Cell<bool>>,
     settle: Settle,
   ) -> Rc<ServiceCall> {
@@ -120,6 +123,7 @@ impl ServiceCall {
       conn,
       op,
       effects,
+      awaiting,
       live,
       calls: RefCell::default(),
       pending: Cell::new(0),
@@ -148,6 +152,11 @@ impl ServiceCall {
 
   pub fn space(&self) -> &Rc<Space> {
     &self.space
+  }
+
+  // The spaces whose ops wait on the run this call belongs to.
+  pub(crate) fn awaiting(&self) -> &[String] {
+    &self.awaiting
   }
 
   // The op being applied, when this call writes within it.
@@ -179,7 +188,7 @@ impl ServiceCall {
       caller.returned(CallRecord::of(&record_call, record_input, &result, calls));
       reply(result)
     });
-    let callee = ServiceCall::new(&self.carbon, &self.space, self.actor.clone(), call, input, self.conn.clone(), self.op.clone(), Rc::clone(&self.effects), Rc::clone(&self.live), settle);
+    let callee = ServiceCall::new(&self.carbon, &self.space, self.actor.clone(), call, input, self.conn.clone(), self.op.clone(), Rc::clone(&self.effects), self.awaiting.clone(), Rc::clone(&self.live), settle);
     self.carbon.route(callee);
   }
 

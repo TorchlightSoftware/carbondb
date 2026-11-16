@@ -524,4 +524,35 @@ Then lets discuss the last agenda item on critical path.
 
 ---
 
+    My proposal for leaving room to grow: each effect binding in service.toml is a table of named settings, and each setting takes one value from a known set.
 
+That's indecipherably vague.  As is the following two paragraphs.  The example is clear enough, but looks wrong:
+
+    [effects.books]
+    replay = "once"
+
+I assume we're already in a service.toml... for books?  You don't need to then say books again.  And replay = once sounds like it will play twice.  I suggest:
+
+    [effects.fetch]
+    replicate = "never" | "always"
+
+Does that make sense?
+
+---
+
+    Questions:
+    1. The registry proposals, accept as written?
+
+Yes.
+
+    2. Network-dependent calls in single-node mode. Invitations accepted, join, leave, sync, enrolling a device, and adding p2panda members can't really happen yet. My proposal: build each call and what it records, but the p2panda effect fails as unreachable, the way today's calls answer "single node". Network tests come with p2panda.
+
+Um... is there a reason we don't just implement with p2panda?  We've done all this research and laid out a design that's compatible...
+
+    3. Docs. I'd update README.md...
+
+You can update readme and docs/.  Other than that, replicate stories that need to be transfered over into channels/ so I can compare them.
+
+    4. Checkpoints.
+
+I'm just going to have you do it all at once.  I know it's a lot, but that works better for me right now.  I'm going to head to bed and check it in the morning.
