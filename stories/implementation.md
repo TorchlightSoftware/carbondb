@@ -1,6 +1,6 @@
 # CarbonDB first draft: implementation notes
 
-Status: agreed — single-node built (build steps 1 and 2): the whole app interface, each service with its own SQLite file, op log and results, channels naming their services, calls between services and other effects made once and recorded on the op's log row, `fetch`, watches, every service a WebAssembly component, and each service's lifecycle and deadlines, explained in [docs/](../docs/); rewind and replay built on a single device (step 4, first half), in [docs/replication.md](../docs/replication.md); the HTTP adapter (step 3) is app code, not built; p2panda is next ([p2panda-sync.md](p2panda-sync.md))
+Status: agreed — single-node built (build steps 1 and 2): the whole app interface, each service with its own SQLite file, op log and results, channels naming their services, calls between services and other effects made once and recorded on the op's log row, `fetch`, watches, every service a WebAssembly component, and each service's lifecycle and deadlines, explained in [docs/](../docs/); rewind and replay built on a single device (step 4, first half), in [docs/replication.md](../docs/replication.md); the HTTP adapter (step 3) is app code, not built; p2panda sync's first milestone, an identity's devices enrolling and syncing, built and explained in [docs/sync.md](../docs/sync.md); what follows in [p2panda-sync.md](p2panda-sync.md)
 
 This is everything we agreed that the code has to honour, gathered in one place for whoever builds the first draft. The numbered stories say what a person cannot do yet, [docs/services.md](../docs/services.md) lists the builtin calls, and [oplog-examples.md](oplog-examples.md) shows them in use. This file covers what happens underneath. Where older notes disagree with it, this file wins.
 
@@ -81,7 +81,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 
 - The TOML file names the system database, which holds the identities on this device with their secret keys, the system log, and the spaces this device holds: for each, the package that runs it, the name its channel calls it by, and its channel. `configure` reads it once, and no other call takes a directory.
 - Each service's space, a channel's own `[channel]` included, is one SQLite file beside the system database, named by its id.
-- Each identity has its own p2panda store file beside it, because a p2panda node takes one set of credentials and one machine may hold several unlinkable identities. That means one p2panda node per identity on a device.
+- Each identity has its own p2panda store file beside it, because a p2panda node takes one set of credentials and one machine may hold several unlinkable identities. That means one p2panda node per identity on a device. A node signs with the identity's device key on this device, and keeps p2panda's X25519 identity secret beside that key in the system database.
 - A service's op log and results live in its own file, beside its tables, so they commit atomically with its writes. The session records every table but CarbonDB's own, using rusqlite's `table_filter`.
 - The core's own tables, named `carbon_` (the op log and results in every service's file, and the identities and spaces in the system database), move forward by migrations, tracked in `carbon_migrations` and applied in one transaction when the file opens. The system database's file applies a service's migrations, then its own. Until 1.0 these migrations may be consolidated, and development databases deleted when they are.
 
@@ -90,7 +90,7 @@ None of this has run on real p2panda nodes yet. Each item is a design risk for r
 Built single-node, and explained in [docs/channels.md](../docs/channels.md): what a channel and a service are, creating channels and services, the rules on `[channel]`, refs and handles, access and manage, and an identity's two channels. What replication adds:
 
 - Each service a channel names is one p2panda space. Channels do not nest in p2panda: adding a group as a member gives everyone in it access, which is not what a parent and child mean.
-- Whether p2panda assigns a channel's or service's id once replication is built, or takes the one the creating op derives, is not yet defined. Recognising a channel an interrupted call already created is left to [recovering after a crash](backlog/crash-recovery.md).
+- p2panda creates a service's space once, in the `create` effect on the device that made the creating op, and the space's p2panda id is recorded as that effect's output, which every peer reads from the op's row. That is the space id, naming the instance and its op log; single-node, the `create` effect answers an id derived from the op instead. The package hash, the service's version, is tracked apart from it and decides which ops the space may run. Recognising a channel an interrupted call already created is left to [recovering after a crash](backlog/crash-recovery.md).
 - A rewind that refuses a creating op at its place leaves the channel or service unattached; the [security review](backlog/security-review.md) revisits this.
 
 ## The op
@@ -112,7 +112,7 @@ Built single-node, and explained in [docs/channels.md](../docs/channels.md): wha
 - Results record what this device did with each op: applied or refused with its service error, with its output. A result is keyed by its op hash and never leaves this device. A rewind replaces results; it never touches the log.
 - The pending ops are the op log minus the results: the ops with no result yet. They are read from the service's file each turn, never kept in memory, and apply one at a time in the shared order, so ops left without a result by a crash simply apply next time the service opens. A local call is stamped when it arrives, since that is when it is written; an op that arrives later but sorts earlier is handled by rewind.
 - Ops apply one at a time per service, and services apply side by side. A service is the finest unit: its tables, op log and results share one SQLite file, which has one writer, and an op holds its transaction while its handler awaits.
-- Every op takes the same path, local or synced: the OpWriter logs it, it applies in turn, and its result is recorded. Nothing is refused before it is logged, so every failure is reported, audited and kept in the history the same way.
+- Every op takes the same path, local or synced: the OpWriter logs it, it applies in turn, and its result is recorded. Nothing that passes the check on received messages is refused before it is logged, so every failure is reported, audited and kept in the history the same way; a message that fails that check is not an op, and is kept as evidence in `carbon_error` instead ([docs/sync.md](../docs/sync.md#receiving)).
 - Pending ops apply only once the service's package is registered on this device; until then the service is initializing, and its ops and their callers wait. An op made for a package this device has not registered is refused with a 404 when its turn comes, before any handler sees it; that refusal keeps it from running again and from being published.
 - The callers waiting on an op are kept beside it in memory, by op hash, and answered when its result is recorded. An op resumed from the log has none.
 - Each service has a RunState: initializing, with its package not registered here yet; idle; applying an op; or stopped. The app can read it and watch it.
@@ -125,7 +125,7 @@ What a handler does outside its own service's tables is an effect: calling anoth
 - An effect is made once, on the op's first run, on the device that made it. Its output, success or failure, is recorded on the op's log row, in the order the handler asked for it, when the first run settles, and travels with the op. The core never interprets an output; the service decides what is a failure.
 - Every later run, on another device or after a rewind here, gets the recorded outputs in order instead of making the effects again. A run asking for more effects than the first run made gets an unreachable failure, the same on every replica.
 - A service declares its effects in its `service.toml`, `[effects.<name>] replicate = "never"` (the default) or `"always"`, which makes the effect again on every run on every replica, never recorded.
-- The registry holds each effect's handler by name. Single-node, this device makes what it can alone (`call` and `create`); an effect that needs peers has no handler and fails as unreachable until p2panda.
+- The registry holds each effect's handler by name. Single-node, this device makes what it can alone (`call`, `create` and `fetch`); an effect that needs peers, such as `enroll`, fails as unreachable. Replicating, `create` creates the p2panda space and `enroll` enrolls a device ([docs/sync.md](../docs/sync.md)).
 - A call's answer is what the other service answered on this device at that moment; a late op there can still change its outcome, and if the caller then fails, what the other service did stays. Only delivery is guaranteed between services, and atomicity ends at the service. Report-back is rejected: a caller that needs the current answer asks again.
 - A call to a service this device holds no copy of that it can run, being pull-only or not a member, fails as unreachable, the same on every run.
 
@@ -175,7 +175,8 @@ GETs and watch re-runs use a second read-only connection in WAL mode, so they se
 ## Publishing
 
 - Each service's op log is its outbox. A publisher drains this device's ops whose result applied, with their recorded effects, also after a crash; a call refused on its own device stays in the log unpublished, its result saying why. Duplicates drop by op hash. The system log is never published.
-- p2panda streams replay unacknowledged operations after a restart, so the core acknowledges after commit to cover a crash on the receiving side.
+- A `carbon_published` table in each space's file records, by op hash, each op this device published, apart from its results, so a rewind forgetting results leaves it alone; a rewind can make an op publishable late and out of log order, so a position in the log would not do. The core's thread writes the row once p2panda accepts the publish, and the publisher sends every op this device made with an applied result and no row there, at start and after each commit. A crash between publishing and recording publishes once more.
+- p2panda streams replay unacknowledged operations after a restart, so the core acknowledges a received op once its row commits to the op log, which covers a crash on the receiving side: a logged op without a result applies when its space is next ready. A device's own op that p2panda echoes back drops as a duplicate.
 - A call resolves once this device has applied it, without waiting for other members.
 
 ## Repeatability
@@ -205,10 +206,10 @@ A test harness runs the same ops on two fresh databases in different delivery or
 - An identity is a channel running only `[identity]`, plus `[channel]` for its one ref, to the personal channel. It is shared only by the person's own devices, never with anyone else, and nothing nests under it but the personal channel. It is sealed at founding: `POST [channel]/origin`, its ref to the personal channel, then `POST [channel]/seal`, after which its `[channel]` refuses every op, the same on every replica.
 - `[identity]` holds the identity's origin and its devices, each with its public key, name and tags, private to the person's devices. Only the identity itself adds, renames or retags its devices.
 - The identity id is the hash of `POST [identity]/origin` with the first device's public key, signed by that device, so it stays the same as keys rotate.
-- `POST [identity]/devices` adds a device: the handshake with it is an effect, and the op records its key, name and tags. Enrolling adds the device to every service of the identity's own channel, its `[channel]` included, as a p2panda membership change, which the seal does not stop.
+- `POST [identity]/devices` adds a device: the handshake with it is an effect, and the op records its key, name and tags. Enrolling adds the device to every service of the identity's own channel, its `[channel]` included, and of its personal channel, at manage, as a p2panda membership change made by the existing device in the enroll effect, which the seal does not stop. A service added later gets every device of the identity, added by the device that made the op adding it.
 - p2panda's intended shape is an identity as a group of its devices, added to a space once. p2panda's high-level API refuses write through a group, so for now CarbonDB adds each device to each service's space directly ([upstream group write](backlog/upstream-group-write.md)), and a member's new device needs a manager of each shared channel online ([member devices](backlog/member-devices.md)).
 - p2panda does not implement Manage for a group, so CarbonDB's own manage, per identity, maps onto each device acting for it.
-- How a peer in a shared channel ties a device to its identity, without reading the identity's own channel, is not yet defined; it was the p2panda group before devices were added directly.
+- An identity's own devices tie a device to its identity through the devices `[identity]` lists, since they all hold the identity's own channel. How a peer in a shared channel ties a device to its identity, without reading the identity's own channel, is not yet defined; it was the p2panda group before devices were added directly.
 - The paper key is an `[identity]` entry only, and stays out of p2panda until recovery is designed ([backlog](backlog/paper-key.md)).
 - Device additions commute, so this log needs no rewind for the current stories.
 - Prefer Keybase semantics unless there is a well-justified reason to diverge. Having no server is one such divergence.
@@ -249,7 +250,7 @@ Deferred with the public record of an identity's devices ([backlog](backlog/publ
 - An invitation need not carry the invitee's device keys: they are exchanged in the initial handshake.
 - Joining writes a ref to the joined channel in the calling channel. Which op records the invitee as a member once they accept is not yet defined.
 - Channel membership must not be revealed to anyone who asks, so CarbonDB must not rely on subscribing to a service's space to learn who is in it.
-- Relay servers are node configuration and need no design for the first draft.
+- A node's iroh relays come from the TOML file and from its identity's relay devices; the TOML file offers default bootstraps and each identity chooses its own; a configured bootstrap is also a well-known place to post invites ([docs/sync.md](../docs/sync.md#network-settings), [p2panda-sync.md](p2panda-sync.md#nodes-and-network)).
 
 ## Removing a member and leaving
 
@@ -263,14 +264,15 @@ Deferred with the public record of an identity's devices ([backlog](backlog/publ
 
 ## Sync, status and partitions
 
-p2panda syncs only spaces a node has subscribed to, so when to sync is CarbonDB's choice:
+p2panda syncs only spaces a node has subscribed to, so which spaces a node loads and syncs is CarbonDB's choice, set per node in the TOML file. Creating a space is an effect, made once and recorded where peers can see it; whether a node loads a space it sees is its sync mode, never the effect's `replicate` setting.
 
 ```toml
 [sync]
 mode = "ref"   # the default; or "all", "manual", or "none" for single-node
 ```
 
-- `ref` syncs a channel, and each of its services this device runs, the first time a ref reaches it, and from then on. CarbonDB's core, in its init and maintenance loop, reads the channels its identity belongs to, joins their services' spaces and fetches their packages, at the lower of the identity's grant and the device's policy.
+- `ref` loads a channel, and each of its services this device runs, as soon as a ref reaches it, and syncs it from then on. The node watches `GET [channel]/refs` and `GET [channel]/services` on each channel it holds, starting from each identity's own channel, and loads what they name, at the lower of the identity's grant and the device's policy. A watch answers as soon as it is registered, so the same watches load everything at start and whatever appears later, with no polling loop.
+- `manual` loads nothing by itself: the app loads what it wants with `POST [@carbon]/sync/start`.
 - `POST [@carbon]/sync/start` and `POST [@carbon]/sync/stop` start and stop syncing a channel or a service named in their input; for a channel, each of its services this device runs. `DELETE [@carbon]/data` deletes this device's copy of a service, or of a channel and its services. p2panda has no per-space delete, so its store keeps the encrypted ops.
 - `.ref()` returns a handle straight away.
 

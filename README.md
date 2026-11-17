@@ -26,7 +26,7 @@ CarbonDB is an experiment in creating a general purpose framework for applicatio
 
 ## Status
 
-The core API currently runs in single-node mode (no network). Each service runs in a channel, with its own SQLite file and op log, and services call each other by message. Rewind and replay are built and tested on a single device: ops received from other devices apply in one shared order, a late op rewinds only what it must, and what a service does outside its own tables (an effect) is made once and replayed after ([docs/replication.md](docs/replication.md)). Every service runs as a WebAssembly component on the core's WASM host, whatever language it was written in ([docs/wasm-services.md](docs/wasm-services.md)). Next step is to carry ops between devices with p2panda (on iroh). The design is in [stories/](stories/README.md), and the channel model's interface in [stories/services.md](docs/services.md).
+The core syncs each service's ops between an identity's devices over p2panda, or runs single-node with `mode = "none"` ([docs/sync.md](docs/sync.md)). Each service runs in a channel, with its own SQLite file and op log, and services call each other by message. Rewind and replay are built and tested on a single device: ops received from other devices apply in one shared order, a late op rewinds only what it must, and what a service does outside its own tables (an effect) is made once and replayed after ([docs/replication.md](docs/replication.md)). Every service runs as a WebAssembly component on the core's WASM host, whatever language it was written in ([docs/wasm-services.md](docs/wasm-services.md)). The design is in [stories/](stories/README.md), and the channel model's interface in [stories/services.md](docs/services.md).
 
 This should be considered a first draft that shows you what the API surface looks like, and what it looks like to build an app on top of CarbonDB.
 
@@ -75,7 +75,7 @@ async function start(config) {
 The app then calls the channel's service, `lobby.call('POST [chat]/messages', {text: 'hello'})`, and watches it, `lobby.watch('GET [chat]/messages', render)`.
 
 **Built on single-node:**
- - create cryptographic identities KeyBase style, each founded with its first device; adding more devices needs peers
+ - create cryptographic identities KeyBase style, each founded with its first device; more devices enroll over p2panda (below)
  - secret keys stay on device and are never transmitted over the network
  - an identity's own channel, shared only by its devices, and its "personal channel" for apps and data
  - channels for organizations, or friends & family, nested for teams and departments
@@ -87,8 +87,13 @@ The app then calls the channel's service, `lobby.call('POST [chat]/messages', {t
 
 The interface is in [packages/carbondb/README.md](packages/carbondb/README.md); how it works, in [docs/](docs/).
 
+**Built over p2panda:**
+ - each identity runs a p2panda node on its device key; each service is a p2panda space, and its ops travel with their recorded effects
+ - a second device enrolls in an identity by the code it shows, then loads the identity's channels and services and syncs them
+ - every received op is checked before it is logged; what fails is kept as evidence and never applied
+
 **Next:**
-    - replication: p2panda carries each service's ops between members' devices, which adding devices and members needs.
+    - fetching packages from peers, the assignment policy, and inviting members to channels ([stories/p2panda-sync.md](stories/p2panda-sync.md)).
 
 `npm test` runs everything: the Rust tests, a native build, the JS services built into components, and the JS and end-to-end tests. It needs Rust and Node 22. After changing a builtin service or ServiceBindings, `scripts/build-components` rebuilds the committed components; it needs the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`).
 

@@ -1,6 +1,6 @@
 # A person can add another device to their identity
 
-Status: agreed — needs peers until p2panda; single-node, `POST [identity]/devices` fails with `503 UNREACHABLE` and `POST [@carbon]/identity` with a `code` with `501 SINGLE_NODE`
+Status: agreed — the direction where the new device shows its code is built ([docs/sync.md](../docs/sync.md#enrolling-a-device)), tested with two devices in one process; the reverse direction, where the existing device shows a code, is not. Single-node, `POST [identity]/devices` fails with `503 UNREACHABLE`, and `POST [@carbon]/devices` and `POST [@carbon]/identity` with a `code` with `501 SINGLE_NODE`
 
 ## Calls
 
@@ -13,7 +13,10 @@ display(code)
 // on the new device, on the system handle: scan it, and join the identity
 await carbon.call('POST [@carbon]/identity', {slug: 'alice', code: scannedCode, device: 'phone'})
 
-// or the other way round: the existing device scans the new device's code
+// or the other way round (built): the new device shows a code on its system handle
+const {code: shown} = await carbon.call('POST [@carbon]/devices')
+display(shown)
+// and the existing device scans it
 await identity.call('POST [identity]/devices', {code: scannedCode, name: 'phone', tags: []})
 // {pubkey, name: 'phone', tags: []}
 
@@ -23,18 +26,17 @@ await identity.call(`PUT [identity]/devices/${pubkey}`, {name: 'work phone', tag
 
 ### Open questions
 
-- How the new device shows its code when it is the one shown: which call on the system handle generates its key pair and answers the code, before it knows the identity.
-- How the side that showed its code learns the exchange finished: a watch, such as `GET [@carbon]/identities` on the new device, which needs watches on the system handle, or `GET [identity]/devices` on the existing one. When the existing device showed the code, which op records the new device's key, name and tags once the exchange finishes is not yet defined; scanning the other way, `POST [identity]/devices` with the `code` records it in one op.
-- Whether a call that waits on p2panda fits its service's timeout, or starts the work and a watch reports it done.
+- When the existing device showed the code, which op records the new device's key, name and tags once the exchange finishes is not yet defined; scanning the other way, `POST [identity]/devices` with the `code` records it in one op.
 
 ## Rules
 
-- Either device may start, and either may show or scan; one scan completes the exchange. How the app offers this is up to its interface.
-- The new device generates its keys on the system handle, which never replicates, as part of `POST [@carbon]/identity` with a `code`. The existing device runs `POST [identity]/devices` in the identity's own channel: the handshake with the new device is an effect of that op, made once on its first run and recorded (see [docs/replication.md](../docs/replication.md#effects-are-made-once)), and the op records the device's public key, name and tags in `[identity]`. Only the identity itself adds, renames or retags its devices.
-- Enrolling adds the new device to every service of the identity's own channel, its `[channel]` included, and of its personal channel. That is a p2panda membership change, not a `[channel]` op, so the seal on the identity's own channel does not stop it. For now CarbonDB adds the device to each service's space directly (see [upstream group write](backlog/upstream-group-write.md)).
-- The new device syncs the identity's own channel and finds the rest by walking refs from it, through the personal channel. CarbonDB's core reads the channels its identity belongs to, joins their services and fetches them, at the lower of the identity's grant and the device's own policy. Where a person sets a device's policy is not yet defined.
+- Either device may start, and either may show or scan; one scan completes the exchange. How the app offers this is up to its interface. The first milestone in [p2panda-sync.md](p2panda-sync.md) builds the new device showing its code and the existing device scanning it; the reverse follows.
+- The new device generates its keys on the system handle, which never replicates: as part of `POST [@carbon]/identity` with a `code` when it scans, or in a `[@carbon]` call that answers its code when it is the one shown. The existing device runs `POST [identity]/devices` in the identity's own channel: the handshake with the new device is an effect of that op, made once on its first run and recorded (see [docs/replication.md](../docs/replication.md#effects-are-made-once)), and the op records the device's public key, name and tags in `[identity]`. Only the identity itself adds, renames or retags its devices.
+- Enrolling adds the new device to every service of the identity's own channel, its `[channel]` included, and of its personal channel, at `manage` under the default assignment policy; the existing device makes those changes in the enroll effect. That is a p2panda membership change, not a `[channel]` op, so the seal on the identity's own channel does not stop it. For now CarbonDB adds the device to each service's space directly (see [upstream group write](backlog/upstream-group-write.md)).
+- The new device loads the identity's own channel, and in the `ref` sync mode finds the rest by watching the refs and services of each channel it holds, from the identity's own channel through the personal channel, at the lower of the identity's grant and the device's own policy ([implementation.md](implementation.md#sync-status-and-partitions)). Where a person sets a device's policy is not yet defined.
 - Channels shared with other people need a device with `manage` there to add the new device; for now one must be online and is presented with the request (see [member devices](backlog/member-devices.md)).
-- Codes are single-use and short-lived.
+- When the new device shows its code, the code carries its p2panda `Member` bytes (its public key and key bundle, cross-signed), a pairing secret and its relay URL if any, so the existing device's op records it and can add it without waiting on it. The enroll effect answers at once and hands the network work to p2panda, which adds the device and sends it the identity and its own channel's space id over the pairing topic; the device that made the enroll op adds the new device wherever it is missing, at start and whenever `[identity]` changes, so a crash loses nothing. The new device learns it finished when that payload arrives, and the app sees it in `GET [@carbon]/identities` ([docs/sync.md](../docs/sync.md#enrolling-a-device)).
+- Codes are single-use and expire after 10 minutes.
 - The identity's existing devices see every join through `GET [identity]/devices`; the interface decides whether and how to show it.
 
 ## Acceptance

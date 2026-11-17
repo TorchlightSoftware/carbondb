@@ -56,11 +56,15 @@ fn only_the_system_database_keeps_the_secret() {
   let identity = alice(&carbon);
   let row = carbon.system().store().reader().unwrap().get("SELECT secret FROM carbon_system_identity", &[]).unwrap();
   let secret = row["secret"].as_str().unwrap().to_string();
-  assert_eq!(secret.len(), 64);
+  assert_eq!(crate::keys::credentials(&secret).unwrap().verifying_key().to_hex(), identity.device);
+  // The secret's parts, as p2panda keeps them: none of them appears in any space's file.
+  let parts = secret_parts(&serde_json::from_str(&secret).unwrap());
+  assert!(!parts.is_empty());
   for entry in std::fs::read_dir(directory.path().join("data")).unwrap() {
     let path = entry.unwrap().path();
     if path.extension().is_some_and(|extension| extension == "db") && path.file_name().unwrap() != "system.db" {
-      assert!(!String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains(&secret), "{}", path.display());
+      let kept = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_string();
+      assert!(parts.iter().all(|part| !kept.contains(part)), "{}", path.display());
     }
   }
   let listed = call_now(&carbon, carbon.system(), &Actor::default(), "GET [@carbon]/identities", Value::Null).unwrap().value;
@@ -69,6 +73,17 @@ fn only_the_system_database_keeps_the_secret() {
   let op = &oplog::entries(carbon.system().store()).unwrap()[0];
   let kept = serde_json::to_string(&(op, results::of(carbon.system().store(), &op.hash).unwrap(), oplog::effects(carbon.system().store(), &op.hash).unwrap())).unwrap();
   assert!(!kept.contains(&secret));
+}
+
+// The text a secret keeps: each string in it, and each list of bytes as text.
+fn secret_parts(secret: &Value) -> Vec<String> {
+  match secret {
+    Value::String(text) => vec![text.clone()],
+    Value::Array(items) if items.iter().all(Value::is_u64) => vec![items.iter().map(|byte| format!("{byte},")).collect()],
+    Value::Array(items) => items.iter().flat_map(secret_parts).collect(),
+    Value::Object(fields) => fields.values().flat_map(secret_parts).collect(),
+    _ => vec![],
+  }
 }
 
 #[test]

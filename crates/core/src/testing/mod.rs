@@ -29,8 +29,35 @@ pub fn carbon() -> (tempfile::TempDir, Rc<Carbon>) {
 // A test's config: single-node, its compiled components kept where every
 // test's are, so a run compiles each component once.
 pub fn config() -> String {
+  config_syncing("mode = \"none\"")
+}
+
+// A test's config with the `[sync]` section given.
+pub fn config_syncing(sync: &str) -> String {
   let compiled = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/carbondb-compiled");
-  format!("system = \"data/system.db\"\ncompiled = {:?}\n[sync]\nmode = \"none\"\n", compiled.display().to_string())
+  format!("system = \"data/system.db\"\ncompiled = {:?}\n[sync]\n{sync}\n", compiled.display().to_string())
+}
+
+// A CarbonDB that syncs in the `ref` mode, its nodes finding no peers: no
+// relay, no bootstrap and no mDNS.
+pub fn replicated() -> (tempfile::TempDir, Rc<Carbon>) {
+  syncing("mode = \"ref\"\nmdns = \"off\"")
+}
+
+// A CarbonDB with the `[sync]` section given, running `[notes]`.
+pub fn syncing(sync: &str) -> (tempfile::TempDir, Rc<Carbon>) {
+  let (directory, carbon, _timers) = syncing_timed(sync);
+  (directory, carbon)
+}
+
+// The same, with the timers it schedules on.
+pub fn syncing_timed(sync: &str) -> (tempfile::TempDir, Rc<Carbon>, Timers) {
+  let directory = tempfile::tempdir().unwrap();
+  std::fs::write(directory.path().join("carbondb.toml"), config_syncing(sync)).unwrap();
+  let timers = Timers::default();
+  let carbon = Carbon::open(&directory.path().join("carbondb.toml"), timers.schedule(), tasks()).unwrap();
+  register_notes(&carbon);
+  (directory, carbon, timers)
 }
 
 // The core's test fixture `[probe]`, a Rust component that reports what it sees of its host.
@@ -84,8 +111,15 @@ pub fn space_now(carbon: &Rc<Carbon>, id: &str) -> Result<Rc<ServiceSpace>> {
 }
 
 pub fn alice(carbon: &Rc<Carbon>) -> Identity {
-  let input = json!({"slug": "alice", "device": "Pixel9", "services": ["notes"]});
-  let created = call_now(carbon, carbon.system(), &Actor::default(), "POST [@carbon]/identity", input).unwrap();
+  found(carbon, "alice", &["notes"])
+}
+
+// An identity founded on this device, its personal channel running the
+// services named; when this device syncs, once its node has created the
+// p2panda spaces.
+pub fn found(carbon: &Rc<Carbon>, slug: &str, services: &[&str]) -> Identity {
+  let input = json!({"slug": slug, "device": "Pixel9", "services": services});
+  let created = awaited(|reply| carbon.submit(carbon.system(), Actor::default(), Call::from_key("POST [@carbon]/identity").unwrap(), input, reply)).unwrap();
   serde_json::from_value(created.value).unwrap()
 }
 
@@ -97,6 +131,12 @@ pub fn actor(identity: &Identity) -> Actor {
 // A call on a channel's handle, as the identity, answered at once.
 pub fn on(carbon: &Rc<Carbon>, channel: &str, identity: &Identity, key: &str, input: Value) -> Result<Value> {
   now(|answer| carbon.call(Some(channel), Some(&identity.id), key, input, answer))
+}
+
+// A call on a channel's handle, as the identity, once it has answered, as
+// one that waits on p2panda does.
+pub fn on_awaited(carbon: &Rc<Carbon>, channel: &str, identity: &Identity, key: &str, input: Value) -> Result<Value> {
+  awaited(|answer| carbon.call(Some(channel), Some(&identity.id), key, input, answer))
 }
 
 // The space a channel names for `[name]`.

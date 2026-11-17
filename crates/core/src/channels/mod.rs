@@ -19,7 +19,7 @@ use crate::error::{Result, bad_request, not_found};
 use crate::ops::clock;
 use crate::ops::effects::Made;
 use crate::ops::oplog::{self, LogRow};
-use crate::{Call, Db, Reply};
+use crate::{Call, Db, HandlerContext, Reply};
 use service::{RunState, Runs, ServiceSpace};
 
 // How an opened space reaches whoever asked for it.
@@ -49,7 +49,7 @@ impl Carbon {
   }
 
   // What this device recorded a space runs, if it holds the space.
-  fn held(&self, id: &str) -> Result<Option<Runs>> {
+  pub(crate) fn held(&self, id: &str) -> Result<Option<Runs>> {
     let row = self.system.store().reader()?.get("SELECT package, name, channel FROM carbon_system_space WHERE id = ?", &[json!(id)])?;
     Ok((!row.is_null()).then(|| Runs {
       package: row["package"].as_str().unwrap_or_default().to_string(),
@@ -150,7 +150,7 @@ impl Carbon {
   }
 
   // A space already open on this device, the root space included.
-  fn opened(&self, id: &str) -> Option<Rc<ServiceSpace>> {
+  pub(crate) fn opened(&self, id: &str) -> Option<Rc<ServiceSpace>> {
     if id == self.system.id {
       return Some(Rc::clone(&self.system));
     }
@@ -169,16 +169,34 @@ fn created(made: &[Made]) -> Vec<String> {
 }
 
 // The `create` effect: the space of a new channel or service, created on this
-// device running the package named. A channel's space belongs to itself; a
-// service's to the channel of the space that creates it.
+// device running the package named, and the id it answers, which names that
+// instance of the service everywhere. A channel's space belongs to itself; a
+// service's to the channel of the space that creates it. Single-node, the id
+// derives from the op; replicating, it is the id of the p2panda space created
+// for it (`crate::nodes`).
 pub(crate) fn create_effect(caller: Rc<ServiceCall>, input: Value, reply: Reply) {
-  reply(create(&caller, &input))
+  let package = input["package"].as_str().unwrap_or_default().to_string();
+  let name = input["name"].as_str().map_or_else(|| package.clone(), str::to_string);
+  if caller.carbon().config.sync == crate::config::SyncMode::None {
+    return reply(derived_id(&caller, &package, &name).and_then(|id| create(&caller, &id, package, name)));
+  }
+  // The identity whose node creates it: the caller's, or, as an identity is founded, the one named.
+  let identity = input["identity"].as_str().map(str::to_string).or_else(|| caller.actor().identity.clone()).unwrap_or_default();
+  let (creating, syncing) = (Rc::clone(&caller), identity.clone());
+  caller.carbon().create_p2panda_space(&identity, Box::new(move |created| {
+    let made = created.and_then(|id| create(&creating, &id, package, name).and_then(|made| creating.carbon().synced_by(&id, &syncing).map(|_| made)));
+    reply(made)
+  }));
 }
 
-fn create(caller: &ServiceCall, input: &Value) -> Result<Value> {
+// A single-node space's id: the same on every run of the op that creates it.
+fn derived_id(caller: &ServiceCall, package: &str, name: &str) -> Result<String> {
+  let op = caller.op().ok_or_else(|| bad_request("Creating a space needs an op"))?;
+  Ok(crate::hash::hash(&json!({"op": op.hash, "create": {"package": package, "name": name}})))
+}
+
+fn create(caller: &ServiceCall, id: &str, package: String, name: String) -> Result<Value> {
   let carbon = caller.carbon();
-  let (id, package) = (input["space"].as_str().unwrap_or_default(), input["package"].as_str().unwrap_or_default().to_string());
-  let name = input["name"].as_str().map_or_else(|| package.clone(), str::to_string);
   let channel = match package.as_str() {
     "channel" => Some(id.to_string()),
     _ => caller.space().runs.channel.clone(),

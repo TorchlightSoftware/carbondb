@@ -10,6 +10,7 @@ pub mod channels;
 pub mod config;
 pub mod error;
 pub mod keys;
+pub mod nodes;
 pub mod ops;
 pub mod services;
 pub mod sql;

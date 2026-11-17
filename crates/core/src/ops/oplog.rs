@@ -15,7 +15,7 @@ use crate::{Db, Op};
 // on the system handle, sorts first among those of its time.
 pub(crate) const ORDER: &str = "ORDER BY time, COALESCE(device, ''), hash";
 
-const COLUMNS: &str = "hash, time, device, author, key, input, version, effects";
+pub(crate) const COLUMNS: &str = "hash, time, device, author, key, input, version, effects";
 
 // An op as its log row holds it, and as it travels between devices: the op
 // and, once its first run has settled, the effects it made, whose outputs

@@ -13,7 +13,6 @@ pub mod names;
 use std::rc::Rc;
 
 use carbondb_service_bindings::error::{Result, ServiceError, bad_request, conflict, forbidden, not_found, unknown};
-use carbondb_service_bindings::hash::hash;
 use carbondb_service_bindings::{Db, HandlerContext, Package, Reply, migrations};
 use names::{slugify, unique_slug};
 use serde::{Deserialize, Serialize};
@@ -212,32 +211,23 @@ fn seal(db: &dyn Db) -> Result<Value> {
   Ok(json!({"sealed": true}))
 }
 
-// The id of a channel or service this op creates: the same on every replica.
-fn new_id(context: &dyn HandlerContext, what: &str, name: &str) -> Result<String> {
-  let op = context.op().ok_or_else(|| bad_request("Creating needs an op"))?;
-  Ok(hash(&json!({"op": op.hash, what: name})))
-}
-
 // A channel inside this one: its space is created, its origin written there,
-// and this channel points to it.
+// and this channel points to it. The `create` effect answers the new space's id.
 fn create_channel(context: Context) {
   let request: NewChannel = match serde_json::from_value(context.input().clone()) {
     Ok(request) => request,
     Err(error) => return settle(&context, Err(error.into())),
   };
-  let id = match new_id(context.as_ref(), "channel", &request.name) {
-    Ok(id) => id,
-    Err(error) => return settle(&context, Err(error)),
-  };
   let author = context.actor().identity.clone().unwrap_or_default();
   let origin = json!({"kind": request.kind, "name": request.name, "manage": request.manage.unwrap_or_else(|| vec![author])});
-  let reference = NewRef { channel: id.clone(), kind: request.kind, name: request.name, slug: request.slug, cascade: request.cascade };
-  let create = json!({"space": id, "package": "channel", "name": "channel"});
+  let create = json!({"package": "channel", "name": "channel"});
   let creating = Rc::clone(&context);
   let reply: Reply = Box::new(move |created| {
-    if let Err(error) = created {
-      return settle(&creating, Err(error));
-    }
+    let id = match created.map(|created| created["space"].as_str().unwrap_or_default().to_string()) {
+      Ok(id) => id,
+      Err(error) => return settle(&creating, Err(error)),
+    };
+    let reference = NewRef { channel: id.clone(), kind: request.kind, name: request.name, slug: request.slug, cascade: request.cascade };
     let call = json!({"space": id, "key": "POST [channel]/origin", "input": origin});
     after(&creating, "call", call, move |context, _| add_ref(context.as_ref(), reference).map(|reference| json!(reference)))
   });
@@ -245,7 +235,8 @@ fn create_channel(context: Context) {
 }
 
 // A service in this channel: its space is created, running the package
-// registered on this device, and the channel names it.
+// registered on this device, and the channel names it by the id the `create`
+// effect answers.
 fn create_service(context: Context) {
   let request: NewService = match serde_json::from_value(context.input().clone()) {
     Ok(request) => request,
@@ -255,14 +246,10 @@ fn create_service(context: Context) {
   if let Err(error) = taken.and_then(|taken| if taken || request.name == "channel" { Err(conflict(format!("This channel already names a service [{}]", request.name))) } else { Ok(()) }) {
     return settle(&context, Err(error));
   }
-  let id = match new_id(context.as_ref(), "service", &request.name) {
-    Ok(id) => id,
-    Err(error) => return settle(&context, Err(error)),
-  };
   let package = request.package.unwrap_or_else(|| request.name.clone());
-  let create = json!({"space": id, "package": package, "name": request.name});
+  let create = json!({"package": package, "name": request.name});
   after(&context, "create", create, move |context, created| {
-    let named = Named { name: request.name, service: id, package, version: created["version"].as_str().unwrap_or_default().to_string() };
+    let named = Named { name: request.name, service: created["space"].as_str().unwrap_or_default().to_string(), package, version: created["version"].as_str().unwrap_or_default().to_string() };
     context.run("INSERT INTO service (name, space, package, version) VALUES (?, ?, ?, ?)", &[json!(named.name), json!(named.service), json!(named.package), json!(named.version)])?;
     Ok(json!({"name": named.name, "service": named.service, "version": named.version}))
   })

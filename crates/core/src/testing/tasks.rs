@@ -151,12 +151,16 @@ pub fn awaited<T: 'static>(start: impl FnOnce(Box<dyn FnOnce(Result<T>)>)) -> Re
 
 // Drive the tasks until something holds, waiting for those woken from other threads.
 pub fn until(holds: impl Fn() -> bool) {
-  const LONGEST: Duration = Duration::from_secs(10);
+  until_within(Duration::from_secs(10), holds)
+}
+
+// The same, for as long as the network may take, as for devices to find each other.
+pub fn until_within(longest: Duration, holds: impl Fn() -> bool) {
   let since = std::time::Instant::now();
   drive();
   while !holds() {
-    assert!(since.elapsed() < LONGEST, "never came to hold");
-    TASKS.with(|tasks| tasks.ready.wait(LONGEST));
+    assert!(since.elapsed() < longest, "never came to hold");
+    TASKS.with(|tasks| tasks.ready.wait(Duration::from_millis(100)));
     drive();
   }
 }

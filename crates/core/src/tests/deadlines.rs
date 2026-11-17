@@ -52,9 +52,9 @@ fn a_call_that_settles_cancels_its_deadline() {
   let (_directory, carbon, timers) = timed();
   let identity = alice(&carbon);
   let personal = personal_notes(&carbon, &identity);
-  assert_eq!(timers.delays(), [], "creating an identity left no deadline behind");
+  assert!(timers.delays().is_empty(), "creating an identity left no deadline behind");
   call_now(&carbon, &personal, &actor(&identity), "POST [notes]/run", json!({"do": [{"insert": "a"}]})).unwrap();
   call_now(&carbon, &personal, &actor(&identity), "GET [notes]/texts", Value::Null).unwrap();
-  assert_eq!(timers.delays(), []);
+  assert!(timers.delays().is_empty());
   assert_eq!(texts(personal.store()).unwrap(), json!(["a"]));
 }

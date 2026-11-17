@@ -4,7 +4,7 @@ This is for anyone who needs to know how CarbonDB keeps the copies of a service 
 
 Each service runs in a channel, in a service space of its own: one SQLite file holding its tables, its op log and its results, so an op and its transaction always cover the same data. Services call each other by message; between services only delivery is guaranteed.
 
-Rewind and replay are built and tested on a single device: a device receives rows from other devices through `Carbon::receive`, and applies them in the shared order. Carrying rows between devices over p2panda is not built yet; see [stories/p2panda-sync.md](../stories/p2panda-sync.md).
+Rewind and replay are built and tested on a single device: a device receives rows from other devices through `Carbon::receive`, and applies them in the shared order. p2panda carries the rows between devices, as [sync.md](sync.md) tells.
 
 ## The promise
 
@@ -26,7 +26,7 @@ Every replica of a service that holds the same ops ends in the same state, whate
 Every replica applies ops sorted by time, then device, then op hash.
 
 - **Time** comes from a hybrid logical clock, in milliseconds. A device's clock never repeats or goes backwards, and it takes in the time of every op the device receives, so every op it makes afterwards sorts after them. An op therefore always sorts after every op its author had seen.
-- **Delivery** will come from p2panda, which delivers ops in causal order: an op arrives only after the ops it depends on. Causal order is partial: two ops made concurrently, neither having seen the other, are left unordered. The clock flattens it into one total order consistent with it, and breaks the tie between concurrent ops by time, then device, then hash.
+- **Delivery** comes from p2panda, which delivers ops in causal order: an op arrives only after the ops it depends on. Causal order is partial: two ops made concurrently, neither having seen the other, are left unordered. The clock flattens it into one total order consistent with it, and breaks the tie between concurrent ops by time, then device, then hash.
 - **Received times are admitted first.** A time at or above 2^53 ms is refused for good, the same on every replica. A time more than five minutes ahead of this device's wall clock is refused only for now, since another device's wall clock may already have reached it: its sender offers it again later. Only an admitted time enters the clock, so one peer's fast clock cannot drag every replica's times forward.
 - **Why not order by p2panda's causal graph instead**: it would still need a tie-break for concurrent ops, the clock already respects it, handlers need a real timestamp, and the order must work without p2panda, in single-node mode and in tests.
 

@@ -16,14 +16,17 @@ carbondb-svc-identity.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ed25519-dalek = "3.0.0"
-getrandom = "0.4.3"
 self_cell = "1.2.1"
 service-key = "0.6.0"
 sqlparser = { version = "=0.63.0", features = ["visitor"] }
 toml = "1.1.8"
 rand = { version = "0.10.1", default-features = false, features = ["std_rng"] }
-tokio = { version = "1.54.1", features = ["sync", "rt", "time", "net"] }
+tokio = { version = "1.54.1", features = ["sync", "rt", "rt-multi-thread", "time", "net", "macros"] }
+tokio-stream = "0.1"
+p2panda = "0.8.1"
+p2panda-encryption = "0.8.1"
+p2panda-spaces = "0.8.1"
+getrandom = "0.4.3"
 wasmtime = { version = "=50.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "component-model-async", "async", "std", "cache", "parallel-compilation"] }
 wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p2", "p3"] }
 wasmtime-wasi-http = { version = "=50.0.1", default-features = false, features = ["p2", "p3", "default-send-request", "component-model-async"] }
@@ -34,3 +37,4 @@ http-body-util = "0.1.5"
 
 [dev-dependencies]
 tempfile = "3"
+iroh-relay = { version = "1.4.1", features = ["server"] }

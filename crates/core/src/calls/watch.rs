@@ -202,8 +202,13 @@ impl Carbon {
   }
 
   // A commit to a space wrote these tables: each watch that read one runs
-  // again. Returns the watches it owes a run.
+  // again, and when the space syncs, what it applied of this device's is
+  // published and the messages held are offered again, since a commit may
+  // list a device (`crate::nodes`). Returns the watches it owes a run.
   pub(crate) fn committed(self: &Rc<Self>, space: &str, tables: &[String]) -> Vec<WatchId> {
+    self.publish(space);
+    self.listed_changed(space);
+    self.offer_all_held();
     let watches = self.watches.on(space);
     let owed = watches
       .iter()

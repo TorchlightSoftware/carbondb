@@ -9,9 +9,11 @@
 
 pub mod clock;
 pub mod effects;
+pub mod errors;
 pub mod fetch;
 pub mod op;
 pub mod op_writer;
 pub mod oplog;
+pub mod published;
 pub mod results;
 pub mod rewind;

@@ -39,6 +39,7 @@ pub const MIGRATIONS: &[Migration] = &[
   ("space/0002_sub_calls", include_str!("../../migrations/space/0002_sub_calls.sql")),
   ("space/0003_read_sets_and_changesets", include_str!("../../migrations/space/0003_read_sets_and_changesets.sql")),
   ("space/0004_effects", include_str!("../../migrations/space/0004_effects.sql")),
+  ("space/0005_published_and_errors", include_str!("../../migrations/space/0005_published_and_errors.sql")),
 ];
 
 // Where a space is in applying its ops: initializing until its package is

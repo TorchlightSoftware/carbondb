@@ -60,8 +60,8 @@ beforeEach(async () => {
 const texts = async (channel) => (await channel.call('GET [notes]/notes')).map((row) => row.text)
 
 describe('configure', () => {
-  it('refuses replicated mode, which is not built yet', async () => {
-    await assert.rejects(configure(configFile('system = "data/system.db"\n')), {status: 501, code: 'NOT_BUILT'})
+  it('refuses the all sync mode, which is not built yet', async () => {
+    await assert.rejects(configure(configFile('system = "data/system.db"\n[sync]\nmode = "all"\n')), {status: 501, code: 'NOT_BUILT'})
   })
 })
 

@@ -24,7 +24,7 @@ use crate::channels::service::RunState;
 use crate::Carbon;
 use crate::{Db, HandlerContext, Routing};
 
-pub use identities::{Identity, SYSTEM_MIGRATIONS, acting, find};
+pub use identities::{Identity, SYSTEM_MIGRATIONS, acting, credentials, find};
 
 // `[@carbon]` as the core registers it. It is not a package: no peer checks
 // its version, so its version is the core's own.
@@ -49,6 +49,7 @@ fn entry(call: Rc<ServiceCall>) {
   };
   match (call.call.method(), call.call.resource.as_str()) {
     ("POST", "/identity") => identities::create(Rc::clone(&call)),
+    ("POST", "/devices") => Rc::clone(call.carbon()).show_code(Rc::clone(&call)),
     ("GET", "/identities") => answer(identities::list(call.as_ref()).map(|identities| json!(identities))),
     ("GET", "/status") => answer(target(&call).and_then(|target| status(&call, &target))),
     ("POST", "/sync/start" | "/sync/stop") => {

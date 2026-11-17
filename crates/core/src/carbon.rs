@@ -8,8 +8,9 @@
 //! The core runs on a thread of its own (`crate::app::runtime`): the host
 //! hands it the timers and tasks it runs there.
 //!
-//! This is the single-node core: no p2panda and no network. Effects that need
-//! peers have no handler here, and are unreachable.
+//! Unless it runs single-node, each identity on this device runs a p2panda
+//! node (`crate::nodes`). Effects that need peers and have no handler yet are
+//! unreachable.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -27,6 +28,7 @@ use crate::channels::lifecycle::{Held, Starting};
 use crate::channels::service::ServiceSpace;
 use crate::config::{Config, SyncMode};
 use crate::error::{Result, bad_request, not_built};
+use crate::nodes::Nodes;
 use crate::ops::clock::Clock;
 use crate::ops::effects::Effects;
 use crate::ops::op::stamp;
@@ -64,13 +66,15 @@ pub struct Carbon {
   pub(crate) holding: RefCell<BTreeMap<String, Vec<Held>>>,
   // The spaces starting, by id.
   pub(crate) starting: RefCell<HashMap<String, Rc<Starting>>>,
+  // The identities' p2panda nodes.
+  pub(crate) nodes: Nodes,
 }
 
 impl Carbon {
   pub fn open(config_path: &Path, schedule: Schedule, spawn: Spawn) -> Result<Rc<Carbon>> {
     let config = Config::load(config_path)?;
-    if config.sync != SyncMode::None {
-      return Err(not_built("Replicated mode"));
+    if matches!(config.sync, SyncMode::All | SyncMode::Manual) {
+      return Err(not_built(&format!("The {:?} sync mode", config.sync)));
     }
     std::fs::create_dir_all(config.directory()).map_err(|error| bad_request(format!("Cannot create {}: {error}", config.directory().display())))?;
     wasm::keep_in(&config.compiled);
@@ -83,18 +87,22 @@ impl Carbon {
       schedule,
       spawn,
       services,
-      effects: Effects::default().with("call", Rc::new(call_effect)).with("create", Rc::new(crate::channels::create_effect)).with("fetch", Rc::new(crate::ops::fetch::fetch_effect)),
+      effects: Effects::default().with("call", Rc::new(call_effect)).with("create", Rc::new(crate::channels::create_effect)).with("fetch", Rc::new(crate::ops::fetch::fetch_effect)).with("enroll", Rc::new(crate::nodes::pairing::enroll_effect)),
       system,
       spaces: RefCell::default(),
       watches: Watches::default(),
       holding: RefCell::default(),
       starting: RefCell::default(),
+      nodes: Nodes::default(),
     });
     for (name, package) in builtins {
       package.compiled().wait()?;
       carbon.register(package.service(name))?;
     }
     carbon.drain(&carbon.system);
+    if carbon.config.sync != SyncMode::None {
+      carbon.run_nodes()?;
+    }
     Ok(carbon)
   }
 
