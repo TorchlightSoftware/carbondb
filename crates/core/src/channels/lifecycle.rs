@@ -29,7 +29,7 @@ use crate::calls::deadline::Deadline;
 use crate::calls::dispatch::{Reply, Taken};
 use crate::error::{Result, ServiceError};
 use crate::services::{DEFAULT_STARTUP_TIMEOUT, Service};
-use crate::channels::service::{RunState, ServiceSpace};
+use crate::channels::service::{RunState, ServiceStore};
 use crate::calls::watch::WatchId;
 use crate::{Actor, Call, Routing};
 
@@ -81,14 +81,14 @@ impl Carbon {
 
   // Start a space: Initializing, its startup time running, then each step in
   // turn, stopping it when one fails. Returns the watches it ran again.
-  pub(crate) fn initialize(self: &Rc<Self>, space: &Rc<ServiceSpace>) -> Vec<WatchId> {
+  pub(crate) fn initialize(self: &Rc<Self>, space: &Rc<ServiceStore>) -> Vec<WatchId> {
     let rerun = self.begin_starting(space);
     self.advance(space);
     rerun
   }
 
   // Mark a space Initializing and start its time running.
-  pub(crate) fn begin_starting(self: &Rc<Self>, space: &Rc<ServiceSpace>) -> Vec<WatchId> {
+  pub(crate) fn begin_starting(self: &Rc<Self>, space: &Rc<ServiceStore>) -> Vec<WatchId> {
     let rerun = self.set_run_state(space, RunState::Initializing { services: vec![space.runs.package.clone()] });
     let within = self.services().find(&space.runs.package).map_or(DEFAULT_STARTUP_TIMEOUT, |service| service.startup);
     let starting = Rc::new(Starting { last: RefCell::default(), running_out: RefCell::default() });
@@ -101,7 +101,7 @@ impl Carbon {
   }
 
   // Take the steps a space can take now, stopping it when one fails.
-  fn advance(self: &Rc<Self>, space: &Rc<ServiceSpace>) {
+  fn advance(self: &Rc<Self>, space: &Rc<ServiceStore>) {
     if let Err(error) = self.prepare(space) {
       self.stop(space, error);
     }
@@ -110,7 +110,7 @@ impl Carbon {
   // The steps that run at once: its package, unless it is still compiling,
   // which advances it again once it has; its setup; then its health check,
   // which runs on. Fails when this device lacks its package or its setup fails.
-  pub(crate) fn prepare(self: &Rc<Self>, space: &Rc<ServiceSpace>) -> Result<()> {
+  pub(crate) fn prepare(self: &Rc<Self>, space: &Rc<ServiceStore>) -> Result<()> {
     let package = &space.runs.package;
     if self.services().is_compiling(package) {
       return Ok(());
@@ -142,19 +142,19 @@ impl Carbon {
   }
 
   // The open spaces running a package that are not set up yet.
-  fn waiting_on(&self, package: &str) -> Vec<Rc<ServiceSpace>> {
-    self.open_spaces().into_iter().filter(|space| space.runs.package == package && space.service().is_none()).collect()
+  fn waiting_on(&self, package: &str) -> Vec<Rc<ServiceStore>> {
+    self.open_stores().into_iter().filter(|space| space.runs.package == package && space.service().is_none()).collect()
   }
 
   // Hold a GET while its space starts, until the space is ready or stopped.
-  pub(crate) fn hold(self: &Rc<Self>, space: &Rc<ServiceSpace>, taken: Taken) {
+  pub(crate) fn hold(self: &Rc<Self>, space: &Rc<ServiceStore>, taken: Taken) {
     let (carbon, here) = (Rc::clone(self), Rc::clone(space));
     self.keep_held(&space.id, Box::new(move || carbon.take(&here, taken)));
   }
 
   // The space is ready: its startup is over, the deadlines of the ops
   // waiting in its log begin, those ops apply, then the GETs held on it run.
-  fn ready(self: &Rc<Self>, space: &Rc<ServiceSpace>) {
+  fn ready(self: &Rc<Self>, space: &Rc<ServiceStore>) {
     if let Some(starting) = self.starting_now(&space.id, None) {
       starting.end();
     }
@@ -165,7 +165,7 @@ impl Carbon {
   }
 
   // Its time ran out before it was ready: it stops, with the last failure its health check met.
-  fn out_of_time(self: &Rc<Self>, space: &Rc<ServiceSpace>, starting: &Rc<Starting>, within: Duration) {
+  fn out_of_time(self: &Rc<Self>, space: &Rc<ServiceStore>, starting: &Rc<Starting>, within: Duration) {
     let current = self.starting_of(&space.id).is_some_and(|now| Rc::ptr_eq(&now, starting));
     if !current || !matches!(space.run_state(), RunState::Initializing { .. }) {
       return;
@@ -175,7 +175,7 @@ impl Carbon {
   }
 
   // Its health check: ready at once when its service names none.
-  fn check_health(self: &Rc<Self>, space: &Rc<ServiceSpace>, service: &Rc<Service>) {
+  fn check_health(self: &Rc<Self>, space: &Rc<ServiceStore>, service: &Rc<Service>) {
     let Some(path) = &service.health else { return self.ready(space) };
     match Call::from_key(&format!("GET [{}]{path}", space.runs.name)) {
       Ok(call) => self.try_health(space, call, service.timeout),
@@ -184,15 +184,15 @@ impl Carbon {
   }
 
   // Try its health check once, as no one, under its service's timeout.
-  fn try_health(self: &Rc<Self>, space: &Rc<ServiceSpace>, call: Call, timeout: Duration) {
+  fn try_health(self: &Rc<Self>, space: &Rc<ServiceStore>, call: Call, timeout: Duration) {
     let (carbon, here, again) = (Rc::clone(self), Rc::clone(space), call.clone());
     let reply: Reply = Box::new(move |result| carbon.health_answered(&here, again, timeout, result.map(|settled| settled.value)));
     let deadline = Deadline::arm(self, call.key(), timeout);
-    self.read(space, Taken { actor: Actor::default(), call, input: Value::Null, awaiting: vec![], deadline, reply });
+    self.read(space, Taken { actor: Actor::default(), call, input: Value::Null, cause: None, awaiting: vec![], deadline, reply });
   }
 
   // It passed, and the space is ready; or it failed, and tries again while the space is still starting.
-  fn health_answered(self: &Rc<Self>, space: &Rc<ServiceSpace>, call: Call, timeout: Duration, result: Result<Value>) {
+  fn health_answered(self: &Rc<Self>, space: &Rc<ServiceStore>, call: Call, timeout: Duration, result: Result<Value>) {
     if !matches!(space.run_state(), RunState::Initializing { .. }) {
       return;
     }

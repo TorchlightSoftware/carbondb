@@ -2,9 +2,9 @@
 //! database keeps them. An identity is its first device's key pair; its own
 //! channel, running `[identity]` and sealed once founded, shared only by the
 //! person's own devices; and its personal channel, where everything else of
-//! the person's nests. Both are set up by ops through `[channel]` and
-//! `[identity]`. Its record here keeps the first device's secret key, which no
-//! channel ever holds.
+//! the person's nests. They are created by `[@carbon]`'s effects and calls
+//! (`spaces`), and set up by ops through `[channel]` and `[identity]`. Its
+//! record here keeps the device's secret key, which no channel ever holds.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -26,8 +26,6 @@ use crate::{Actor, Db, HandlerContext};
 // device, each with its first device's secret key, and the spaces it holds.
 pub const SYSTEM_MIGRATIONS: &[Migration] = &[
   ("system/0001_identities", include_str!("../../../migrations/system/0001_identities.sql")),
-  ("system/0002_channels_and_spaces", include_str!("../../../migrations/system/0002_channels_and_spaces.sql")),
-  ("system/0003_space_identity", include_str!("../../../migrations/system/0003_space_identity.sql")),
 ];
 
 // An identity on this device, as anyone on it may see it: everything but the
@@ -84,6 +82,28 @@ pub fn list(system: &dyn Db) -> Result<Vec<Value>> {
   system.all(&format!("SELECT {COLUMNS} FROM carbon_system_identity ORDER BY slug"), &[])
 }
 
+impl crate::Carbon {
+  // An identity's device credentials on this device, which `[@carbon]` signs with.
+  pub(crate) fn credentials_of(&self, identity: &str) -> Result<p2panda::Credentials> {
+    if let Some(credentials) = self.keys.borrow().get(identity) {
+      return Ok(credentials.clone());
+    }
+    let read = credentials(&self.system.store().reader()?, identity)?;
+    self.remember_keys(identity, read.clone());
+    Ok(read)
+  }
+
+  // Keep an identity's credentials at hand, as founding does before the identity is recorded.
+  pub(crate) fn remember_keys(&self, identity: &str, credentials: p2panda::Credentials) {
+    self.keys.borrow_mut().insert(identity.to_string(), credentials);
+  }
+
+  // Let go of an identity's credentials, as a failed founding does.
+  pub(crate) fn forget_keys(&self, identity: &str) {
+    self.keys.borrow_mut().remove(identity);
+  }
+}
+
 // Record an identity on this device, with its first device's secret key.
 fn keep(system: &dyn Db, identity: &Identity, secret: &str) -> Result<()> {
   system.run(
@@ -93,12 +113,14 @@ fn keep(system: &dyn Db, identity: &Identity, secret: &str) -> Result<()> {
   Ok(())
 }
 
-// Found an identity: its own channel, created first since the `create`
-// effect answers its id, then its `[identity]` and personal channel, then the
-// personal channel's services and the seal on its own channel; recorded in
-// this call's own transaction once all of it is set up, so an identity is
-// listed only when it is whole. When this device syncs, the identity's node
-// starts first, since it creates the p2panda space of each.
+// Found an identity, as one `[@carbon]` op on the system handle. When this
+// device syncs, its node starts first, since it creates the p2panda space of
+// each new channel. The `create` effect makes its own channel; then calls set
+// it up: its origin, `[@carbon]` there adding `[identity]`, the identity's
+// origin, and `[@carbon]` there adding the personal channel; then `[@carbon]`
+// on the personal channel adds its services, and the own channel is sealed.
+// The identity is recorded in this op's own transaction once all of it is
+// set up, so an identity is listed only when it is whole.
 pub fn create(call: Rc<ServiceCall>) {
   let request: IdentityInput = match serde_json::from_value(call.input.clone()) {
     Ok(request) => request,
@@ -112,32 +134,32 @@ pub fn create(call: Rc<ServiceCall>) {
     let _ = call.settle(joined);
     return;
   }
-  let founding = match plan(&call, request) {
+  let founding = match plan(&call, request).and_then(|founding| start(&call, &founding).map(|_| founding)) {
     Ok(founding) => founding,
     Err(error) => {
       let _ = call.settle(Err(error));
       return;
     }
   };
-  if let Err(error) = call.carbon().start_founding_node(&founding.id, &founding.keys.secret) {
-    let _ = call.settle(Err(error));
-    return;
-  }
   let caller = Rc::clone(&call);
-  steps::run(call, VecDeque::from([founding.own_space()]), Box::new(move |created| {
-    let channel = created.and_then(|returned| returned[0]["space"].as_str().map(str::to_string).ok_or_else(|| internal("The create effect answered without its space")));
-    match channel {
-      Ok(channel) => own_channel(caller, founding, channel),
-      Err(error) => fail(&caller, &founding, error),
-    }
+  let own = json!({"package": "channel", "name": "channel", "identity": founding.id});
+  HandlerContext::effect(call, "create", own, Box::new(move |created| match created.and_then(|created| created["space"].as_str().map(str::to_string).ok_or_else(|| internal("The create effect answered without its channel"))) {
+    Ok(channel) => own_channel(caller, founding, channel),
+    Err(error) => fail(&caller, &founding, error),
   }))
 }
 
-// Set up the identity's own channel, and the personal channel inside it.
+// Keep the new identity's keys at hand, for signing as it is set up, and start its node.
+fn start(call: &ServiceCall, founding: &Founding) -> Result<()> {
+  call.carbon().remember_keys(&founding.id, keys::credentials(&founding.keys.secret)?);
+  call.carbon().start_founding_node(&founding.id, &founding.keys.secret)
+}
+
+// Set up the identity's own channel, and the personal channel inside it, whose ref the last step answers.
 fn own_channel(call: Rc<ServiceCall>, founding: Founding, channel: String) {
   let caller = Rc::clone(&call);
   steps::run(call, founding.own_channel(&channel), Box::new(move |founded| {
-    let personal = founded.and_then(|returned| returned.last().and_then(|reference| reference["channel"].as_str()).map(str::to_string).ok_or_else(|| internal("POST [channel]/channel answered without its channel")));
+    let personal = founded.and_then(|returned| returned.last().and_then(|reference| reference["channel"].as_str()).map(str::to_string).ok_or_else(|| internal("POST [@carbon]/channel answered without its channel")));
     match personal {
       Ok(personal) => finish(caller, founding, channel, personal),
       Err(error) => fail(&caller, &founding, error),
@@ -145,7 +167,7 @@ fn own_channel(call: Rc<ServiceCall>, founding: Founding, channel: String) {
   }))
 }
 
-// Add the personal channel's services and seal the identity's own channel, then keep the identity here.
+// Add the personal channel's services and seal the own channel, then keep the identity here.
 fn finish(call: Rc<ServiceCall>, founding: Founding, channel: String, personal: String) {
   let identity = founding.identity(&channel, &personal);
   let caller = Rc::clone(&call);
@@ -159,9 +181,14 @@ fn finish(call: Rc<ServiceCall>, founding: Founding, channel: String, personal: 
   }))
 }
 
-// An identity that could not be founded: its node, if one started, stops.
+// An identity that could not be founded: its node, if one started, stops,
+// its keys are let go, and everything in its directory is deleted, the
+// channels its calls created included.
 fn fail(call: &ServiceCall, founding: &Founding, error: crate::ServiceError) {
-  call.carbon().stop_node(&founding.id);
+  let carbon = call.carbon();
+  carbon.stop_node(&founding.id);
+  carbon.forget_keys(&founding.id);
+  let error = carbon.forget_identity(&founding.id).err().unwrap_or(error);
   let _ = call.settle(Err(error));
 }
 
@@ -210,28 +237,25 @@ impl Founding {
     Actor { identity: Some(self.id.clone()), device: Some(self.keys.public.clone()) }
   }
 
-  // The space of the identity's own channel, created by its node when this device syncs.
-  fn own_space(&self) -> Step {
-    Step::Effect { name: "create", input: json!({"package": "channel", "name": "channel", "identity": self.id}) }
+  fn call(&self, space: &str, key: &'static str, input: Value) -> Step {
+    Step { space: space.to_string(), actor: self.actor(), key, input }
   }
 
-  // The identity's own channel, its `[identity]` with the first device, and
-  // the personal channel inside it, whose ref the last step answers.
-  fn own_channel(&self, channel: &str) -> VecDeque<Step> {
-    let call = |key: &'static str, input: Value| Step::Call { space: channel.to_string(), actor: self.actor(), key, input };
+  // The own channel's origin, its `[identity]` with the first device, and the
+  // personal channel inside it, added by `[@carbon]` there.
+  fn own_channel(&self, own: &str) -> VecDeque<Step> {
     VecDeque::from([
-      call("POST [channel]/origin", json!({"kind": "identity", "name": self.slug, "manage": [self.id]})),
-      call("POST [channel]/services", json!({"name": "identity"})),
-      call("POST [identity]/origin", json!({"device": self.keys.public, "name": self.device_name, "tags": ["manage"]})),
-      call("POST [channel]/channel", json!({"kind": "personal", "name": self.slug, "slug": self.slug})),
+      self.call(own, "POST [channel]/origin", json!({"kind": "identity", "name": self.slug, "manage": [self.id]})),
+      self.call(own, "POST [@carbon]/services", json!({"name": "identity"})),
+      self.call(own, "POST [identity]/origin", json!({"device": self.keys.public, "name": self.device_name, "tags": ["manage"]})),
+      self.call(own, "POST [@carbon]/channel", json!({"kind": "personal", "name": self.slug, "slug": self.slug})),
     ])
   }
 
-  // The personal channel's services, then the seal on the identity's own channel.
-  fn rest(&self, channel: &str, personal: &str) -> VecDeque<Step> {
-    let services = self.personal_services.iter().map(|name| Step::Call { space: personal.to_string(), actor: self.actor(), key: "POST [channel]/services", input: json!({"name": name}) });
-    let seal = Step::Call { space: channel.to_string(), actor: self.actor(), key: "POST [channel]/seal", input: json!({}) };
-    services.chain(std::iter::once(seal)).collect()
+  // The personal channel's services, added by `[@carbon]` there, then the seal on the own channel.
+  fn rest(&self, own: &str, personal: &str) -> VecDeque<Step> {
+    let services = self.personal_services.iter().map(|name| self.call(personal, "POST [@carbon]/services", json!({"name": name})));
+    services.chain(std::iter::once(self.call(own, "POST [channel]/seal", json!({})))).collect()
   }
 
   fn identity(&self, channel: &str, personal: &str) -> Identity {

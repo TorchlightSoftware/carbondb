@@ -32,7 +32,7 @@ A generator writes `service.toml` from a `wrangler.toml` for services ported fro
 
 ## Bindings
 
-- A handler sees only bindings to storage that already exists, as a Worker sees `env.DB`. It never creates storage, generates keys or touches the system database. Creating a service's storage is an effect of `POST [channel]/services`.
+- A handler sees only bindings to storage that already exists, as a Worker sees `env.DB`. It never creates storage, generates keys or touches the system database. Creating a service's storage is the core's, a step of `POST [@carbon]/services`.
 - Each service runs in a space of its own: one SQLite file holding its tables beside CarbonDB's record of it (its op log and results, named `carbon_`), so an op and its transaction always cover the same data. Data that must change together in one op lives in one service; a call to another service is a message, and atomicity ends at the service.
 - A device sets up a service when it creates the service's space, and again on every open: it calls the service's `setup` in a transaction of its own, outside any op, then checks its tables' keys. This is internal to the core; nothing calls it directly. A replica will do the same when it joins the service's space, which needs peers.
 - A service's statements run as written, with no rewrite into a namespace. SQLite's authorizer refuses a statement that names CarbonDB's `carbon_` tables or reaches another file through ATTACH or a pragma, and records what each statement read.
@@ -67,7 +67,7 @@ A service name means something only inside a channel. A channel's `[channel]` ke
 
 The entry is also what a peer needs to join a channel: which packages to register, or fetch, before each service's ops can apply. CarbonDB's core, in its init and maintenance loop, reads the channels its identity belongs to, joins their services and fetches their WASM, at the lower of the identity's grant and the device's policy. Not built: it needs peers and the WASM host.
 
-A package's registered name is still device-wide: the core keeps one registry for the whole device, so a name CarbonDB already uses, such as `identity`, cannot be registered by an app. The channel gives the local `[name]` with `POST [channel]/services {name, package}`.
+A package's registered name is still device-wide: the core keeps one registry for the whole device, so a name CarbonDB already uses, such as `identity`, cannot be registered by an app. The channel gives the local `[name]` with `POST [@carbon]/services {name, package}`.
 
 Open:
 

@@ -39,7 +39,6 @@ fn calls_inside_an_op_see_its_writes_and_roll_back_on_their_own() {
       Ok(json!([[{"error": 409}]])),
       json!(["a", "b"]),
     ),
-    ("a replicated service never calls a local one", json!([{"call": "GET [@carbon]/status"}]), Err(403), json!([])),
   ];
   for (why, script, expected, committed) in cases {
     let (_directory, carbon) = carbon();

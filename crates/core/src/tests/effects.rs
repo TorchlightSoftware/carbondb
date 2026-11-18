@@ -9,17 +9,17 @@ fn room_with_jots(always: &[&str]) -> (tempfile::TempDir, Rc<crate::Carbon>, cra
   register_script_making(&carbon, "loud", always);
   let identity = alice(&carbon);
   let room = room_channel(&carbon, &identity);
-  on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "jots"})).unwrap();
-  on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "loud"})).unwrap();
+  on(&carbon, &room, &identity, "POST [@carbon]/services", json!({"name": "jots"})).unwrap();
+  on(&carbon, &room, &identity, "POST [@carbon]/services", json!({"name": "loud"})).unwrap();
   (directory, carbon, identity, room)
 }
 
 // A row arriving from alice's other device, late: before everything here.
-fn late(carbon: &Rc<crate::Carbon>, space: &crate::ServiceSpace, script: Value, effects: Option<Vec<Made>>) {
+fn late(carbon: &Rc<crate::Carbon>, space: &crate::ServiceStore, script: Value, effects: Option<Vec<Made>>) {
   let call = crate::Call::from_key(&format!("POST [{}]/run", space.runs.name)).unwrap();
   let actor = Actor { identity: Some("alice".into()), device: Some("laptop".into()) };
   let op = crate::ops::op::stamp(&actor, &call, &json!({"do": script}), &carbon.services().version(&space.runs.package), 1);
-  now(|received| carbon.receive(&space.id, oplog::LogRow { op, effects }, received)).unwrap();
+  carbon.receive_in(&carbon.opened(&space.id).unwrap(), oplog::LogRow { op, effects, cause: None }).unwrap();
 }
 
 #[test]
@@ -28,8 +28,8 @@ fn a_call_to_another_service_is_made_once_and_replayed_after_a_rewind() {
   let script = json!({"do": [{"read": true}, {"call": "POST [jots]/run", "input": {"do": [{"insert": "j"}]}}]});
   on(&carbon, &room, &identity, "POST [notes]/run", script).unwrap();
   let (notes, jots) = (service(&carbon, &room, "notes"), service(&carbon, &room, "jots"));
-  let made = &oplog::entries(notes.store()).unwrap()[0];
-  let recorded = oplog::effects(notes.store(), &made.hash).unwrap().unwrap();
+  let made = &entries(&notes)[0];
+  let recorded = oplog::effects(notes.channel.log(), &made.hash).unwrap().unwrap();
   assert_eq!((recorded.len(), recorded[0].name.as_str(), recorded[0].output.clone()), (1, "call", Ok(json!([]))));
   assert_eq!(logged(&jots), vec!["POST [jots]/run"], "the call is a message, an op in the other service");
 
@@ -46,7 +46,7 @@ fn an_effect_declared_always_is_made_again_on_every_run() {
   let script = json!({"do": [{"read": true}, {"call": "POST [jots]/run", "input": {"do": [{"insert": "j"}]}}]});
   on(&carbon, &room, &identity, "POST [loud]/run", script).unwrap();
   let (loud, jots) = (service(&carbon, &room, "loud"), service(&carbon, &room, "jots"));
-  assert_eq!(oplog::effects(loud.store(), &oplog::entries(loud.store()).unwrap()[0].hash).unwrap(), Some(vec![]), "nothing is recorded");
+  assert_eq!(oplog::effects(loud.channel.log(), &entries(&loud)[0].hash).unwrap(), Some(vec![]), "nothing is recorded");
   late(&carbon, &loud, json!([{"insert": "early"}]), Some(vec![]));
   assert_eq!(logged(&jots), vec!["POST [jots]/run", "POST [jots]/run"]);
 }
@@ -67,6 +67,16 @@ fn a_write_back_into_a_service_waiting_on_the_call_is_refused_at_once_and_a_read
 }
 
 #[test]
+fn a_service_calls_carbon_as_a_message_made_once() {
+  let (_directory, carbon, identity, room) = room_with_jots(&[]);
+  let answered = on(&carbon, &room, &identity, "POST [notes]/run", json!({"do": [{"call": "GET [@carbon]/status", "input": {"service": "jots"}}]})).unwrap();
+  assert_eq!(answered[0]["name"], json!("jots"));
+  let notes = service(&carbon, &room, "notes");
+  let recorded = oplog::effects(notes.channel.log(), &entries(&notes)[0].hash).unwrap().unwrap();
+  assert_eq!((recorded[0].name.as_str(), recorded[0].input["key"].as_str()), ("call", Some("GET [@carbon]/status")));
+}
+
+#[test]
 fn a_refused_founding_leaves_no_channel_or_service_behind() {
   let (directory, carbon) = carbon();
   let setup = Rc::new(|db: Rc<dyn Db>| db.run("CREATE TABLE IF NOT EXISTS hit (id INTEGER PRIMARY KEY)", &[]).map(|_| ()));
@@ -74,9 +84,10 @@ fn a_refused_founding_leaves_no_channel_or_service_behind() {
   let input = json!({"slug": "alice", "device": "Pixel9", "services": ["counter"]});
   let refused = call_now(&carbon, carbon.system(), &Actor::default(), "POST [@carbon]/identity", input).unwrap_err();
   assert_eq!(refused.details, Some(json!({"table": "hit"})));
-  let files: Vec<String> = std::fs::read_dir(directory.path().join("data")).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().to_string()).filter(|name| name.ends_with(".db")).collect();
-  assert_eq!(files, ["system.db"]);
-  let held = carbon.system().store().reader().unwrap().all("SELECT id FROM carbon_system_space", &[]).unwrap();
+  let mut files: Vec<String> = std::fs::read_dir(directory.path().join("data")).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().to_string()).filter(|name| !name.ends_with("-wal") && !name.ends_with("-shm")).collect();
+  files.sort();
+  assert_eq!(files, ["system.db", "system.log.db"], "nothing of the identity is left: its directory is gone");
+  let held = carbon.system().store().reader().unwrap().all("SELECT id FROM carbon_system_identity", &[]).unwrap();
   assert_eq!(held, Vec::<Value>::new());
 }
 
@@ -86,7 +97,7 @@ fn a_received_op_replays_the_effects_its_row_carries_and_one_beyond_them_is_unre
   let (notes, jots) = (service(&carbon, &room, "notes"), service(&carbon, &room, "jots"));
   let answered = Made { name: "call".into(), input: json!({"key": "GET [jots]/texts"}), output: Ok(json!(["from the author"])) };
   late(&carbon, &notes, json!([{"call": "GET [jots]/texts"}, {"call": "GET [jots]/texts", "catch": true}]), Some(vec![answered]));
-  let op = &oplog::entries(notes.store()).unwrap()[0];
+  let op = &entries(&notes)[0];
   let Some(Outcome::Applied { output, .. }) = results::of(notes.store(), &op.hash).unwrap() else { panic!("applied") };
   assert_eq!(output, json!([["from the author"], {"error": 503}]));
   assert_eq!(logged(&jots), Vec::<String>::new());

@@ -4,7 +4,7 @@ use super::*;
 fn creates_a_channel_inside_another_and_points_to_it() {
   let (_directory, carbon) = carbon();
   let identity = alice(&carbon);
-  let create = |name: &str| on(&carbon, &identity.personal, &identity, "POST [channel]/channel", json!({"name": name})).unwrap();
+  let create = |name: &str| on(&carbon, &identity.personal, &identity, "POST [@carbon]/channel", json!({"name": name})).unwrap();
   let created = create("Randall's Playhouse");
   assert_eq!((created["slug"].as_str(), created["kind"].as_str()), (Some("randalls-playhouse"), Some("channel")));
   assert_eq!(create("Randall's Playhouse")["slug"].as_str(), Some("randalls-playhouse-2"));
@@ -13,7 +13,10 @@ fn creates_a_channel_inside_another_and_points_to_it() {
 
   let playhouse = space_now(&carbon, channel).unwrap();
   assert_eq!(logged(&playhouse), vec!["POST [channel]/origin"]);
-  assert_eq!(playhouse.runs.channel.as_deref(), Some(channel), "a channel's space belongs to itself");
+  let personal = carbon.carbon_store(&carbon.channel(&identity.personal).unwrap()).unwrap();
+  assert_eq!(logged(&personal), vec!["POST [@carbon]/services", "POST [@carbon]/channel", "POST [@carbon]/channel"], "[@carbon] logs in the channel it was called on");
+  assert_eq!(logged(carbon.system()), vec!["POST [@carbon]/identity"]);
+  assert_eq!(playhouse.channel.id, channel, "a channel's own [channel] belongs to it");
   let status = on(&carbon, channel, &identity, "GET [@carbon]/status", Value::Null).unwrap();
   assert_eq!(
     (&status["name"], &status["kind"], &status["access"], &status["sync"], &status["peers"], &status["services"]),
@@ -43,11 +46,11 @@ fn reports_the_status_of_a_channel_or_one_of_its_services_for_the_identity_actin
 
 #[test]
 fn names_a_service_it_creates_and_resolves_calls_to_it() {
-  let (_directory, carbon) = carbon();
+  let (directory, carbon) = carbon();
   crate::testing::register_script(&carbon, "jots");
   let identity = alice(&carbon);
   let room = room_channel(&carbon, &identity);
-  let named = on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "scratch", "package": "jots"})).unwrap();
+  let named = on(&carbon, &room, &identity, "POST [@carbon]/services", json!({"name": "scratch", "package": "jots"})).unwrap();
   assert_eq!(named["version"], json!("jots-v1"));
   on(&carbon, &room, &identity, "POST [scratch]/run", json!({"do": [{"insert": "s"}]})).unwrap();
   assert_eq!(on(&carbon, &room, &identity, "GET [scratch]/texts", Value::Null).unwrap(), json!(["s"]));
@@ -59,10 +62,26 @@ fn names_a_service_it_creates_and_resolves_calls_to_it() {
     (json!({"name": "channel"}), 409),
     (json!({"name": "crm"}), 404),
   ];
+  let spaces = || std::fs::read_dir(directory.path().join("data")).unwrap().count();
+  let before = spaces();
   for (input, status) in refused {
-    assert_eq!(on(&carbon, &room, &identity, "POST [channel]/services", input.clone()).unwrap_err().status, status, "{input}");
+    assert_eq!(on(&carbon, &room, &identity, "POST [@carbon]/services", input.clone()).unwrap_err().status, status, "{input}");
   }
+  assert_eq!(spaces(), before, "a refused [@carbon] op deletes the spaces it created");
   assert_eq!(on(&carbon, &room, &identity, "GET [elsewhere]/texts", Value::Null).unwrap_err().status, 404);
+}
+
+#[test]
+fn a_channel_names_a_service_only_on_carbons_signed_word() {
+  let (_directory, carbon) = carbon();
+  let identity = alice(&carbon);
+  let room = room_channel(&carbon, &identity);
+  let notes = service(&carbon, &room, "notes");
+  let claimed = json!({"name": "copy", "space": notes.id, "package": "notes", "version": "notes-v1", "signature": "00"});
+  let refused = on(&carbon, &room, &identity, "POST [channel]/services", claimed).unwrap_err();
+  assert_eq!((refused.status, refused.message.as_str()), (403, "POST [channel]/services records only what [@carbon] signed with the op's device key"));
+  let listed = on(&carbon, &identity.channel, &identity, "POST [identity]/devices", json!({"pubkey": "b2", "name": "Laptop", "signature": "00"})).unwrap_err();
+  assert_eq!(listed.status, 403);
 }
 
 #[test]
@@ -71,7 +90,7 @@ fn only_a_manager_changes_a_channel() {
   let identity = alice(&carbon);
   let personal = space_now(&carbon, &identity.personal).unwrap();
   let stranger = Actor { identity: Some("someone-else".into()), device: None };
-  let error = call_now(&carbon, &personal, &stranger, "POST [channel]/channel", json!({"name": "Room"})).unwrap_err();
+  let error = call_now(&carbon, &carbon.carbon_store(&personal.channel).unwrap(), &stranger, "POST [@carbon]/channel", json!({"name": "Room"})).unwrap_err();
   assert_eq!(error.status, 403);
   let leaving = call_now(&carbon, &personal, &stranger, "POST [channel]/leave", json!({})).unwrap_err();
   assert_eq!(leaving.code, "UNREACHABLE", "leaving needs no manage, only peers");
@@ -117,22 +136,4 @@ fn a_ref_to_the_same_channel_replaces_the_last() {
   }
   let refs = on(&carbon, &identity.personal, &identity, "GET [channel]/refs", Value::Null).unwrap();
   assert_eq!(refs, json!([{"channel": "c1", "kind": "team", "name": "Sales West", "slug": "sales-west", "cascade": []}]));
-}
-
-#[test]
-fn deletes_this_devices_copy_of_a_service_or_of_a_channel_and_its_services() {
-  let (directory, carbon) = carbon();
-  crate::testing::register_script(&carbon, "jots");
-  let identity = alice(&carbon);
-  let room = room_channel(&carbon, &identity);
-  on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "jots"})).unwrap();
-  let (notes, jots) = (service(&carbon, &room, "notes").id.clone(), service(&carbon, &room, "jots").id.clone());
-  on(&carbon, &room, &identity, "DELETE [@carbon]/data", json!({"service": "jots"})).unwrap();
-  assert!(!directory.path().join("data").join(format!("{jots}.db")).exists());
-  assert!(directory.path().join("data").join(format!("{notes}.db")).exists());
-  on(&carbon, &room, &identity, "DELETE [@carbon]/data", Value::Null).unwrap();
-  for id in [&room, &notes] {
-    assert!(!directory.path().join("data").join(format!("{id}.db")).exists(), "{id}");
-    assert_eq!(space_now(&carbon, id).err().map(|error| error.status), Some(404), "{id}");
-  }
 }

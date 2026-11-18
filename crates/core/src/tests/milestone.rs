@@ -1,11 +1,12 @@
 //! The first milestone: the flow a person takes, two devices in one process,
-//! in each network configuration: mDNS alone, as on one LAN; an iroh relay
+//! in each network configuration: mDNS alone, as on one LAN, skipped where
+//! the host offers no multicast, as some CI containers do; an iroh relay
 //! the test runs on localhost, with mDNS off, the enrollment code standing in
 //! for bootstrap; and a configured bootstrap, a third p2panda node behind the
 //! same relay. The relay serves plain HTTP in dev mode, since p2panda's node
 //! builder offers no way to trust a self-signed certificate.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use iroh_relay::server::{RelayConfig, Server, ServerConfig};
@@ -39,7 +40,7 @@ fn flow(sync: &str) {
   // Device 1 founds alice; device 2 shows a code, which device 1 scans.
   let alice = found(&one, "alice", &[]);
   let shown = awaited(|answer| two.call(None, None, "POST [@carbon]/devices", Value::Null, answer)).unwrap();
-  let enrolled = on_awaited(&one, &alice.channel, &alice, "POST [identity]/devices", json!({"code": shown["code"], "name": "Laptop", "tags": []})).unwrap();
+  let enrolled = on_awaited(&one, &alice.channel, &alice, "POST [@carbon]/enroll", json!({"code": shown["code"], "name": "Laptop", "tags": []})).unwrap();
   assert_eq!(enrolled["pubkey"], shown["device"]);
 
   // Device 2 joins alice, under its own device key.
@@ -48,7 +49,7 @@ fn flow(sync: &str) {
   let laptop = crate::Identity { device: shown["device"].as_str().unwrap().to_string(), ..alice.clone() };
 
   // Alice adds [chat] to her personal channel, and each device's message reaches the other.
-  on_awaited(&one, &alice.personal, &alice, "POST [channel]/services", json!({"name": "chat"})).unwrap();
+  on_awaited(&one, &alice.personal, &alice, "POST [@carbon]/services", json!({"name": "chat"})).unwrap();
   on_awaited(&one, &alice.personal, &alice, "POST [chat]/run", json!({"do": [{"insert": "from the phone"}]})).unwrap();
   until_within(NETWORK, || chat(&two, &laptop.personal) == ["from the phone"]);
   on_awaited(&two, &laptop.personal, &laptop, "POST [chat]/run", json!({"do": [{"insert": "from the laptop"}]})).unwrap();
@@ -72,8 +73,20 @@ fn bootstrap(relay: &str) -> (p2panda::Node, String) {
   (node, id)
 }
 
+// mDNS's multicast group.
+const MDNS: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+
+// Why this host cannot run mDNS, if it cannot: it lets no socket join a multicast group.
+fn no_multicast() -> Option<String> {
+  let joined = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|socket| socket.join_multicast_v4(&MDNS, &Ipv4Addr::UNSPECIFIED));
+  joined.err().map(|error| error.to_string())
+}
+
 #[test]
 fn one_identity_enrolls_a_second_device_and_chats_between_them_over_mdns() {
+  if let Some(why) = no_multicast() {
+    return eprintln!("skipped: mDNS needs multicast, which this host does not offer ({why})");
+  }
   flow("mode = \"ref\"\nmdns = \"active\"");
 }
 

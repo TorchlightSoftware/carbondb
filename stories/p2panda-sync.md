@@ -2,7 +2,7 @@
 
 Status: agreed — the first milestone is built (identity, enrollment, a service in the personal channel, chat between two devices; see [docs/sync.md](../docs/sync.md)); next, fetching packages from peers
 
-This plan carries each service's ops between devices and identities with p2panda 0.8, behind CarbonDB's identity-level API. What is built is described in [docs/sync.md](../docs/sync.md): one node per identity, space ids from the `create` effect, publishing from the op log, the check on every received op, loading in the `ref` sync mode, and enrolling a device by the code it shows. [implementation.md](implementation.md) holds the wider design; where the two disagree about p2panda, this file wins.
+This plan carries each service's ops between devices and identities with p2panda 0.8, behind CarbonDB's identity-level API. What is built is described in [docs/sync.md](../docs/sync.md): one node per identity, spaces created only by the core through `[@carbon]`, publishing from the op log, the check on every received op, loading in the `ref` sync mode, and enrolling a device by the code it shows. [implementation.md](implementation.md) holds the wider design; where the two disagree about p2panda, this file wins.
 
 ## Agreed, not built yet
 
@@ -10,20 +10,19 @@ This plan carries each service's ops between devices and identities with p2panda
 
 - A node's iroh relays also come from its identity's relay devices: a relay device is a pull-only device of the identity whose host also runs an iroh relay, so enrolling it gives the identity both at one address, and it serves only its own identity.
 - An identity chooses its own bootstraps, from those the TOML file offers or others, and uses them to fill its address book and find public channels. A configured bootstrap is also a well-known place to post invites, identities and cryptographic claims; to hold what is posted, it runs CarbonDB and holds the spaces it is posted in. Where an identity records its choice is not yet defined; until then its node uses the bootstraps the TOML file offers.
-- The mDNS configuration of the first milestone's test is skipped, with its reason, where multicast is unavailable, such as some CI containers. It runs everywhere for now.
 
 ### Receiving
 
-- If `[identity]` later lists a device whose messages failed the check as an unlisted device, they are offered again from the signed operations `carbon_error` keeps. That needs a way to decode a kept operation's body again, which p2panda encrypts towards the space's members.
+- If `[identity]` later lists a device whose messages failed the check as an unlisted device, they are offered again from the signed operations the sync file's `carbon_error` keeps. That needs a way to decode a kept operation's body again, which p2panda encrypts towards the space's members.
 
 ### Enrollment and the default policy
 
-- The reverse direction: the existing device shows a code and the new device scans it, with `POST [@carbon]/identity {slug, code, device}`; which op records the new device's key, name and tags once that exchange finishes is not yet defined ([story 2](02-add-device.md)).
-- The agreed design has the device that made an op carry out the membership changes it calls for, once. What is built has every device add the listed devices missing from the spaces it follows; adding a member already added changes nothing, so it differs only in who does it. The full assignment policy settles which.
+- The reverse direction: the existing device shows a code and the new device scans it, with `POST [@carbon]/identity {slug, code, device}`; which `[@carbon]` call shows the code, and which op records the new device's key, name and tags once that exchange finishes, are not yet defined ([story 2](02-add-device.md)).
 
 ### Sync modes
 
 - `manual`: the app loads spaces itself, with `POST [@carbon]/sync/start`. `all`: not yet defined. Both are refused as not built.
+- Unloading: removing this device's copy of a channel or a service, the reverse of loading it, under a precise name and with full cleanup: its spaces, its local space, its node no longer following them, and its sync bookkeeping. The former `DELETE [@carbon]/data` did part of this and was removed until the sync modes define it.
 
 ## Open
 

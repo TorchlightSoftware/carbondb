@@ -24,6 +24,15 @@ pub trait Routing: Sized {
   fn unknown(&self) -> ServiceError;
 }
 
+// The service a call is addressed to, by the name its channel gives it:
+// `@carbon` for `[@carbon]`, `name` for `[name]`.
+pub fn address(call: &Call) -> String {
+  match call.confined {
+    true => format!("@{}", call.service),
+    false => call.service.clone(),
+  }
+}
+
 impl Routing for Call {
   fn from_key(key: &str) -> Result<Call> {
     Call::parse(key).ok_or_else(|| bad_request(format!("'{key}' is not a service key")))

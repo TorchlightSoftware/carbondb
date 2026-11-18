@@ -27,9 +27,9 @@ async function start(config) {
   } else {
     await carbon.call('POST [@carbon]/identity', {slug: 'app', device: 'server'})
     const personal = carbon.ref('identity:app').ref('personal:app')
-    await personal.call('POST [channel]/channel', {name: 'Lobby'})
+    await personal.call('POST [@carbon]/channel', {name: 'Lobby'})
     const lobby = personal.ref('channel:lobby')
-    await lobby.call('POST [channel]/services', {name: 'chat'})
+    await lobby.call('POST [@carbon]/services', {name: 'chat'})
     return lobby
   }
 }

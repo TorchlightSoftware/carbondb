@@ -1,7 +1,9 @@
-//! The p2panda space of each service space a node syncs. Its messages are
-//! ops as their log rows hold them, with the effects their first run
-//! recorded. A space's p2panda space is created with it, by the `create`
-//! effect, or joined when this device loads it; either way it is followed:
+//! The p2panda space of each channel a node syncs. Its messages are the
+//! ops of the channel's log, as their rows hold them, with the effects their
+//! first run recorded and their cause. A channel's p2panda space is created
+//! with it, by `[@carbon]`'s `create` effect (`crate::services::carbon`), or
+//! joined when this device loads it; either way it is followed, until a
+//! `[@carbon]` op that created it fails:
 //! what arrives on it reaches the core's thread, which acknowledges each
 //! message once it has dealt with it (`crate::nodes::receive`), and this
 //! device's applied ops are published to it from the op log (`publish`).
@@ -23,10 +25,10 @@ use super::on_network;
 use crate::carbon::Carbon;
 use crate::error::{Result, bad_request, internal};
 use crate::hash::to_hex;
+use crate::channels::channel::held_in;
 use crate::ops::oplog::LogRow;
-use crate::Db;
 
-// A service space's p2panda space, as the core holds it: the space, the
+// A channel's p2panda space, as the core holds it: the space, the
 // identity whose node syncs it and this device's key in it, where
 // acknowledgements go, and what is under way.
 pub(crate) struct Followed {
@@ -40,8 +42,6 @@ pub(crate) struct Followed {
   pub(crate) publishing: RefCell<HashSet<String>>,
   // Messages held unacknowledged, to be offered again (`crate::nodes::receive`).
   pub(crate) held: RefCell<Vec<Held>>,
-  // What waits to be written to the space's file until no op applies there.
-  pub(crate) unrecorded: RefCell<Vec<Unrecorded>>,
   // The devices being added as members now (`crate::nodes::members`).
   pub(crate) adding: RefCell<HashSet<String>>,
 }
@@ -50,12 +50,6 @@ pub(crate) struct Followed {
 pub(crate) struct Held {
   pub arrival: Arrival,
   pub expiring: bool,
-}
-
-// What the core writes to a space's file for its p2panda space, between ops.
-pub(crate) enum Unrecorded {
-  Published(String),
-  Error(crate::ops::errors::Evidence),
 }
 
 impl Followed {
@@ -78,7 +72,7 @@ pub(crate) struct Arrival {
   pub signed: String,
 }
 
-// The p2panda spaces followed, by service space id, and the way messages reach the core.
+// The p2panda spaces followed, by channel id, and the way messages reach the core.
 pub(crate) struct Spaces {
   followed: RefCell<HashMap<String, Rc<Followed>>>,
   // The spaces being joined now.
@@ -95,7 +89,7 @@ impl Default for Spaces {
 }
 
 impl Spaces {
-  // The service spaces whose p2panda spaces are followed.
+  // The channels whose p2panda spaces are followed.
   pub(crate) fn followed_ids(&self) -> Vec<String> {
     self.followed.borrow().keys().cloned().collect()
   }
@@ -114,13 +108,13 @@ impl Carbon {
     }));
   }
 
-  // A service space's p2panda space, when this device follows it.
+  // A channel's p2panda space, when this device follows it.
   pub(crate) fn followed(&self, space: &str) -> Option<Rc<Followed>> {
     self.nodes.spaces.followed.borrow().get(space).cloned()
   }
 
-  // Create the p2panda space of a new service space, by the node of the
-  // identity creating it, and follow it: its p2panda id is the space's id.
+  // Create the p2panda space of a new channel, by the node of the identity
+  // creating it, and follow it: its p2panda id is the channel's id.
   pub(crate) fn create_p2panda_space(self: &Rc<Self>, identity: &str, created: Box<dyn FnOnce(Result<String>)>) {
     let (carbon, identity) = (Rc::clone(self), identity.to_string());
     self.with_node(&identity.clone(), Box::new(move |node| {
@@ -139,9 +133,9 @@ impl Carbon {
     }));
   }
 
-  // Join the p2panda space of a service space this device holds, by the node
-  // of the identity that syncs it, and follow it once this device's node is
-  // a member, which for a space it created is at once.
+  // Join the p2panda space of a channel this device holds, by the node of
+  // the identity that holds it, and follow it once this device's node is a
+  // member, which for a channel it created is at once.
   pub(crate) fn join_p2panda_space(self: &Rc<Self>, space: &str, identity: &str) {
     if self.followed(space).is_some() || !self.nodes.spaces.joining.borrow_mut().insert(space.to_string()) {
       return;
@@ -182,29 +176,28 @@ impl Carbon {
   // on the nodes' runtime, which acknowledges each message when the core says.
   fn follow(self: &Rc<Self>, space: &str, identity: &str, device: &str, joined: Space<LogRow>, subscription: p2panda::spaces::SpaceSubscription<LogRow>) {
     let (acks, acking) = unbounded_channel();
-    let followed = Rc::new(Followed { space: Arc::new(joined), identity: identity.to_string(), device: device.to_string(), acks, publishing: RefCell::default(), held: RefCell::default(), unrecorded: RefCell::default(), adding: RefCell::default() });
+    let followed = Rc::new(Followed { space: Arc::new(joined), identity: identity.to_string(), device: device.to_string(), acks, publishing: RefCell::default(), held: RefCell::default(), adding: RefCell::default() });
     self.nodes.spaces.followed.borrow_mut().insert(space.to_string(), followed);
     super::runtime().spawn(forward(space.to_string(), subscription, self.nodes.spaces.arrivals.clone(), acking));
     self.publish(space);
     self.add_listed_devices(space);
   }
 
-  // A p2panda space this device could not follow: its service space is not synced, and the failure is reported.
+  // Stop following a space's p2panda space, as when the `[@carbon]` op that
+  // created it failed: its forwarding task ends with its acknowledgements,
+  // and dropping its last handle closes p2panda's stream for it.
+  pub(crate) fn unfollow(&self, space: &str) {
+    self.nodes.spaces.followed.borrow_mut().remove(space);
+  }
+
+  // A p2panda space this device could not follow: its channel is not synced, and the failure is reported.
   fn space_failed(&self, space: &str, error: crate::ServiceError) {
     eprintln!("[carbondb] {space} is not synced: {}", error.message);
   }
 
-  // Record which identity's node syncs a space this device holds.
-  pub(crate) fn synced_by(&self, space: &str, identity: &str) -> Result<()> {
-    self.system.store().run("UPDATE carbon_system_space SET identity = ? WHERE id = ?", &[json!(identity), json!(space)])?;
-    Ok(())
-  }
-
-  // Follow again the p2panda spaces an identity's node syncs, once it has started.
-  pub(crate) fn rejoin(self: &Rc<Self>, identity: &str) -> Result<()> {
-    let held = self.system.store().reader()?.all("SELECT id FROM carbon_system_space WHERE identity = ?", &[json!(identity)])?;
-    held.iter().filter_map(|row| row["id"].as_str()).for_each(|space| self.join_p2panda_space(space, identity));
-    Ok(())
+  // Follow again the p2panda spaces of the channels an identity holds here, once its node has started.
+  pub(crate) fn rejoin(self: &Rc<Self>, identity: &str) {
+    held_in(&self.directory_of(Some(identity))).iter().for_each(|channel| self.join_p2panda_space(channel, identity));
   }
 }
 

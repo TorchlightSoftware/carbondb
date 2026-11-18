@@ -1,8 +1,10 @@
 //! p2panda nodes: each identity on this device runs one, signing with its
-//! device key, with a store file of its own beside the system database, since a
-//! node takes one set of credentials and identities on one device must stay
-//! unlinkable. A node runs whenever its identity is listed in the system
-//! database and the device syncs at all.
+//! device key, with a store file of its own named by that key, since a node
+//! takes one set of credentials and identities on one device must stay
+//! unlinkable. The key names it from the moment it is made, before a device
+//! joining an identity knows which. A node runs whenever its identity is listed in the
+//! system database and the device syncs at all. Each channel the identity
+//! holds is one p2panda space its node follows (`spaces`).
 //!
 //! Every node in the process runs on one multi-threaded tokio runtime of its
 //! own (`runtime`), not on the core's thread: that thread runs SQLite,
@@ -59,8 +61,8 @@ pub type NodeReady = Box<dyn FnOnce(Result<Arc<Node>>)>;
 #[derive(Default)]
 pub(crate) struct Nodes {
   by_identity: RefCell<HashMap<String, NodeState>>,
-  // The p2panda spaces the nodes follow, by service space.
-  spaces: spaces::Spaces,
+  // The p2panda spaces the nodes follow, by channel.
+  pub(crate) spaces: spaces::Spaces,
   // The devices here waiting to join an identity.
   pairings: pairing::Pairings,
   // The channels loaded in the `ref` sync mode, whose refs and services are watched.
@@ -156,7 +158,7 @@ impl Carbon {
   }
 
   pub(crate) fn spawn_node(self: &Rc<Self>, identity: &str, credentials: Credentials) {
-    let builder = builder(credentials, &self.node_path(identity), &self.config.network);
+    let builder = builder(credentials.clone(), &self.node_path(&credentials.verifying_key().to_hex()), &self.config.network);
     self.nodes.by_identity.borrow_mut().insert(identity.to_string(), NodeState::Starting(vec![]));
     let (carbon, identity) = (Rc::clone(self), identity.to_string());
     on_network(self, async move { builder.spawn().await.map_err(|error| internal(format!("Cannot start a p2panda node: {error}"))) }, move |started| {
@@ -179,14 +181,14 @@ impl Carbon {
       _ => return,
     };
     waiting.into_iter().for_each(|ready| ready(started.clone()));
-    if let (Ok(_), Err(error)) = (&started, self.rejoin(identity)) {
-      eprintln!("[carbondb] the spaces of identity {identity} are not synced: {}", error.message);
+    if started.is_ok() {
+      self.rejoin(identity);
     }
   }
 
-  // Where an identity's node keeps its store: beside the system database.
-  pub(crate) fn node_path(&self, identity: &str) -> PathBuf {
-    self.config.directory().join(format!("{identity}.p2panda.db"))
+  // Where a node keeps its store, named by the device key it signs with.
+  pub(crate) fn node_path(&self, device: &str) -> PathBuf {
+    self.config.directory().join(format!("{device}.p2panda.db"))
   }
 }
 

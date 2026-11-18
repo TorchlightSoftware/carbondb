@@ -84,7 +84,6 @@ impl Package {
     let entry = Rc::new(move |call: Rc<ServiceCall>| running.start(call));
     Service {
       name: name.into(),
-      local: false,
       version: package.version.clone(),
       binding: package.manifest.binding().map(str::to_string),
       timeout: timeout(package.manifest.timeout),

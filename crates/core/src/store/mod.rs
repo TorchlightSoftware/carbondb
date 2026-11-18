@@ -49,7 +49,7 @@ use crate::sql::authorizer::{Read, Shared, start_reading, stop_reading, unrecord
 use crate::error::{Result, ServiceError, bad_request, is_system_failure, sqlite, system_failure};
 
 // The core's own record of a space, which no rewind undoes.
-const UNRECORDED: [&str; 5] = ["carbon_oplog", "carbon_result", "carbon_published", "carbon_error", MIGRATED];
+const UNRECORDED: [&str; 3] = ["carbon_pointer", "carbon_result", MIGRATED];
 
 // Where a file tracks the migrations of the core's own tables.
 const MIGRATED: &str = "carbon_migrations";

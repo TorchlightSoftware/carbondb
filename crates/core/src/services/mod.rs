@@ -52,7 +52,6 @@ pub type Entry = Rc<dyn Fn(Rc<dyn HandlerContext>)>;
 
 pub struct Service {
   pub name: String,
-  pub local: bool,
   // The hash of the package that handles its calls, which every op on it carries.
   pub version: String,
   pub binding: Option<String>,
@@ -76,7 +75,6 @@ impl Service {
   pub fn replicated(name: &str, version: &str, binding: Option<&str>, timeout: Duration, setup: Setup, entry: Entry) -> Service {
     Service {
       name: name.into(),
-      local: false,
       version: version.into(),
       binding: binding.map(str::to_string),
       timeout,
@@ -195,7 +193,7 @@ mod tests {
   fn starts_with_carbon_and_registers_each_name_once() {
     let services = Services::builtin().unwrap();
     let carbon = services.get("carbon").unwrap();
-    assert_eq!((carbon.local, carbon.binding.clone()), (true, None));
+    assert_eq!((carbon.name.as_str(), carbon.binding.clone()), ("carbon", None));
     services.register(service("chat")).unwrap();
     for name in ["chat", "carbon"] {
       assert_eq!(services.register(service(name)).err().unwrap().status, 409, "{name}");

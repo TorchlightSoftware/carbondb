@@ -37,7 +37,7 @@ fn room_with_gauge(startup: Duration) -> (tempfile::TempDir, Rc<crate::Carbon>, 
   carbon.register(gauge(Rc::clone(&healthy), startup)).unwrap();
   let identity = alice(&carbon);
   let room = room_channel(&carbon, &identity);
-  on(&carbon, &room, &identity, "POST [channel]/services", json!({"name": "gauge"})).unwrap();
+  on(&carbon, &room, &identity, "POST [@carbon]/services", json!({"name": "gauge"})).unwrap();
   (directory, carbon, timers, identity, room, healthy)
 }
 

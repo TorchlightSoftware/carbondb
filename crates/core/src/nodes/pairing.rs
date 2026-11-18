@@ -1,5 +1,5 @@
 //! Enrolling a device: the new device shows a code, and a device already in
-//! the identity scans it (`POST [identity]/devices {code}`).
+//! the identity scans it (`POST [@carbon]/enroll {code, name, tags}`).
 //!
 //! The new device makes its key pair and code with `POST [@carbon]/devices`
 //! on its system handle, and starts its node. The code carries its p2panda
@@ -7,36 +7,41 @@
 //! cross-signed, a pairing secret, and its relay URL if it names one: all the
 //! existing device needs to add it, without waiting on it.
 //!
-//! The existing device's `enroll` effect answers the new device's key at
-//! once, and hands the rest to its node: adding the new device to every
-//! service of the identity's own and personal channels (`members`), then
-//! sending it, sealed with the pairing secret on an ephemeral topic the secret
-//! names, the identity and its channels. Ephemeral messages are not stored, so
-//! the new device announces itself on the topic until that arrives, and the
-//! existing device answers each announcement. When it does, the new device's
-//! core records the identity by an op on its system handle, and the `ref`
-//! sync mode loads the rest. A code expires after `EXPIRES`.
+//! On the existing device, `[@carbon]` lists the new device in `[identity]`,
+//! signed with its own device key; then its `enroll` effect has the
+//! identity's node register the new device's key bundle and add it to every
+//! space the node follows (`members`), and the call answers. The node then sends the new device,
+//! sealed with the pairing secret on an ephemeral topic the secret names, the
+//! identity and its channels. Ephemeral messages are not stored, so the new
+//! device announces itself on the topic until that arrives, and the existing
+//! device answers each announcement. When it does, the new device's core
+//! records the identity by an op on its system handle, and the `ref` sync
+//! mode loads the rest. A code expires after `EXPIRES`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use p2panda::spaces::Member;
-use p2panda::{Hash, RelayUrl, Topic};
+use p2panda::{Hash, RelayUrl, Topic, VerifyingKey};
 use p2panda_encryption::crypto::aead::{aead_decrypt, aead_encrypt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_stream::StreamExt;
 
+use super::members::add_members;
 use super::on_network;
 use crate::calls::service_call::ServiceCall;
 use crate::carbon::Carbon;
-use crate::error::{Result, bad_request, internal, single_node};
+use crate::error::{Result, bad_request, forbidden, internal, single_node};
 use crate::hash::to_hex;
 use crate::keys;
+use crate::services::carbon as local;
 use crate::{HandlerContext, Reply, Routing};
+use carbondb_service_bindings::hash::from_hex;
 
 // How long a code can be scanned, and its devices look for each other.
 pub const EXPIRES: Duration = Duration::from_secs(10 * 60);
@@ -79,11 +84,6 @@ impl Code {
   pub fn device(&self) -> String {
     self.member.id().to_hex()
   }
-}
-
-fn from_hex(text: &str) -> Option<Vec<u8>> {
-  (text.len() % 2 == 0).then_some(())?;
-  (0..text.len()).step_by(2).map(|at| u8::from_str_radix(text.get(at..at + 2)?, 16).ok()).collect()
 }
 
 // The ephemeral topic a pairing secret names.
@@ -195,10 +195,8 @@ impl Carbon {
             let _ = publisher.publish(Pairing::Announce).await;
           }
           message = subscription.next() => match message {
-            Some(message) => if let Pairing::Joined { nonce, sealed } = message.body() {
-              if let Some(joined) = open(&secret, nonce, sealed) {
-                return Ok(joined);
-              }
+            Some(message) => if let Pairing::Joined { nonce, sealed } = message.body() && let Some(joined) = open(&secret, nonce, sealed) {
+              return Ok(joined);
             },
             None => return Err(internal("The pairing topic closed")),
           },
@@ -244,83 +242,135 @@ impl Carbon {
   }
 }
 
-// The `enroll` effect, on the device that scanned the code: the new device's
-// key at once, and the rest handed to the node of the identity it joins.
-pub(crate) fn enroll_effect(caller: Rc<ServiceCall>, input: Value, reply: Reply) {
-  if caller.carbon().config.sync == crate::config::SyncMode::None {
-    return reply(Err(crate::ops::effects::unreachable("The effect enroll")));
-  }
-  let code = match input["code"].as_str().ok_or_else(|| bad_request("Enrolling a device needs the code it shows")).and_then(Code::decode) {
-    Ok(code) => code,
-    Err(error) => return reply(Err(error)),
-  };
-  let carbon = Rc::clone(caller.carbon());
-  let identity = caller.actor().identity.clone().unwrap_or_default();
-  let device = code.device();
-  match carbon.held_identity(&identity) {
-    Ok(joined) => carbon.send_joined(&identity, code, joined),
-    Err(error) => return reply(Err(error)),
-  }
-  reply(Ok(json!({"pubkey": device})))
+// A device to enroll: the code it shows, and the name and tags it is listed with.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Enrolling {
+  code: String,
+  name: String,
+  #[serde(default)]
+  tags: Vec<String>,
 }
 
 impl Carbon {
-  // An identity on this device as a device joining it records it.
-  fn held_identity(&self, identity: &str) -> Result<Joined> {
-    let held = crate::services::carbon::acting(&self.system.store().reader()?, identity)?;
-    Ok(Joined { slug: held.slug, id: held.id, channel: held.channel, personal: held.personal })
-  }
-
-  // Add the new device to the identity's spaces, then answer its
-  // announcements on the pairing topic with the identity, until the code expires.
-  fn send_joined(self: &Rc<Self>, identity: &str, code: Code, joined: Joined) {
-    let (carbon, identity_id) = (Rc::clone(self), identity.to_string());
-    self.with_node(identity, Box::new(move |node| {
-      let node = match node {
-        Ok(node) => node,
-        Err(error) => return eprintln!("[carbondb] cannot enroll a device: {}", error.message),
-      };
-      let (member, secret, relay) = (code.member.clone(), code.secret, code.relay.clone());
-      let device = member.id();
-      let registering = node.clone();
-      let registered = async move {
-        if let Some(relay) = relay {
-          let _ = registering.insert_bootstrap(device, relay).await;
+  // `POST [@carbon]/enroll`, on the identity's handle: the device a code
+  // shows is listed in `[identity]`, signed by the `sign` effect; then the
+  // `enroll` effect has the identity's node register its key bundle, add it to
+  // every space the node follows, and answer its announcements with the
+  // identity until the code expires. Answers the device as listed. Every
+  // replica of the identity's channel replays it with those effects recorded.
+  pub(crate) fn enroll(self: &Rc<Self>, call: Rc<ServiceCall>) {
+    if self.config.sync == crate::config::SyncMode::None {
+      let _ = call.settle(Err(single_node("Enrolling a device")));
+      return;
+    }
+    let request: Result<Enrolling> = serde_json::from_value(call.input.clone()).map_err(Into::into);
+    let device = request.and_then(|request| Code::decode(&request.code).map(|code| (json!({"pubkey": code.device(), "name": request.name, "tags": request.tags}), request.code)));
+    let (device, code) = match device {
+      Ok(device) => device,
+      Err(error) => {
+        let _ = call.settle(Err(error));
+        return;
+      }
+    };
+    let caller = Rc::clone(&call);
+    HandlerContext::effect(call, "sign", json!({"key": "POST [identity]/devices", "recorded": device}), Box::new(move |signature| {
+      let listing = signature.map(|signature| json!({"pubkey": device["pubkey"], "name": device["name"], "tags": device["tags"], "signature": signature}));
+      match listing {
+        Ok(listing) => list_and_admit(caller, listing, code),
+        Err(error) => {
+          let _ = caller.settle(Err(error));
         }
-        registering.register_member(member).await.map_err(|error| internal(format!("Cannot register a device's key bundle: {error}")))
-      };
-      let answering = node.clone();
-      let then = Rc::clone(&carbon);
-      on_network(&carbon, registered, move |registered| {
-        if let Err(error) = registered {
-          return eprintln!("[carbondb] cannot enroll a device: {}", error.message);
-        }
-        then.reconcile_members(&identity_id);
-        let sealed = match seal(&secret, &joined) {
-          Ok(sealed) => sealed,
-          Err(error) => return eprintln!("[carbondb] cannot enroll a device: {}", error.message),
-        };
-        let device = device.to_hex();
-        let answer = async move {
-          let (publisher, mut subscription) = answering.ephemeral_stream::<Pairing>(topic(&secret)).await.map_err(|error| internal(format!("Cannot open a pairing topic: {error}")))?;
-          let expired = tokio::time::sleep(EXPIRES);
-          tokio::pin!(expired);
-          loop {
-            tokio::select! {
-              _ = &mut expired => return Ok(()),
-              message = subscription.next() => match message {
-                Some(message) if matches!(message.body(), Pairing::Announce) && message.author().to_hex() == device => {
-                  let _ = publisher.publish(sealed.clone()).await;
-                }
-                Some(_) => {}
-                None => return Ok(()),
-              },
-            }
-          }
-        };
-        on_network(&then, answer, |_: Result<()>| {});
-      });
+      }
     }));
+  }
+}
+
+// List the device in `[identity]`, then admit it through the identity's node.
+fn list_and_admit(call: Rc<ServiceCall>, listing: Value, code: String) {
+  let caller = Rc::clone(&call);
+  HandlerContext::call(call, "POST [identity]/devices", listing, Box::new(move |listed| match listed {
+    Ok(listed) => {
+      let answering = Rc::clone(&caller);
+      HandlerContext::effect(caller, "enroll", json!({"code": code}), Box::new(move |enrolled| {
+        let _ = answering.settle(enrolled.map(|_| listed));
+      }));
+    }
+    Err(error) => {
+      let _ = caller.settle(Err(error));
+    }
+  }));
+}
+
+// The `enroll` effect, on the device that scanned a code: the identity's node
+// registers the new device's key bundle and adds it to every space it
+// follows, then answers the device's key; it then answers the device's
+// announcements with the identity until the code expires.
+pub(crate) fn enroll_effect(caller: Rc<ServiceCall>, input: Value, reply: Reply) {
+  let carbon = Rc::clone(caller.carbon());
+  let prepared = (|| -> Result<(Code, String, Pairing)> {
+    let code = Code::decode(input["code"].as_str().unwrap_or_default())?;
+    let identity = caller.actor.identity.clone().ok_or_else(|| forbidden("Enrolling a device needs an acting identity"))?;
+    let held = local::acting(&carbon.system.store().reader()?, &identity)?;
+    let sealed = seal(&code.secret, &Joined { slug: held.slug, id: held.id, channel: held.channel, personal: held.personal })?;
+    Ok((code, identity, sealed))
+  })();
+  let (code, identity, sealed) = match prepared {
+    Ok(prepared) => prepared,
+    Err(error) => return reply(Err(error)),
+  };
+  let admitting = Rc::clone(&carbon);
+  carbon.with_node(&identity.clone(), Box::new(move |node| {
+    let node = match node {
+      Ok(node) => node,
+      Err(error) => return reply(Err(error)),
+    };
+    let (member, secret, relay, device) = (code.member.clone(), code.secret, code.relay.clone(), code.device());
+    let (registering, spaces) = (Arc::clone(&node), admitting.spaces_of(&identity));
+    let key_text = device.clone();
+    let added = async move {
+      let key = key_text.parse::<VerifyingKey>().map_err(|error| internal(format!("{key_text} is not a device key: {error}")))?;
+      if let Some(relay) = relay {
+        let _ = registering.insert_bootstrap(member.id(), relay).await;
+      }
+      registering.register_member(member).await.map_err(|error| internal(format!("Cannot register a device's key bundle: {error}")))?;
+      for space in spaces {
+        add_members(&space, &[key]).await?;
+      }
+      Ok(())
+    };
+    let then = Rc::clone(&admitting);
+    on_network(&admitting, added, move |added: Result<()>| {
+      let answered = added.is_ok();
+      reply(added.map(|()| json!({"pubkey": device})));
+      if answered {
+        then.answer_announcements(node, secret, sealed, code.device());
+      }
+    });
+  }));
+}
+
+impl Carbon {
+  // Answer the new device's announcements on its pairing topic with the sealed identity, until the code expires.
+  fn answer_announcements(self: &Rc<Self>, node: Arc<p2panda::Node>, secret: [u8; 32], sealed: Pairing, device: String) {
+    let answer = async move {
+      let (publisher, mut subscription) = node.ephemeral_stream::<Pairing>(topic(&secret)).await.map_err(|error| internal(format!("Cannot open a pairing topic: {error}")))?;
+      let expired = tokio::time::sleep(EXPIRES);
+      tokio::pin!(expired);
+      loop {
+        tokio::select! {
+          _ = &mut expired => return Ok(()),
+          message = subscription.next() => match message {
+            Some(message) if matches!(message.body(), Pairing::Announce) && message.author().to_hex() == device => {
+              let _ = publisher.publish(sealed.clone()).await;
+            }
+            Some(_) => {}
+            None => return Ok(()),
+          },
+        }
+      }
+    };
+    on_network(self, answer, |_: Result<()>| {});
   }
 }
 

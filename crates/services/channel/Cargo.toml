@@ -12,9 +12,9 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-carbondb-service-bindings.workspace = true
+carbondb-service-bindings = { workspace = true, features = ["signature"] }
 serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-carbondb-service-bindings = { workspace = true, features = ["guest"] }
+carbondb-service-bindings = { workspace = true, features = ["guest", "signature"] }

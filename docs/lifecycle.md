@@ -13,7 +13,7 @@ The core: `Carbon::add` and `Carbon::register` in `crates/core/src/carbon.rs`, a
 
 ## Starting
 
-Each service a channel names is a service space of its own on each device that holds it: one SQLite file, its op log and results. Before it applies anything here, it starts, in three steps:
+Each service a channel names has a store of its own on each device that holds the channel: one SQLite file, holding its tables and results, beside the channel's one log. Before it applies anything here, it starts, in three steps:
 
 1. **Its package.** It waits while this device compiles it. A package this device does not have cannot be fetched without peers, so single-node that step fails at once with `PACKAGE_UNAVAILABLE`; with p2panda it becomes a fetch ([p2panda-sync.md](../stories/p2panda-sync.md)).
 2. **Its setup,** the service's `setup`, run on its `sql` binding in a transaction of its own, then the check that every table takes its keys from the op.

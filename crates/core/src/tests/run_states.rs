@@ -3,7 +3,7 @@ use crate::RunState;
 use std::cell::RefCell;
 
 // Every RunState a space moves to, by its name.
-fn states_of(carbon: &Rc<crate::Carbon>, space: &crate::ServiceSpace) -> Rc<RefCell<Vec<String>>> {
+fn states_of(carbon: &Rc<crate::Carbon>, space: &crate::ServiceStore) -> Rc<RefCell<Vec<String>>> {
   let seen = Rc::new(RefCell::new(vec![]));
   let into = Rc::clone(&seen);
   carbon.watch_run_state(&space.id, Rc::new(move |state: &RunState| into.borrow_mut().push(serde_json::to_value(state).unwrap()["state"].as_str().unwrap().to_string())));
@@ -48,7 +48,7 @@ fn an_op_a_system_failure_interrupts_stays_pending_and_applies_on_resume() {
   let call = crate::Call::from_key("POST [notes]/run").unwrap();
   let large = "x".repeat(64 * 1024);
   let op = carbon.stamp(&actor(&identity), &call, &json!({"do": [{"call": "POST [notes]/run", "input": insert(&large), "catch": true}]}), "notes");
-  oplog::append(space.store(), &oplog::LogRow::new(op.clone())).unwrap();
+  crate::testing::left(&space, op.clone());
   let pages = space.store().get("PRAGMA page_count", &[]).unwrap()["page_count"].clone();
   space.store().run_batch(&format!("PRAGMA max_page_count = {pages}")).unwrap();
 
@@ -64,7 +64,7 @@ fn an_op_a_system_failure_interrupts_stays_pending_and_applies_on_resume() {
 }
 
 // Submit a call, and keep its answer for whenever it comes.
-fn submitted(carbon: &Rc<crate::Carbon>, space: &Rc<crate::ServiceSpace>, actor: &crate::Actor, key: &str, input: Value) -> Rc<RefCell<Option<Result<Value, u16>>>> {
+fn submitted(carbon: &Rc<crate::Carbon>, space: &Rc<crate::ServiceStore>, actor: &crate::Actor, key: &str, input: Value) -> Rc<RefCell<Option<Result<Value, u16>>>> {
   let answer = Rc::new(RefCell::new(None));
   let into = Rc::clone(&answer);
   let call = crate::Call::from_key(key).unwrap();
@@ -79,15 +79,14 @@ fn submitted(carbon: &Rc<crate::Carbon>, space: &Rc<crate::ServiceSpace>, actor:
 fn a_space_whose_package_this_device_lacks_stops_until_the_package_is_registered() {
   let (directory, carbon) = carbon();
   let identity = alice(&carbon);
-  let space = room(&carbon, &identity);
-  let id = space.id.clone();
-  drop((space, carbon));
+  let room = room_channel(&carbon, &identity);
+  drop(carbon);
   let restarted = crate::testing::reopen(&directory);
-  let space = space_now(&restarted, &id).unwrap();
+  let space = service(&restarted, &room, "notes");
   let refused = now(|reply| restarted.submit(&space, actor(&identity), crate::Call::from_key("POST [notes]/run").unwrap(), insert("a"), reply)).unwrap_err();
   assert!(refused.message.starts_with("[notes] stopped, and applies nothing until it is resumed"), "named as calls name it: {}", refused.message);
   assert_eq!((refused.status, refused.code.as_str(), refused.details.unwrap()["failure"]["code"].clone()), (503, "SERVICE_STOPPED", json!("PACKAGE_UNAVAILABLE")));
-  assert_eq!(oplog::entries(space.store()).unwrap(), vec![], "nothing is logged for a stopped space");
+  assert_eq!(entries(&space), vec![], "nothing is logged for a stopped space");
 
   crate::testing::register_notes(&restarted);
   assert_eq!(space.run_state(), crate::RunState::Idle);

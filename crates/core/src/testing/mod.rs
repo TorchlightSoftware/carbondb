@@ -17,7 +17,7 @@ use std::rc::Rc;
 use serde_json::{Value, json};
 
 use crate::error::Result;
-use crate::{Actor, Call, Carbon, Identity, Routing, ServiceSpace, Settled};
+use crate::{Actor, Call, Carbon, Identity, Routing, ServiceStore, Settled};
 
 // A single-node CarbonDB in a temporary directory, which lives as long as the
 // directory, running `[notes]`.
@@ -83,7 +83,7 @@ pub fn probed() -> (tempfile::TempDir, Rc<Carbon>, Timers, Identity) {
   let (directory, carbon, timers) = timed();
   add(&carbon, "probe", PROBE).unwrap();
   let identity = alice(&carbon);
-  on(&carbon, &identity.personal, &identity, "POST [channel]/services", json!({"name": "probe"})).unwrap();
+  on(&carbon, &identity.personal, &identity, "POST [@carbon]/services", json!({"name": "probe"})).unwrap();
   (directory, carbon, timers, identity)
 }
 
@@ -102,12 +102,23 @@ pub fn reopen(directory: &tempfile::TempDir) -> Rc<Carbon> {
   Carbon::open(&directory.path().join("carbondb.toml"), Timers::default().schedule(), tasks()).unwrap()
 }
 
-pub fn call_now(carbon: &Rc<Carbon>, space: &Rc<ServiceSpace>, actor: &Actor, key: &str, input: Value) -> Result<Settled> {
+pub fn call_now(carbon: &Rc<Carbon>, space: &Rc<ServiceStore>, actor: &Actor, key: &str, input: Value) -> Result<Settled> {
   now(|reply| carbon.submit(space, actor.clone(), Call::from_key(key).unwrap(), input, reply))
 }
 
-pub fn space_now(carbon: &Rc<Carbon>, id: &str) -> Result<Rc<ServiceSpace>> {
-  now(|opened| carbon.with_space(id, opened))
+pub fn space_now(carbon: &Rc<Carbon>, id: &str) -> Result<Rc<ServiceStore>> {
+  now(|opened| carbon.with_store(id, opened))
+}
+
+// An op logged for a store and pointed to, as a crash leaves it before it ran.
+pub fn left(space: &ServiceStore, op: crate::Op) {
+  crate::ops::oplog::append(space.channel.log(), &crate::ops::oplog::LogRow::new(op.clone())).unwrap();
+  crate::ops::pointers::write(space.store(), &crate::ops::pointers::Pointer { hash: op.hash, time: op.time, device: op.device }).unwrap();
+}
+
+// The ops addressed to a store, from its channel's log, in the shared order.
+pub fn entries(space: &ServiceStore) -> Vec<crate::Op> {
+  crate::ops::oplog::addressed(space.channel.log(), &space.runs.name).unwrap()
 }
 
 pub fn alice(carbon: &Rc<Carbon>) -> Identity {
@@ -140,25 +151,25 @@ pub fn on_awaited(carbon: &Rc<Carbon>, channel: &str, identity: &Identity, key: 
 }
 
 // The space a channel names for `[name]`.
-pub fn service(carbon: &Rc<Carbon>, channel: &str, name: &str) -> Rc<ServiceSpace> {
+pub fn service(carbon: &Rc<Carbon>, channel: &str, name: &str) -> Rc<ServiceStore> {
   carbon.service_space(channel, &Call::from_key(&format!("GET [{name}]/any")).unwrap()).unwrap()
 }
 
 // The identity's personal channel's `[notes]`.
-pub fn personal_notes(carbon: &Rc<Carbon>, identity: &Identity) -> Rc<ServiceSpace> {
+pub fn personal_notes(carbon: &Rc<Carbon>, identity: &Identity) -> Rc<ServiceStore> {
   service(carbon, &identity.personal, "notes")
 }
 
 // A channel "Room" in the identity's personal channel, running `[notes]`: its id.
 pub fn room_channel(carbon: &Rc<Carbon>, identity: &Identity) -> String {
-  let created = on(carbon, &identity.personal, identity, "POST [channel]/channel", json!({"name": "Room"})).unwrap();
+  let created = on(carbon, &identity.personal, identity, "POST [@carbon]/channel", json!({"name": "Room"})).unwrap();
   let room = created["channel"].as_str().unwrap().to_string();
-  on(carbon, &room, identity, "POST [channel]/services", json!({"name": "notes"})).unwrap();
+  on(carbon, &room, identity, "POST [@carbon]/services", json!({"name": "notes"})).unwrap();
   room
 }
 
 // The `[notes]` of a fresh "Room" channel in the identity's personal channel.
-pub fn room(carbon: &Rc<Carbon>, identity: &Identity) -> Rc<ServiceSpace> {
+pub fn room(carbon: &Rc<Carbon>, identity: &Identity) -> Rc<ServiceStore> {
   let room = room_channel(carbon, identity);
   service(carbon, &room, "notes")
 }

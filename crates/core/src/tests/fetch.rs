@@ -8,7 +8,7 @@ use crate::testing::{Outside, awaited, hanging_up, until};
 use std::net::TcpListener;
 
 // A personal channel running `[probe]`, which sends requests over wasi:http, and its space.
-fn probed() -> (tempfile::TempDir, Rc<crate::Carbon>, crate::Identity, Rc<crate::ServiceSpace>) {
+fn probed() -> (tempfile::TempDir, Rc<crate::Carbon>, crate::Identity, Rc<crate::ServiceStore>) {
   let (directory, carbon, _timers, identity) = crate::testing::probed();
   let probe = service(&carbon, &identity.personal, "probe");
   (directory, carbon, identity, probe)
@@ -24,21 +24,21 @@ fn fetch(carbon: &Rc<crate::Carbon>, identity: &crate::Identity, method: &str, r
 // with the effects its first run recorded, once every op has run again: a
 // probe that reads the notes its fetches are noted beside rewinds and runs
 // again.
-fn late(carbon: &Rc<crate::Carbon>, probe: &crate::ServiceSpace, key: &str, input: Value, effects: Vec<Made>) {
+fn late(carbon: &Rc<crate::Carbon>, probe: &crate::ServiceStore, key: &str, input: Value, effects: Vec<Made>) {
   let actor = Actor { identity: Some("alice".into()), device: Some("laptop".into()) };
   let op = crate::ops::op::stamp(&actor, &crate::Call::from_key(key).unwrap(), &input, &carbon.services().version(&probe.runs.package), 1);
-  awaited(|received| carbon.receive(&probe.id, oplog::LogRow { op, effects: Some(effects) }, received)).unwrap();
+  carbon.receive_in(&carbon.opened(&probe.id).unwrap(), oplog::LogRow { op, effects: Some(effects), cause: None }).unwrap();
   until(|| !outcomes(probe).contains(&Err(0)));
 }
 
 // What the last op made of its run, and the fetches it recorded.
-fn last(probe: &crate::ServiceSpace) -> (Value, Vec<Made>) {
-  let op = oplog::entries(probe.store()).unwrap().pop().unwrap();
+fn last(probe: &crate::ServiceStore) -> (Value, Vec<Made>) {
+  let op = entries(probe).pop().unwrap();
   let Some(Outcome::Applied { output, .. }) = results::of(probe.store(), &op.hash).unwrap() else { panic!("applied") };
-  (output, oplog::effects(probe.store(), &op.hash).unwrap().unwrap_or_default())
+  (output, oplog::effects(probe.channel.log(), &op.hash).unwrap().unwrap_or_default())
 }
 
-fn early_note(carbon: &Rc<crate::Carbon>, probe: &crate::ServiceSpace) {
+fn early_note(carbon: &Rc<crate::Carbon>, probe: &crate::ServiceStore) {
   late(carbon, probe, "POST [probe]/note", json!({"text": "early"}), vec![]);
 }
 

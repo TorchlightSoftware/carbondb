@@ -97,7 +97,7 @@ export class SystemHandle {
 
   // A call on the system handle, which runs only `[@carbon]`: `POST
   // [@carbon]/identity` creates an identity, `GET [@carbon]/identities` lists
-  // them, and status, sync and data name a channel or service in their input.
+  // them, and `POST [@carbon]/devices` shows a code for this device to join one.
   call(key, input = null) {
     return answered((reply) => this.#native.call(null, null, key, input, reply))
   }

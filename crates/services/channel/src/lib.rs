@@ -3,17 +3,18 @@
 //! every channel's own space.
 //!
 //! Every POST but the origin and leaving needs manage on the channel, and a
-//! sealed channel refuses every such POST after its seal. What changes p2panda or reaches another
-//! device (adding or removing a member, an invitation, joining, leaving, a
-//! change of manage) is an effect; so is creating the space of a new channel
-//! or service.
+//! sealed channel refuses every such POST after its seal. What changes p2panda
+//! or reaches another device (adding or removing a member, an invitation,
+//! joining, leaving, a change of manage) is an effect. Creating a channel or a
+//! service is the core's, through `[@carbon]`, which then names the new
+//! service here, signed with the op's device key (`signature`).
 
 pub mod names;
 
 use std::rc::Rc;
 
 use carbondb_service_bindings::error::{Result, ServiceError, bad_request, conflict, forbidden, not_found, unknown};
-use carbondb_service_bindings::{Db, HandlerContext, Package, Reply, migrations};
+use carbondb_service_bindings::{Db, HandlerContext, Package, Reply, migrations, signature};
 use names::{slugify, unique_slug};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -63,30 +64,18 @@ struct NewRef {
   cascade: Vec<String>,
 }
 
-// A channel to create inside this one.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NewChannel {
-  #[serde(default = "default_kind")]
-  kind: String,
-  name: String,
-  manage: Option<Vec<String>>,
-  slug: Option<String>,
-  #[serde(default)]
-  cascade: Vec<String>,
-}
-
-fn default_kind() -> String {
-  "channel".to_string()
-}
-
-// A service to create in this channel: the name the channel calls it by, and
-// the package registered on this device that runs it, which defaults to the name.
+// A service `[@carbon]` created for this channel to name: the name the
+// channel calls it by, its space, the package registered on the device that
+// created it and that package's version, and the signature by the op's
+// device key over them.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewService {
   name: String,
-  package: Option<String>,
+  space: String,
+  package: String,
+  version: String,
+  signature: String,
 }
 
 // A service this channel names: `[name]` resolves to its space.
@@ -142,8 +131,7 @@ fn managing(context: Context, resource: String) {
       let added = serde_json::from_value(context.input().clone()).map_err(Into::into).and_then(|new| add_ref(context.as_ref(), new));
       settle(&context, added.map(|reference| json!(reference)))
     }
-    ("POST", "/channel") => create_channel(context),
-    ("POST", "/services") => create_service(context),
+    ("POST", "/services") => settle(&context, name_service(context.as_ref())),
     ("POST", "/members") => invite(context),
     ("POST", "/join") => join(context),
     ("POST", "/manage") => change_manage(context),
@@ -211,48 +199,22 @@ fn seal(db: &dyn Db) -> Result<Value> {
   Ok(json!({"sealed": true}))
 }
 
-// A channel inside this one: its space is created, its origin written there,
-// and this channel points to it. The `create` effect answers the new space's id.
-fn create_channel(context: Context) {
-  let request: NewChannel = match serde_json::from_value(context.input().clone()) {
-    Ok(request) => request,
-    Err(error) => return settle(&context, Err(error.into())),
-  };
-  let author = context.actor().identity.clone().unwrap_or_default();
-  let origin = json!({"kind": request.kind, "name": request.name, "manage": request.manage.unwrap_or_else(|| vec![author])});
-  let create = json!({"package": "channel", "name": "channel"});
-  let creating = Rc::clone(&context);
-  let reply: Reply = Box::new(move |created| {
-    let id = match created.map(|created| created["space"].as_str().unwrap_or_default().to_string()) {
-      Ok(id) => id,
-      Err(error) => return settle(&creating, Err(error)),
-    };
-    let reference = NewRef { channel: id.clone(), kind: request.kind, name: request.name, slug: request.slug, cascade: request.cascade };
-    let call = json!({"space": id, "key": "POST [channel]/origin", "input": origin});
-    after(&creating, "call", call, move |context, _| add_ref(context.as_ref(), reference).map(|reference| json!(reference)))
-  });
-  Rc::clone(&context).effect("create", create, reply)
+// Name a service `[@carbon]` created, once it shows the op's device signed it.
+fn name_service(context: &dyn HandlerContext) -> Result<Value> {
+  let request: NewService = serde_json::from_value(context.input().clone())?;
+  let named = Named { name: request.name, service: request.space, package: request.package, version: request.version };
+  signature::check(context.op(), "POST [channel]/services", &signed(&named), &request.signature)?;
+  let taken = !context.get("SELECT 1 AS present FROM service WHERE name = ?", &[json!(named.name)])?.is_null();
+  if taken || named.name == "channel" {
+    return Err(conflict(format!("This channel already names a service [{}]", named.name)));
+  }
+  context.run("INSERT INTO service (name, space, package, version) VALUES (?, ?, ?, ?)", &[json!(named.name), json!(named.service), json!(named.package), json!(named.version)])?;
+  Ok(json!({"name": named.name, "service": named.service, "version": named.version}))
 }
 
-// A service in this channel: its space is created, running the package
-// registered on this device, and the channel names it by the id the `create`
-// effect answers.
-fn create_service(context: Context) {
-  let request: NewService = match serde_json::from_value(context.input().clone()) {
-    Ok(request) => request,
-    Err(error) => return settle(&context, Err(error.into())),
-  };
-  let taken = context.get("SELECT 1 AS present FROM service WHERE name = ?", &[json!(request.name)]).map(|row| !row.is_null());
-  if let Err(error) = taken.and_then(|taken| if taken || request.name == "channel" { Err(conflict(format!("This channel already names a service [{}]", request.name))) } else { Ok(()) }) {
-    return settle(&context, Err(error));
-  }
-  let package = request.package.unwrap_or_else(|| request.name.clone());
-  let create = json!({"package": package, "name": request.name});
-  after(&context, "create", create, move |context, created| {
-    let named = Named { name: request.name, service: created["space"].as_str().unwrap_or_default().to_string(), package, version: created["version"].as_str().unwrap_or_default().to_string() };
-    context.run("INSERT INTO service (name, space, package, version) VALUES (?, ?, ?, ?)", &[json!(named.name), json!(named.service), json!(named.package), json!(named.version)])?;
-    Ok(json!({"name": named.name, "service": named.service, "version": named.version}))
-  })
+// What `[@carbon]` signs to have a service named: everything the channel records of it.
+pub fn signed(named: &Named) -> Value {
+  json!({"name": named.name, "space": named.service, "package": named.package, "version": named.version})
 }
 
 fn services(db: &dyn Db) -> Result<Vec<Value>> {

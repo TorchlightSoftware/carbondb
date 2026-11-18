@@ -6,22 +6,24 @@ fn founds_its_own_channel_sealed_with_identity_and_a_personal_channel_by_ops() {
   let identity = alice(&carbon);
   assert_eq!(carbon.identity("alice").unwrap(), identity);
   assert_eq!(logged(carbon.system()), vec!["POST [@carbon]/identity"]);
-  let founding = &oplog::entries(carbon.system().store()).unwrap()[0];
-  let effects: Vec<String> = oplog::effects(carbon.system().store(), &founding.hash).unwrap().unwrap().into_iter().map(|made| format!("{} {}", made.name, made.input["key"].as_str().unwrap_or(""))).collect();
+  let founding = &entries(carbon.system())[0];
+  let effects: Vec<String> = oplog::effects(carbon.system().channel.log(), &founding.hash).unwrap().unwrap().into_iter().map(|made| format!("{} {}", made.name, made.input["key"].as_str().unwrap_or(""))).collect();
   let expected = [
     "create ",
     "call POST [channel]/origin",
-    "call POST [channel]/services",
+    "call POST [@carbon]/services",
     "call POST [identity]/origin",
-    "call POST [channel]/channel",
-    "call POST [channel]/services",
+    "call POST [@carbon]/channel",
+    "call POST [@carbon]/services",
     "call POST [channel]/seal",
   ];
-  assert_eq!(effects, expected, "its own op records every effect it made");
+  assert_eq!(effects, expected, "its own op records every effect it made: its own channel created, then [@carbon] called on each new channel");
+  let own_carbon = carbon.carbon_store(&carbon.channel(&identity.channel).unwrap()).unwrap();
+  assert_eq!(logged(&own_carbon), vec!["POST [@carbon]/services", "POST [@carbon]/channel"], "[@carbon] set up the own channel's [identity] and the personal channel there");
 
   let own = space_now(&carbon, &identity.channel).unwrap();
-  assert_eq!(logged(&own), vec!["POST [channel]/origin", "POST [channel]/services", "POST [channel]/channel", "POST [channel]/seal"]);
-  assert!(oplog::entries(own.store()).unwrap().iter().all(|op| op.author == Some(identity.id.clone()) && op.device == Some(identity.device.clone())));
+  assert_eq!(logged(&own), vec!["POST [channel]/origin", "POST [channel]/services", "POST [channel]/ref", "POST [channel]/seal"]);
+  assert!(entries(&own).iter().all(|op| op.author == Some(identity.id.clone()) && op.device == Some(identity.device.clone())));
   let answer = |channel: &str, key: &str, input: Value| on(&carbon, channel, &identity, key, input).unwrap();
   assert_eq!(answer(&identity.channel, "GET [channel]/origin", Value::Null), json!({"kind": "identity", "name": "alice", "manage": [identity.id]}));
   assert_eq!(answer(&identity.channel, "GET [identity]/origin", Value::Null), json!({"id": identity.id, "device": identity.device}));
@@ -37,7 +39,7 @@ fn founds_its_own_channel_sealed_with_identity_and_a_personal_channel_by_ops() {
 }
 
 #[test]
-fn renames_a_device_as_the_identity_itself_and_adding_one_needs_peers() {
+fn renames_a_device_as_the_identity_itself_and_enrolling_one_needs_peers() {
   let (_directory, carbon) = carbon();
   let identity = alice(&carbon);
   let renamed = on(&carbon, &identity.channel, &identity, &format!("PUT [identity]/devices/{}", identity.device), json!({"name": "Phone", "tags": []})).unwrap();
@@ -46,8 +48,8 @@ fn renames_a_device_as_the_identity_itself_and_adding_one_needs_peers() {
   let devices = service(&carbon, &identity.channel, "identity");
   let refused = call_now(&carbon, &devices, &stranger, &format!("PUT [identity]/devices/{}", identity.device), json!({"name": "Mine"})).unwrap_err();
   assert_eq!(refused.status, 403);
-  let enrolling = on(&carbon, &identity.channel, &identity, "POST [identity]/devices", json!({"name": "Laptop"})).unwrap_err();
-  assert_eq!((enrolling.status, enrolling.code.as_str()), (503, "UNREACHABLE"));
+  let enrolling = on(&carbon, &identity.channel, &identity, "POST [@carbon]/enroll", json!({"code": "scanned", "name": "Laptop"})).unwrap_err();
+  assert_eq!((enrolling.status, enrolling.code.as_str()), (501, "SINGLE_NODE"));
 }
 
 #[test]
@@ -70,8 +72,8 @@ fn only_the_system_database_keeps_the_secret() {
   let listed = call_now(&carbon, carbon.system(), &Actor::default(), "GET [@carbon]/identities", Value::Null).unwrap().value;
   assert_eq!(listed[0]["personal"], json!(identity.personal));
   assert!(listed[0].get("secret").is_none());
-  let op = &oplog::entries(carbon.system().store()).unwrap()[0];
-  let kept = serde_json::to_string(&(op, results::of(carbon.system().store(), &op.hash).unwrap(), oplog::effects(carbon.system().store(), &op.hash).unwrap())).unwrap();
+  let op = &entries(carbon.system())[0];
+  let kept = serde_json::to_string(&(op, results::of(carbon.system().store(), &op.hash).unwrap(), oplog::effects(carbon.system().channel.log(), &op.hash).unwrap())).unwrap();
   assert!(!kept.contains(&secret));
 }
 

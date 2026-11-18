@@ -1,5 +1,5 @@
 //! Effects: what a service does outside its own tables, such as calling
-//! another service or creating a space for a new one.
+//! another service or sending a request to the world outside.
 //!
 //! Every replica re-runs each op's handler, but an effect happens once: on the
 //! op's first run, on the device that made it. Its output, success or
@@ -16,17 +16,20 @@
 //! such an effect is made again on every run on every replica, and never
 //! recorded.
 //!
-//! The registry holds the handler for each effect by name. Single-node, this
-//! device carries out what it can alone (`call`, `create`, `fetch`); an
-//! effect that needs peers has no handler, and fails as unreachable.
+//! `KNOWN` is the effects this device carries out, by name, and who may ask
+//! for each: `call` and `fetch` any service; `create` (a channel or a
+//! service's store), `sign` (what a service records only on `[@carbon]`'s
+//! word) and `enroll` (a device into an identity) only `[@carbon]`, whose ops
+//! replay on every replica like any other, these effects with them. Any other
+//! effect has no handler here, and fails as unreachable.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 
-use crate::error::{Result, ServiceError};
+use crate::error::{Result, ServiceError, forbidden};
 use crate::calls::service_call::ServiceCall;
 use crate::Reply;
 
@@ -138,26 +141,31 @@ pub fn unreachable(what: &str) -> ServiceError {
 
 // How an effect is carried out: given the service call that asks for it, its
 // input, and where to answer.
-pub type Handler = Rc<dyn Fn(Rc<ServiceCall>, Value, Reply)>;
+pub type Handler = fn(Rc<ServiceCall>, Value, Reply);
 
-// The effects this device can carry out, by name.
-#[derive(Default)]
-pub struct Effects {
-  handlers: BTreeMap<String, Handler>,
+// Who may ask for an effect.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Asker {
+  Any,
+  Carbon,
 }
 
-impl Effects {
-  pub fn with(mut self, name: &str, handler: Handler) -> Effects {
-    self.handlers.insert(name.to_string(), handler);
-    self
-  }
+// The effects this device carries out, by name, with who may ask for each.
+const KNOWN: [(&str, Asker, Handler); 5] = [
+  ("call", Asker::Any, crate::calls::dispatch::call_effect),
+  ("fetch", Asker::Any, crate::ops::fetch::fetch_effect),
+  ("create", Asker::Carbon, crate::services::carbon::create_effect),
+  ("sign", Asker::Carbon, crate::services::carbon::sign_effect),
+  ("enroll", Asker::Carbon, crate::nodes::pairing::enroll_effect),
+];
 
-  // Carry out an effect, or answer that it cannot be reached from here.
-  pub(crate) fn make(&self, call: Rc<ServiceCall>, name: &str, input: Value, reply: Reply) {
-    match self.handlers.get(name) {
-      Some(handler) => handler(call, input, reply),
-      None => reply(Err(unreachable(&format!("The effect {name}")))),
-    }
+// Carry out an effect, refuse it to a service that may not ask for it, or
+// answer that it cannot be reached from here.
+pub(crate) fn make(call: Rc<ServiceCall>, name: &str, input: Value, reply: Reply) {
+  match KNOWN.iter().find(|(known, _, _)| *known == name) {
+    Some((_, Asker::Carbon, _)) if !call.call.confined => reply(Err(forbidden(format!("Only [@carbon] makes the effect {name}")))),
+    Some((_, _, handler)) => handler(call, input, reply),
+    None => reply(Err(unreachable(&format!("The effect {name}")))),
   }
 }
 
@@ -183,7 +191,7 @@ mod tests {
   #[test]
   fn a_first_run_records_its_effects_in_the_order_it_asked_for_them() {
     let mut first = EffectLog::of(None);
-    let slots: Vec<usize> = ["call", "create", "fetch"]
+    let slots: Vec<usize> = ["call", "fetch", "call"]
       .iter()
       .map(|name| match first.next(name, &json!({"n": 1})) {
         Turn::Make(slot) => slot,
@@ -198,7 +206,7 @@ mod tests {
 
   #[test]
   fn a_replay_hands_back_the_recorded_outputs_in_order() {
-    let mut replay = EffectLog::of(Some(vec![made("call", Ok(json!(1))), made("create", Err(conflict("no")))]));
+    let mut replay = EffectLog::of(Some(vec![made("call", Ok(json!(1))), made("fetch", Err(conflict("no")))]));
     let outputs: Vec<std::result::Result<Value, u16>> = ["fetch", "call", "call"]
       .iter()
       .map(|name| match replay.next(name, &Value::Null) {

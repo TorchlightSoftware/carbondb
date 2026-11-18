@@ -11,7 +11,8 @@
 //! and the op, when the call writes. It settles the context once.
 //!
 //! `migrations` is an opt-in helper for `setup`, not part of the footprint.
-//! `hash` is the content hash every replica agrees on.
+//! `hash` is the content hash every replica agrees on. With the `signature`
+//! feature, `signature` checks a write that records what `[@carbon]` signed.
 //!
 //! A service ships as a WebAssembly component of the `carbondb:service` world
 //! (`wit/service.wit`): with the `guest` feature, `guest` exports a Rust
@@ -29,6 +30,8 @@ pub mod manifest;
 pub mod migrations;
 pub mod op;
 pub mod package;
+#[cfg(feature = "signature")]
+pub mod signature;
 
 pub use context::{Actor, Db, HandlerContext, Package, Reply};
 pub use error::{Result, ServiceError};

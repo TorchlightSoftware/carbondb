@@ -29,7 +29,7 @@ fn calls_to_a_service_still_compiling_wait_for_it_and_answer_once_it_has() {
   let identity = alice(&carbon);
   let package = Package::read(&afresh(PROBE)).unwrap();
   let added = later(|added| carbon.add("probe", package, added));
-  on(&carbon, &identity.personal, &identity, "POST [channel]/services", json!({"name": "probe"})).unwrap();
+  on(&carbon, &identity.personal, &identity, "POST [@carbon]/services", json!({"name": "probe"})).unwrap();
   let call = |key: &'static str, input: Value| later(|answer| carbon.call(Some(&identity.personal), Some(&identity.id), key, input, answer));
   let (wrote, read) = (call("POST [probe]/note", json!({"text": "early"})), call("GET [probe]/notes", Value::Null));
   on(&carbon, &identity.personal, &identity, "POST [notes]/run", json!({"do": [{"insert": "meanwhile"}]})).unwrap();
@@ -75,7 +75,7 @@ fn a_write_sees_its_ops_time_and_randomness_and_never_draws_the_same_id_twice() 
   let (_directory, carbon, _timers, identity) = probed();
   let seen = probe(&carbon, &identity, "POST [probe]/seen", json!({"inner": true})).unwrap();
   let (outer, inner) = (&seen["outer"], &seen["inner"]);
-  let op = oplog::entries(service(&carbon, &identity.personal, "probe").store()).unwrap().pop().unwrap();
+  let op = entries(&service(&carbon, &identity.personal, "probe")).pop().unwrap();
   assert_eq!((&outer["clock"], &inner["clock"]), (&json!(op.time), &json!(op.time)), "every clock reads the op's time");
   assert_eq!(outer["random"], inner["random"], "randomness is drawn from the op, the same in every instance");
   let ids = [&outer["first"], &inner["first"], &seen["last"]].map(|id| id.as_str().unwrap().to_string());

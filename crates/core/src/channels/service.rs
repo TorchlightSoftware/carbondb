@@ -1,20 +1,16 @@
-//! A space on this device, as the host keeps it: its database, the one
-//! service that runs in it, the name its channel calls that service by and
-//! the channel it belongs to, its OpWriter, the callers waiting on its ops,
-//! and its RunState. The system database is the root space: local, never
-//! replicated, and running only `[@carbon]`.
+//! A service's store on this device: the file holding its tables and the
+//! core's record of what it did with each op addressed to it, its pointers
+//! into its channel's log and its results; the service that runs in it, the
+//! name its channel calls it by and the channel it belongs to; its OpWriter,
+//! the callers waiting on its ops, and its RunState.
 //!
-//! A space's file holds its service's tables beside the core's own record of
-//! it (the op log, results and migrations, named `carbon_`). Its ops apply one
-//! at a time: one store, one writer. Different spaces apply side by side.
-//!
-//! Which service a space runs, and in which channel, is this device's own
-//! bookkeeping, kept in the system database when the space is created here;
-//! a space keeps no record about itself.
+//! A service's ops apply one at a time, each in its transaction in this file:
+//! one store, one writer. Different services apply side by side, though their
+//! ops share their channel's log. `[@carbon]` runs in a store of its own in
+//! every channel, the system's being the system database.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
 use std::rc::Rc;
 
 use serde::Serialize;
@@ -24,23 +20,19 @@ use crate::sql::call_window::CallWindow;
 use crate::calls::deadline::Deadline;
 use crate::calls::dispatch::{Reply, Settled};
 use crate::error::{Result, ServiceError, conflict, internal, not_found};
+use crate::channels::channel::Channel;
 use crate::ops::op_writer::OpWriter;
 use crate::sql::schema::check_keys;
 use crate::services::Service;
 use crate::store::Store;
+use crate::calls::call::address;
 use crate::{Call, Db};
 use carbondb_service_bindings::migrations::Migration;
 
-// The core's own tables in every space's file, the op log and results, as
-// forward-only migrations. Each name carries its set, since the root space's
-// file tracks the system database's migrations beside these.
-pub const MIGRATIONS: &[Migration] = &[
-  ("space/0001_oplog_and_results", include_str!("../../migrations/space/0001_oplog_and_results.sql")),
-  ("space/0002_sub_calls", include_str!("../../migrations/space/0002_sub_calls.sql")),
-  ("space/0003_read_sets_and_changesets", include_str!("../../migrations/space/0003_read_sets_and_changesets.sql")),
-  ("space/0004_effects", include_str!("../../migrations/space/0004_effects.sql")),
-  ("space/0005_published_and_errors", include_str!("../../migrations/space/0005_published_and_errors.sql")),
-];
+// The core's own tables in every service's store, its pointers and results,
+// as forward-only migrations. Each name carries its set, since the system's
+// store tracks the system database's migrations beside these.
+pub const MIGRATIONS: &[Migration] = &[("store/0001_pointers_and_results", include_str!("../../migrations/store/0001_pointers_and_results.sql"))];
 
 // Where a space is in applying its ops: initializing until its package is
 // here and compiled, set up and healthy (`crate::channels::lifecycle`), then idle, or
@@ -55,19 +47,18 @@ pub enum RunState {
   Stopped { error: ServiceError },
 }
 
-// What a space runs: the package registered on this device that answers its
-// calls, the name its channel calls it by, and the channel it belongs to. A
-// channel's own space belongs to itself; the system space to none.
+// What a store runs: the package registered on this device that answers its
+// calls, and the name its channel calls it by, `@carbon` for `[@carbon]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Runs {
   pub package: String,
   pub name: String,
-  pub channel: Option<String>,
 }
 
-pub struct ServiceSpace {
+pub struct ServiceStore {
   pub id: String,
-  root: bool,
+  // The channel it belongs to, whose log holds its ops.
+  pub channel: Rc<Channel>,
   store: Store,
   pub runs: Runs,
   // Its service, once set up here; until then its ops wait.
@@ -80,42 +71,52 @@ pub struct ServiceSpace {
   // The ops whose callers' deadlines passed before they ran, with the 504
   // their callers got: each is refused with it when its turn comes.
   expired: RefCell<HashMap<String, ServiceError>>,
-  // The spaces whose ops wait on an op, by op hash, when another service's
+  // The stores whose ops wait on an op, by op hash, when another service's
   // call posted it: a write it posts back into one of them would wait forever.
   awaiting: RefCell<HashMap<String, Vec<String>>>,
   run_state: RefCell<RunState>,
   // Whether pending ops are being applied further up the stack, since an op
   // can settle while it is being started.
   pub(crate) draining: Cell<bool>,
+  // The ops to take up again between turns, their cause's outcome having changed.
+  reconsidering: RefCell<Vec<String>>,
 }
 
-impl ServiceSpace {
-  // The root space over the system database, whose file holds a space's
-  // tables and, after them, the system database's own. It runs `[@carbon]`.
-  pub fn root(store: Store, system: &[Migration], carbon: Rc<Service>) -> Result<ServiceSpace> {
-    let runs = Runs { package: carbon.name.clone(), name: carbon.name.clone(), channel: None };
-    let space = ServiceSpace::over("system", true, store, &[MIGRATIONS, system].concat(), runs)?;
+impl ServiceStore {
+  // The system's `[@carbon]` store, over the system database, whose file
+  // holds a store's tables and, after them, the system database's own.
+  pub fn system(channel: &Rc<Channel>, store: Store, system: &[Migration], carbon: Rc<Service>) -> Result<ServiceStore> {
+    let space = ServiceStore::over(channel, &channel.carbon(), store, &[MIGRATIONS, system].concat(), carbon_runs(&carbon))?;
     space.service.replace(Some(carbon));
     Ok(space)
   }
 
-  // A new, empty space's database.
-  pub fn create(path: &Path, id: &str, runs: Runs) -> Result<ServiceSpace> {
+  // A channel's `[@carbon]` store, running `[@carbon]` from the start.
+  pub fn carbon(channel: &Rc<Channel>, carbon: Rc<Service>) -> Result<ServiceStore> {
+    let id = channel.carbon();
+    let space = ServiceStore::over(channel, &id, Store::open(&channel.store_path(&id))?, MIGRATIONS, carbon_runs(&carbon))?;
+    space.service.replace(Some(carbon));
+    Ok(space)
+  }
+
+  // A new, empty store for a service of a channel.
+  pub fn create(channel: &Rc<Channel>, id: &str, runs: Runs) -> Result<ServiceStore> {
+    let path = channel.store_path(id);
     if path.exists() {
-      return Err(conflict(format!("A space already exists at {}", path.display())));
+      return Err(conflict(format!("A service's store already exists at {}", path.display())));
     }
-    ServiceSpace::open(path, id, runs)
+    ServiceStore::open(channel, id, runs)
   }
 
-  pub fn open(path: &Path, id: &str, runs: Runs) -> Result<ServiceSpace> {
-    ServiceSpace::over(id, false, Store::open(path)?, MIGRATIONS, runs)
+  pub fn open(channel: &Rc<Channel>, id: &str, runs: Runs) -> Result<ServiceStore> {
+    ServiceStore::over(channel, id, Store::open(&channel.store_path(id))?, MIGRATIONS, runs)
   }
 
-  fn over(id: &str, root: bool, store: Store, migrations: &[Migration], runs: Runs) -> Result<ServiceSpace> {
+  fn over(channel: &Rc<Channel>, id: &str, store: Store, migrations: &[Migration], runs: Runs) -> Result<ServiceStore> {
     store.migrate(migrations)?;
-    Ok(ServiceSpace {
+    Ok(ServiceStore {
       id: id.to_string(),
-      root,
+      channel: Rc::clone(channel),
       store,
       runs,
       service: RefCell::default(),
@@ -126,11 +127,23 @@ impl ServiceSpace {
       awaiting: RefCell::default(),
       run_state: RefCell::new(RunState::Idle),
       draining: Cell::new(false),
+      reconsidering: RefCell::default(),
     })
   }
 
-  pub fn is_root(&self) -> bool {
-    self.root
+  // Take up an op again before the next turn, its cause's outcome having changed.
+  pub(crate) fn reconsider(&self, hash: &str) {
+    self.reconsidering.borrow_mut().push(hash.to_string());
+  }
+
+  // The ops to take up again now, taken.
+  pub(crate) fn reconsidering(&self) -> Vec<String> {
+    std::mem::take(&mut *self.reconsidering.borrow_mut())
+  }
+
+  // Whether it runs `[@carbon]`.
+  pub fn is_carbon(&self) -> bool {
+    self.runs.name == CARBON
   }
 
   pub fn store(&self) -> &Store {
@@ -142,19 +155,14 @@ impl ServiceSpace {
     self.service.borrow().clone()
   }
 
-  // Its service as calls name it: `[@carbon]` in the system root, `[name]`
-  // anywhere else, by the name its channel gives it.
+  // Its service as calls name it, by the name its channel gives it: `[@carbon]`, or `[name]`.
   pub fn called(&self) -> String {
-    match self.root {
-      true => format!("[@{}]", self.runs.name),
-      false => format!("[{}]", self.runs.name),
-    }
+    format!("[{}]", self.runs.name)
   }
 
-  // Whether a call is to this space's own service, by the name it goes by:
-  // `[@carbon]` in the system space, its channel name anywhere else.
+  // Whether a call is to this store's own service, by the name it goes by.
   pub fn answers(&self, call: &Call) -> bool {
-    call.confined == self.root && call.service == self.runs.name
+    address(call) == self.runs.name
   }
 
   pub fn run_state(&self) -> RunState {
@@ -247,7 +255,7 @@ impl ServiceSpace {
 // The `db` binding a service's `setup` receives: its own tables in this
 // space, open only while `setup` runs.
 struct DbBinding {
-  space: Rc<ServiceSpace>,
+  space: Rc<ServiceStore>,
   window: CallWindow,
   open: Cell<bool>,
 }
@@ -271,24 +279,36 @@ impl Db for DbBinding {
   }
 }
 
-// Where a space id leads when this device does not hold it.
+// The name `[@carbon]` goes by in every channel.
+pub const CARBON: &str = "@carbon";
+
+fn carbon_runs(carbon: &Service) -> Runs {
+  Runs { package: carbon.name.clone(), name: CARBON.into() }
+}
+
+// Where a store id leads when this device does not hold it.
 pub fn missing(id: &str) -> crate::error::ServiceError {
-  not_found(format!("No space {id} on this device"))
+  not_found(format!("No service {id} on this device"))
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::Routing;
+  use crate::channels::channel::Kind;
   use serde_json::json;
 
   fn notes() -> Runs {
-    Runs { package: "notes".into(), name: "notes".into(), channel: Some("room".into()) }
+    Runs { package: "notes".into(), name: "notes".into() }
   }
 
-  fn space() -> (tempfile::TempDir, Rc<ServiceSpace>) {
+  fn channel(directory: &tempfile::TempDir) -> Rc<Channel> {
+    Rc::new(Channel::open(directory.path(), "room", None, Kind::Replicated).unwrap())
+  }
+
+  fn space() -> (tempfile::TempDir, Rc<ServiceStore>) {
     let directory = tempfile::tempdir().unwrap();
-    let space = Rc::new(ServiceSpace::create(&directory.path().join("s.db"), "s", notes()).unwrap());
+    let space = Rc::new(ServiceStore::create(&channel(&directory), "s", notes()).unwrap());
     (directory, space)
   }
 
@@ -298,10 +318,11 @@ mod tests {
 
   #[test]
   fn names_its_service_as_calls_name_it() {
-    let (_directory, space) = space();
+    let (directory, space) = space();
     assert_eq!(space.called(), "[notes]");
-    let root = ServiceSpace::root(Store::open(&_directory.path().join("system.db")).unwrap(), &[], Rc::new(crate::services::carbon::service())).unwrap();
-    assert_eq!(root.called(), "[@carbon]");
+    let carbon = ServiceStore::carbon(&channel(&directory), Rc::new(crate::services::carbon::service())).unwrap();
+    assert_eq!(carbon.called(), "[@carbon]");
+    assert!(carbon.answers(&Call::from_key("GET [@carbon]/status").unwrap()));
   }
 
   // The core migrations a store's file has applied, in order.
@@ -314,40 +335,27 @@ mod tests {
   }
 
   #[test]
-  fn brings_a_space_file_from_before_effects_up_to_date_once() {
+  fn refuses_a_store_file_migrated_by_newer_code() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("s.db");
-    Store::open(&path).unwrap().migrate(&MIGRATIONS[..3]).unwrap();
-    for opening in ["first", "again"] {
-      let space = ServiceSpace::open(&path, "s", notes()).unwrap();
-      assert_eq!(applied(space.store()), names(MIGRATIONS), "{opening}");
-      assert!(space.store().all("SELECT effects FROM carbon_oplog", &[]).is_ok(), "{opening}");
-    }
-  }
-
-  #[test]
-  fn refuses_a_space_file_migrated_by_newer_code() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("s.db");
-    let space = ServiceSpace::open(&path, "s", notes()).unwrap();
-    space.store().run("INSERT INTO carbon_migrations (name) VALUES ('space/9999_from_the_future')", &[]).unwrap();
+    let space = ServiceStore::open(&channel(&directory), "s", notes()).unwrap();
+    space.store().run("INSERT INTO carbon_migrations (name) VALUES ('store/9999_from_the_future')", &[]).unwrap();
     drop(space);
-    assert_eq!(ServiceSpace::open(&path, "s", notes()).err().unwrap().status, 409);
+    assert_eq!(ServiceStore::open(&channel(&directory), "s", notes()).err().unwrap().status, 409);
   }
 
   #[test]
-  fn the_root_space_holds_the_space_tables_and_the_system_tables_after_them() {
+  fn the_system_store_holds_a_stores_tables_and_the_system_tables_after_them() {
     let directory = tempfile::tempdir().unwrap();
     let system: &[Migration] = &[("system/0001_things", "CREATE TABLE carbon_system_thing (id TEXT PRIMARY KEY)")];
-    let root = ServiceSpace::root(Store::open(&directory.path().join("system.db")).unwrap(), system, Rc::new(crate::services::carbon::service())).unwrap();
+    let root = ServiceStore::system(&channel(&directory), Store::open(&directory.path().join("system.db")).unwrap(), system, Rc::new(crate::services::carbon::service())).unwrap();
     assert_eq!(applied(root.store()), [names(MIGRATIONS), names(system)].concat());
     assert!(root.answers(&Call::from_key("GET [@carbon]/identities").unwrap()));
   }
 
   #[test]
-  fn creates_a_space_once() {
+  fn creates_a_store_once() {
     let (directory, _space) = space();
-    assert_eq!(ServiceSpace::create(&directory.path().join("s.db"), "s", notes()).err().unwrap().status, 409);
+    assert_eq!(ServiceStore::create(&channel(&directory), "s", notes()).err().unwrap().status, 409);
   }
 
   #[test]

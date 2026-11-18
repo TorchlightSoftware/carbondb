@@ -26,7 +26,7 @@ use serde_json::Value;
 use crate::carbon::Carbon;
 use crate::calls::dispatch::{Reply, Settled};
 use crate::error::Result;
-use crate::channels::service::{RunState, ServiceSpace};
+use crate::channels::service::{RunState, ServiceStore};
 use crate::{Actor, Call, Routing};
 
 // Stops a watch or a RunState listener.
@@ -206,8 +206,9 @@ impl Carbon {
   // published and the messages held are offered again, since a commit may
   // list a device (`crate::nodes`). Returns the watches it owes a run.
   pub(crate) fn committed(self: &Rc<Self>, space: &str, tables: &[String]) -> Vec<WatchId> {
-    self.publish(space);
-    self.listed_changed(space);
+    if let Some(store) = self.opened(space) {
+      self.publish(&store.channel.id);
+    }
     self.offer_all_held();
     let watches = self.watches.on(space);
     let owed = watches
@@ -226,7 +227,7 @@ impl Carbon {
   // Move a space to a RunState and tell whoever listens. Stopping or resuming
   // changes what every GET answers, so every watch on it runs again.
   // Returns the watches it ran again.
-  pub(crate) fn set_run_state(self: &Rc<Self>, space: &ServiceSpace, state: RunState) -> Vec<WatchId> {
+  pub(crate) fn set_run_state(self: &Rc<Self>, space: &ServiceStore, state: RunState) -> Vec<WatchId> {
     let stopping_or_resuming = is_stopped(&space.run_state()) != is_stopped(&state);
     space.set_run_state(state.clone());
     for listener in self.watches.listening(&space.id) {
@@ -252,7 +253,7 @@ impl Carbon {
     let (carbon, running) = (Rc::clone(self), Rc::clone(watch));
     let answered: Reply = Box::new(move |settled| carbon.answered(&running, settled));
     let (carbon, actor, call) = (Rc::clone(self), watch.actor.clone(), watch.call.clone());
-    self.with_space(&watch.space, Box::new(move |space| match space {
+    self.with_store(&watch.space, Box::new(move |space| match space {
       Ok(space) => carbon.submit(&space, actor, call, Value::Null, answered),
       Err(error) => answered(Err(error)),
     }));

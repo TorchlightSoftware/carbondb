@@ -1,18 +1,20 @@
-//! Loading spaces in the `ref` sync mode: a node holds each identity's own
-//! channel, and every channel and service the channels it holds name. It
-//! watches `GET [channel]/refs` and `GET [channel]/services` on each channel
-//! it holds; a watch answers as soon as it is registered, so the same watches
-//! load everything at start and whatever appears later, as the ops naming it
-//! apply. A space this device does not hold yet is created here, running the
-//! package registered under its name, and its p2panda space joined, which
-//! completes once a device of the identity adds this one (`members`).
+//! Loading channels in the `ref` sync mode: a node holds each identity's own
+//! channel, and every channel the channels it holds point to, with every
+//! service they name. It watches `GET [channel]/refs` and `GET
+//! [channel]/services` on each channel it holds; a watch answers as soon as
+//! it is registered, so the same watches load everything at start and
+//! whatever appears later, as the ops naming it apply. A channel this device
+//! does not hold yet is created here and its p2panda space joined, which
+//! completes once a device of the identity adds this one (`members`); a
+//! service's store is opened, running the package registered under its name,
+//! and takes up what the channel's log addresses to it.
 
 use std::rc::Rc;
 
 use serde_json::Value;
 
 use crate::carbon::Carbon;
-use crate::channels::service::Runs;
+use crate::channels::channel::Channel;
 use crate::error::Result;
 
 impl Carbon {
@@ -21,22 +23,21 @@ impl Carbon {
     self.load_channel(channel, identity);
   }
 
-  // Hold a channel, and watch what it names.
+  // Hold a channel, follow its p2panda space, and watch what it names.
   fn load_channel(self: &Rc<Self>, channel: &str, identity: &str) {
     if !self.nodes.loading.borrow_mut().insert(channel.to_string()) {
       return;
     }
-    if let Err(error) = self.load(channel, Runs { package: "channel".into(), name: "channel".into(), channel: Some(channel.to_string()) }, identity) {
-      return eprintln!("[carbondb] channel {channel} is not loaded: {}", error.message);
-    }
+    let held = match self.held_or_created(channel, identity) {
+      Ok(held) => held,
+      Err(error) => return eprintln!("[carbondb] channel {channel} is not loaded: {}", error.message),
+    };
+    self.join_p2panda_space(channel, identity);
     let (services, refs) = (Rc::downgrade(self), Rc::downgrade(self));
-    let (named_in, identity_of) = (channel.to_string(), identity.to_string());
     let on_services = Rc::new(move |listed: Result<Value>| {
       let (Some(carbon), Ok(listed)) = (services.upgrade(), listed) else { return };
-      for service in listed.as_array().into_iter().flatten() {
-        let (Some(space), Some(name), Some(package)) = (service["service"].as_str(), service["name"].as_str(), service["package"].as_str()) else { continue };
-        let runs = Runs { package: package.to_string(), name: name.to_string(), channel: Some(named_in.clone()) };
-        if let Err(error) = carbon.load(space, runs, &identity_of) {
+      for name in listed.as_array().into_iter().flatten().filter_map(|service| service["name"].as_str()) {
+        if let Err(error) = carbon.named_store(&held, name) {
           eprintln!("[carbondb] [{name}] is not loaded: {}", error.message);
         }
       }
@@ -52,13 +53,11 @@ impl Carbon {
     }
   }
 
-  // Hold a space this device does not hold yet, synced by the identity's node, and follow its p2panda space.
-  fn load(self: &Rc<Self>, space: &str, runs: Runs, identity: &str) -> Result<()> {
-    if self.held(space)?.is_none() {
-      self.create_space(space, runs)?;
-      self.synced_by(space, identity)?;
+  // A channel this device holds, created here if it does not hold it yet.
+  fn held_or_created(self: &Rc<Self>, channel: &str, identity: &str) -> Result<Rc<Channel>> {
+    match self.channel(channel) {
+      Ok(held) => Ok(held),
+      Err(_) => self.create_channel(channel, identity),
     }
-    self.join_p2panda_space(space, identity);
-    Ok(())
   }
 }

@@ -5,10 +5,11 @@ use super::*;
 use crate::ops::op::stamp;
 use crate::ops::oplog::LogRow;
 use crate::channels::service::Runs;
-use crate::testing::now;
-use crate::{Call, Carbon, ServiceSpace};
+use crate::testing::{now, register_script};
+use crate::{Call, Carbon, ServiceStore};
 
 const ROOM: &str = "room";
+const NOTES: &str = "notes-in-room";
 
 // An op in a scenario: when it was made, from which of alice's devices, and its call.
 struct Made {
@@ -34,28 +35,29 @@ fn row(carbon: &Carbon, made: &Made) -> LogRow {
   LogRow::new(stamp(&actor, &call, &made.input, &carbon.services().version("notes"), made.time))
 }
 
-// A fresh replica holding the room, a `[notes]` service.
+// A fresh replica holding the room, a channel with a `[notes]` service.
 fn device() -> (tempfile::TempDir, Rc<Carbon>) {
   let (directory, carbon) = carbon();
-  carbon.create_space(ROOM, Runs { package: "notes".into(), name: "notes".into(), channel: None }).unwrap();
+  let room = carbon.create_channel(ROOM, "alice").unwrap();
+  carbon.create_service(&room, NOTES, Runs { package: "notes".into(), name: "notes".into() }).unwrap();
   (directory, carbon)
 }
 
 fn receive(carbon: &Rc<Carbon>, row: LogRow) {
-  now(|received| carbon.receive(ROOM, row, received)).unwrap();
+  carbon.receive_in(&carbon.opened(NOTES).unwrap(), row).unwrap();
 }
 
 // A replica that received these rows in this order.
-fn replica(rows: &[&LogRow]) -> (tempfile::TempDir, Rc<Carbon>, Rc<ServiceSpace>) {
+fn replica(rows: &[&LogRow]) -> (tempfile::TempDir, Rc<Carbon>, Rc<ServiceStore>) {
   let (directory, carbon) = device();
   rows.iter().for_each(|row| receive(&carbon, (*row).clone()));
-  let space = space_now(&carbon, ROOM).unwrap();
+  let space = carbon.opened(NOTES).unwrap();
   (directory, carbon, space)
 }
 
 // What a replica holds: its notes, and what became of each op in the shared order.
-fn state(space: &ServiceSpace) -> Value {
-  let ops = oplog::entries(space.store()).unwrap();
+fn state(space: &ServiceStore) -> Value {
+  let ops = entries(space);
   let results: Vec<Value> = ops.iter().map(|op| json!([op.key, results::of(space.store(), &op.hash).unwrap()])).collect();
   json!({"notes": texts(&space.store().reader().unwrap()).unwrap(), "results": results})
 }
@@ -137,7 +139,7 @@ fn a_watch_shows_the_state_a_rewind_settles_on() {
   let (_directory, carbon) = device();
   let seen = Rc::new(std::cell::RefCell::new(vec![]));
   let seeing = Rc::clone(&seen);
-  carbon.watch(ROOM, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
+  carbon.watch(NOTES, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
   receive(&carbon, row(&carbon, &script(20, json!([{"replace": ["a", "b"]}]))));
   receive(&carbon, row(&carbon, &script(10, json!([{"insert": "a"}]))));
   assert_eq!(seen.borrow().last(), Some(&json!(["b"])));
@@ -148,7 +150,7 @@ fn a_late_insert_of_another_row_applies_in_place_and_nothing_re_runs() {
   let (_directory, carbon) = device();
   let seen = Rc::new(std::cell::RefCell::new(vec![]));
   let seeing = Rc::clone(&seen);
-  carbon.watch(ROOM, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
+  carbon.watch(NOTES, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
   receive(&carbon, row(&carbon, &script(20, json!([{"insert": "b"}]))));
   receive(&carbon, row(&carbon, &script(10, json!([{"insert": "a"}]))));
   // A rewind would have shown the later insert undone, then applied again.
@@ -160,7 +162,7 @@ fn a_late_insert_applies_in_place_before_an_edit_that_looked_up_another_row_by_i
   let (_directory, carbon) = device();
   let seen = Rc::new(std::cell::RefCell::new(vec![]));
   let seeing = Rc::clone(&seen);
-  carbon.watch(ROOM, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
+  carbon.watch(NOTES, None, "GET [notes]/texts", Rc::new(move |texts| seeing.borrow_mut().push(texts.unwrap()))).unwrap();
   receive(&carbon, row(&carbon, &script(5, json!([{"set": ["k", "first"]}]))));
   receive(&carbon, row(&carbon, &script(20, json!([{"set": ["k", "second"]}]))));
   receive(&carbon, row(&carbon, &script(10, json!([{"insert": "a"}]))));
@@ -174,9 +176,9 @@ fn a_call_made_after_receiving_an_op_sorts_after_it() {
   // A minute ahead of this device's clock, within how far clocks drift.
   let future = crate::ops::clock::wall() + 60_000;
   receive(&carbon, row(&carbon, &script(future, json!([{"insert": "a"}]))));
-  let space = space_now(&carbon, ROOM).unwrap();
+  let space = carbon.opened(NOTES).unwrap();
   call_now(&carbon, &space, &Actor { identity: Some("alice".into()), device: Some("pixel".into()) }, "POST [notes]/run", json!({"do": [{"read": true}]})).unwrap();
-  let ops = oplog::entries(space.store()).unwrap();
+  let ops = entries(&space);
   assert!(ops[1].time > future);
   assert_eq!(results::of(space.store(), &ops[1].hash).unwrap(), Some(Outcome::Applied { output: json!([["a"]]), calls: json!([]) }));
 }
@@ -190,8 +192,35 @@ fn a_row_whose_time_is_too_far_ahead_or_impossible_is_refused_unlogged_and_leave
     let refused = now(|received| carbon.receive(ROOM, row(&carbon, &script(time, json!([{"insert": "a"}]))), received));
     assert_eq!(refused.unwrap_err().status, status, "{name}");
   }
-  let space = space_now(&carbon, ROOM).unwrap();
-  assert_eq!(oplog::entries(space.store()).unwrap().len(), 0, "nothing was logged");
+  let space = carbon.opened(NOTES).unwrap();
+  assert_eq!(entries(&space).len(), 0, "nothing was logged");
   let next = carbon.stamp(&Actor::default(), &Call::from_key("POST [notes]/run").unwrap(), &json!({}), "notes").time;
   assert!(next < wall + 60_000, "the clock never took in a refused time");
+}
+
+// A `[@carbon]` op replays on every replica of its channel like any op: its
+// effects' recorded outputs stand in for making them, so another replica
+// creates nothing; what it holds follows from what the channel names.
+#[test]
+fn a_carbon_op_replays_on_another_replica_without_making_its_effects_again() {
+  let (_first, one) = carbon();
+  register_script(&one, "jots");
+  let identity = alice(&one);
+  let room = crate::testing::room_channel(&one, &identity);
+  on(&one, &room, &identity, "POST [@carbon]/services", json!({"name": "jots"})).unwrap();
+  let added = one.named(&room, "jots").unwrap();
+
+  let (_second, two) = carbon();
+  register_script(&two, "jots");
+  let replica = two.create_channel(&room, &identity.id).unwrap();
+  for row in oplog::rows(one.channel(&room).unwrap().log()).unwrap() {
+    now(|received| two.receive(&room, row, received)).unwrap();
+  }
+  let carbon_ops = two.carbon_store(&replica).unwrap();
+  assert_eq!((logged(&carbon_ops), outcomes(&carbon_ops)), (vec!["POST [@carbon]/services".to_string(); 2], vec![Ok(()); 2]), "each [@carbon] op applied, replaying its recorded effects");
+  assert!(!replica.store_path(&added).exists(), "replaying `create` made no store");
+  assert_eq!(two.named(&room, "jots").unwrap(), added, "[channel] names the service with the id its first run created");
+  let jots = service(&two, &room, "jots");
+  assert!(replica.store_path(&added).exists(), "its store is opened from what the channel names");
+  assert_eq!(jots.runs.package, "jots");
 }

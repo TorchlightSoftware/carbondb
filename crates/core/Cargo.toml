@@ -10,7 +10,7 @@ keywords = ["database", "local-first", "sqlite", "p2p", "sync"]
 categories = ["database-implementations"]
 
 [dependencies]
-carbondb-service-bindings = { workspace = true, features = ["manifest"] }
+carbondb-service-bindings = { workspace = true, features = ["manifest", "signature"] }
 carbondb-svc-channel.workspace = true
 carbondb-svc-identity.workspace = true
 rusqlite.workspace = true
@@ -24,6 +24,7 @@ rand = { version = "0.10.1", default-features = false, features = ["std_rng"] }
 tokio = { version = "1.54.1", features = ["sync", "rt", "rt-multi-thread", "time", "net", "macros"] }
 tokio-stream = "0.1"
 p2panda = "0.8.1"
+p2panda-core = "0.8.1"
 p2panda-encryption = "0.8.1"
 p2panda-spaces = "0.8.1"
 getrandom = "0.4.3"

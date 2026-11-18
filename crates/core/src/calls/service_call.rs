@@ -27,7 +27,7 @@ use crate::carbon::{Cancel, Carbon};
 use crate::calls::deadline::Deadline;
 use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal, timed_out};
 use crate::ops::effects::{EffectLog, Turn};
-use crate::channels::service::ServiceSpace;
+use crate::channels::service::ServiceStore;
 use crate::sql::call_window::{CallWindow, Scoped};
 use crate::store::Reader;
 use crate::{Actor, Call, Routing, Db, HandlerContext, Op, Reply};
@@ -66,13 +66,11 @@ impl CallRecord {
   }
 }
 
-// Who may call what: a replicated service never calls a local one, since
-// every replica would repeat its effects; a GET never calls a write.
+// Who may call what: a GET never calls a write.
 fn allowed(caller: &Call, callee: &Call) -> Result<()> {
-  match (caller.confined, caller.writes(), callee.confined, callee.writes()) {
-    (false, _, true, _) => Err(forbidden(format!("A replicated service never calls a local one, such as {}", callee.key()))),
-    (_, false, _, true) => Err(bad_request(format!("A GET cannot call {}, which writes", callee.key()))),
-    _ => Ok(()),
+  match caller.writes() || !callee.writes() {
+    true => Ok(()),
+    false => Err(bad_request(format!("A GET cannot call {}, which writes", callee.key()))),
   }
 }
 
@@ -85,7 +83,7 @@ pub(crate) enum Asked {
 
 pub struct ServiceCall {
   carbon: Rc<Carbon>,
-  space: Rc<ServiceSpace>,
+  space: Rc<ServiceStore>,
   pub actor: Actor,
   pub call: Call,
   pub input: Value,
@@ -94,7 +92,7 @@ pub struct ServiceCall {
   op: Option<Op>,
   // The effects of the run it belongs to, shared by every call within it.
   effects: Rc<RefCell<EffectLog>>,
-  // The spaces whose ops wait on the run it belongs to.
+  // The stores whose ops wait on the run it belongs to.
   awaiting: Vec<String>,
   // Whether the top-level call it belongs to is still open; nothing queries after.
   live: Rc<Cell<bool>>,
@@ -113,7 +111,7 @@ impl ServiceCall {
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     carbon: &Rc<Carbon>,
-    space: &Rc<ServiceSpace>,
+    space: &Rc<ServiceStore>,
     actor: Actor,
     call: Call,
     input: Value,
@@ -175,8 +173,7 @@ impl ServiceCall {
       }
       reply(output)
     });
-    let carbon = Rc::clone(&self.carbon);
-    carbon.effects().make(self, name, input, made)
+    crate::ops::effects::make(self, name, input, made)
   }
 
   // How to drop whatever runs its handler, should it expire first.
@@ -205,13 +202,25 @@ impl ServiceCall {
     &self.carbon
   }
 
-  pub fn space(&self) -> &Rc<ServiceSpace> {
+  pub fn space(&self) -> &Rc<ServiceStore> {
     &self.space
   }
 
   // The spaces whose ops wait on the run this call belongs to.
   pub(crate) fn awaiting(&self) -> &[String] {
     &self.awaiting
+  }
+
+  // Whether the run this call belongs to is still open.
+  pub(crate) fn is_live(&self) -> bool {
+    self.live.get()
+  }
+
+  // The cause a write this call makes into a store is bound to: the op it
+  // runs within, when the store is in the same channel; none for another
+  // channel's, which no cause binds.
+  pub(crate) fn cause_of(&self, target: &ServiceStore) -> Option<String> {
+    self.writing().filter(|_| Rc::ptr_eq(&target.channel, &self.space.channel)).map(|op| op.hash.clone())
   }
 
   // The op being applied, when this call writes within it.
@@ -382,7 +391,8 @@ mod tests {
       ("POST [chat]/messages", "GET [channel]/members", Ok(())),
       ("GET [chat]/messages", "GET [tag]/tags", Ok(())),
       ("POST [@carbon]/identity", "POST [channel]/origin", Ok(())),
-      ("POST [chat]/messages", "GET [@carbon]/status", Err(403)),
+      ("POST [chat]/messages", "GET [@carbon]/status", Ok(())),
+      ("POST [chat]/messages", "POST [@carbon]/services", Ok(())),
       ("GET [chat]/messages", "POST [tag]/tags", Err(400)),
       ("GET [@carbon]/status", "POST [channel]/ref", Err(400)),
     ];

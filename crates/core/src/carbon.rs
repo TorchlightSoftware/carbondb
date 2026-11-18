@@ -1,7 +1,7 @@
 //! This device's CarbonDB, its root: its config, its clock, the core's timers
-//! and tasks, the services it runs and the effects it can carry out, the
-//! system database as its root service space, the service spaces opened so
-//! far (`crate::channels`), and the watches on them (`crate::calls::watch`).
+//! and tasks, the services it runs, the system as a local channel whose
+//! `[@carbon]` store is the system database, the channels and stores opened
+//! so far (`crate::channels`), and the watches on them (`crate::calls::watch`).
 //! Every call goes through `submit`, in `crate::calls::dispatch`; a call from
 //! the app comes in through `call` (`crate::app`).
 //!
@@ -9,8 +9,7 @@
 //! hands it the timers and tasks it runs there.
 //!
 //! Unless it runs single-node, each identity on this device runs a p2panda
-//! node (`crate::nodes`). Effects that need peers and have no handler yet are
-//! unreachable.
+//! node (`crate::nodes`).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -22,15 +21,15 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::calls::dispatch::call_effect;
 use crate::calls::watch::Watches;
 use crate::channels::lifecycle::{Held, Starting};
-use crate::channels::service::ServiceSpace;
+use crate::channels::Open;
+use crate::channels::channel::{Channel, Kind};
+use crate::channels::service::ServiceStore;
 use crate::config::{Config, SyncMode};
 use crate::error::{Result, bad_request, not_built};
 use crate::nodes::Nodes;
 use crate::ops::clock::Clock;
-use crate::ops::effects::Effects;
 use crate::ops::op::stamp;
 use crate::services::carbon::{self as local, Identity};
 use crate::services::{BUILTINS, Service, Services};
@@ -58,9 +57,10 @@ pub struct Carbon {
   schedule: Schedule,
   spawn: Spawn,
   services: Services,
-  effects: Effects,
-  pub(crate) system: Rc<ServiceSpace>,
-  pub(crate) spaces: RefCell<HashMap<String, Rc<ServiceSpace>>>,
+  // The system's `[@carbon]` store, over the system database.
+  pub(crate) system: Rc<ServiceStore>,
+  // The channels and stores open so far.
+  pub(crate) open: Open,
   pub(crate) watches: Watches,
   // The GETs held while their spaces start, by space.
   pub(crate) holding: RefCell<BTreeMap<String, Vec<Held>>>,
@@ -68,6 +68,10 @@ pub struct Carbon {
   pub(crate) starting: RefCell<HashMap<String, Rc<Starting>>>,
   // The identities' p2panda nodes.
   pub(crate) nodes: Nodes,
+  // The device credentials of the identities on this device, by identity,
+  // read from the system database on first use, or kept by a founding before
+  // the identity is recorded there.
+  pub(crate) keys: RefCell<HashMap<String, p2panda::Credentials>>,
 }
 
 impl Carbon {
@@ -80,21 +84,23 @@ impl Carbon {
     wasm::keep_in(&config.compiled);
     let builtins = BUILTINS.iter().map(|(name, bytes)| Package::read(bytes).map(|package| (*name, package))).collect::<Result<Vec<_>>>()?;
     let services = Services::builtin()?;
-    let system = Rc::new(ServiceSpace::root(Store::open(&config.system)?, local::SYSTEM_MIGRATIONS, services.get("carbon")?)?);
+    let system_channel = Rc::new(Channel::open(config.directory(), "system", None, Kind::Local)?);
+    let system = Rc::new(ServiceStore::system(&system_channel, Store::open(&config.system)?, local::SYSTEM_MIGRATIONS, services.get("carbon")?)?);
     let carbon = Rc::new(Carbon {
       config,
       clock: Clock::default(),
       schedule,
       spawn,
       services,
-      effects: Effects::default().with("call", Rc::new(call_effect)).with("create", Rc::new(crate::channels::create_effect)).with("fetch", Rc::new(crate::ops::fetch::fetch_effect)).with("enroll", Rc::new(crate::nodes::pairing::enroll_effect)),
       system,
-      spaces: RefCell::default(),
+      open: Open::default(),
       watches: Watches::default(),
       holding: RefCell::default(),
       starting: RefCell::default(),
       nodes: Nodes::default(),
+      keys: RefCell::default(),
     });
+    carbon.keep_channel(&system_channel);
     for (name, package) in builtins {
       package.compiled().wait()?;
       carbon.register(package.service(name))?;
@@ -110,12 +116,8 @@ impl Carbon {
     &self.services
   }
 
-  pub fn effects(&self) -> &Effects {
-    &self.effects
-  }
-
-  // The root space: the system database, where identities live.
-  pub fn system(&self) -> &Rc<ServiceSpace> {
+  // The system's `[@carbon]` store: the system database, where identities live.
+  pub fn system(&self) -> &Rc<ServiceStore> {
     &self.system
   }
 

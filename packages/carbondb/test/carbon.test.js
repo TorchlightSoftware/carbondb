@@ -39,9 +39,9 @@ async function start(path) {
 // A channel made in `parent`, as an app makes one: a call there, a ref to it,
 // then each of its services named in it.
 async function channelIn(parent, {name, services = []}) {
-  const {kind, slug} = await parent.call('POST [channel]/channel', {name})
+  const {kind, slug} = await parent.call('POST [@carbon]/channel', {name})
   const channel = parent.ref(`${kind}:${slug}`)
-  for (const service of services) await channel.call('POST [channel]/services', {name: service})
+  for (const service of services) await channel.call('POST [@carbon]/services', {name: service})
   return channel
 }
 
@@ -129,7 +129,7 @@ describe('services', () => {
 
   it('refuses an identity or channel naming a service this device has not registered', async () => {
     await assert.rejects(carbon.call('POST [@carbon]/identity', {slug: 'sally', device: 'x', services: ['crm']}), {status: 400, details: {services: ['crm']}})
-    await assert.rejects(personal.call('POST [channel]/services', {name: 'crm'}), {status: 404, details: {service: 'crm'}})
+    await assert.rejects(personal.call('POST [@carbon]/services', {name: 'crm'}), {status: 404, details: {service: 'crm'}})
   })
 
   it('keeps data across a restart that registers the service again, and stops its spaces until it does', async () => {
@@ -368,7 +368,7 @@ describe('watch', () => {
   it('watches a builtin GET too', async () => {
     const {results, arrival} = watching(personal, 'GET [channel]/refs')
     await arrival()
-    personal.call('POST [channel]/channel', {name: 'Lobby'})
+    personal.call('POST [@carbon]/channel', {name: 'Lobby'})
     await arrival()
     assert.deepStrictEqual(results.map((refs) => refs.map((ref) => ref.slug)), [[], ['lobby']])
   })
@@ -407,7 +407,7 @@ describe('run state', () => {
   // Hold a service's file from another process, as a second copy of the app
   // would; resolves with a function that lets go of it.
   async function holdLock(service) {
-    const path = join(dirname(config), 'data', `${service}.db`)
+    const path = join(dirname(config), 'data', alice.id, `${service}.db`)
     const holding = `const db = new (require('node:sqlite').DatabaseSync)(${JSON.stringify(path)}); db.exec('BEGIN IMMEDIATE'); console.log('held'); process.stdin.on('end', () => db.exec('ROLLBACK')); process.stdin.resume()`
     const holder = spawn(process.execPath, ['--no-warnings', '-e', holding], {stdio: ['pipe', 'pipe', 'inherit']})
     await once(holder.stdout, 'data')
@@ -452,7 +452,7 @@ describe('run state', () => {
 
 describe('refs', () => {
   it('reach a channel at once, also after a restart', async () => {
-    const {channel} = await personal.call('POST [channel]/channel', {name: 'Lobby'})
+    const {channel} = await personal.call('POST [@carbon]/channel', {name: 'Lobby'})
     assert.strictEqual(personal.ref('channel:lobby').channel, channel)
     const restarted = await start(config)
     assert.strictEqual(restarted.ref('identity:alice').ref('personal:alice').ref('channel:lobby').channel, channel)
@@ -469,7 +469,7 @@ describe('schema', () => {
 
   it('refuses a service whose table takes its keys from SQLite, and says how to fix it', async () => {
     await carbon.services.add('counter', component('counter'))
-    await assert.rejects(personal.call('POST [channel]/services', {name: 'counter'}), (error) => {
+    await assert.rejects(personal.call('POST [@carbon]/services', {name: 'counter'}), (error) => {
       assert.deepStrictEqual([error.status, error.details], [400, {table: 'hit'}])
       assert.match(error.message, /must come from the op that creates it.*op_id\(\)/)
       return true

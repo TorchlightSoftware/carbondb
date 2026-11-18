@@ -16,4 +16,4 @@ A device runs one version of a service at a time. After the move, that version d
 
 ## Related
 
-- `POST [channel]/services`, which changes a channel's services through the same kind of op ([docs/services.md](../../docs/services.md#channel)).
+- `POST [channel]/services`, which `POST [@carbon]/services` changes a channel's services through, the same kind of op ([docs/services.md](../../docs/services.md#channel)).

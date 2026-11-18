@@ -64,9 +64,9 @@ async function start(config) {
   } else {
     await carbon.call('POST [@carbon]/identity', {slug: 'app', device: 'server'})
     const personal = carbon.ref('identity:app').ref('personal:app')
-    await personal.call('POST [channel]/channel', {name: 'Lobby'})
+    await personal.call('POST [@carbon]/channel', {name: 'Lobby'})
     const lobby = personal.ref('channel:lobby')
-    await lobby.call('POST [channel]/services', {name: 'chat'})
+    await lobby.call('POST [@carbon]/services', {name: 'chat'})
     return lobby
   }
 }
@@ -103,7 +103,7 @@ The interface is in [packages/carbondb/README.md](packages/carbondb/README.md); 
 - [perspectives/brandon/platforms/](perspectives/brandon/platforms/README.md): evaluations of the candidate platforms and the feature matrix.
 - [docs/](docs/): how what is built works: [services.md](docs/services.md), every builtin call; [channels.md](docs/channels.md), channels, refs, access and identities; [lifecycle.md](docs/lifecycle.md), registering, starting and deadlines; [replication.md](docs/replication.md), the shared order, rewind and effects; [wasm-services.md](docs/wasm-services.md), services as WebAssembly components.
 - [stories/](stories/README.md): what a person cannot do yet, the design still to build, and the backlog.
-- [crates/core/](crates/core/): the `carbondb` crate, the Rust core: `calls/`, the one path every call takes, its deadline and watches; `channels/`, each service a channel names as a service space on this device, with its own SQLite file and op log, and its lifecycle; `ops/`, applying ops in the shared order, rewind and effects; `wasm/`, the host every service runs on; `app/`, how an app reaches the core, on a thread of its own; and `services/`, the registry and `[@carbon]`, the part of the core that answers as a local service. The builtins it embeds are committed in `builtins/`.
+- [crates/core/](crates/core/): the `carbondb` crate, the Rust core: `calls/`, the one path every call takes, its deadline and watches; `channels/`, each channel's one log and the store of each service it names, with its own SQLite file, and their lifecycle; `ops/`, applying ops in the shared order, rewind and effects; `wasm/`, the host every service runs on; `app/`, how an app reaches the core, on a thread of its own; and `services/`, the registry and `[@carbon]`, the part of the core that answers as a local service. The builtins it embeds are committed in `builtins/`.
 - [crates/service-bindings/](crates/service-bindings/): ServiceBindings, the toolkit a Rust service builds with: the `carbondb:service` WIT world every service exports; the API footprint a service exposes, its `setup`, entry point and the handler context each call receives; with its `guest` feature, exporting a Rust service as a component; an opt-in helper that applies D1-style migrations; the content hash every replica agrees on; and `carbondb-package`, which embeds a `service.toml` in a component.
 - [crates/services/](crates/services/): the builtin services `[channel]` and `[identity]`, each a crate with its own `service.toml`, migrations and source, written against ServiceBindings alone and built as components by [scripts/build-components](scripts/build-components); and `[probe]`, a component the core's tests run.
 - [crates/node/](crates/node/): the core's Node bindings, through napi-rs.

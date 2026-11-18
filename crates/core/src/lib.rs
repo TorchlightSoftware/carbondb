@@ -31,4 +31,4 @@ pub use app::runtime::Runtime;
 pub use error::{Result, ServiceError};
 pub use services::carbon::Identity;
 pub use services::{Entry, Service, Setup};
-pub use channels::service::{RunState, ServiceSpace};
+pub use channels::service::{RunState, ServiceStore};

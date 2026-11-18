@@ -4,14 +4,15 @@
 //! origin proves it founded the identity. It runs only in the identity's own
 //! channel, shared by the person's own devices and never with anyone else.
 //!
-//! Adding a device needs a handshake with it, which is an effect; single-node
-//! it cannot be reached. Renaming or retagging one needs the identity itself.
+//! A device is added by `[@carbon]`, which enrolls it and then lists it here,
+//! signed with the op's device key (`signature`). Renaming or retagging one
+//! needs the identity itself.
 
 use std::rc::Rc;
 
 use carbondb_service_bindings::error::{Result, conflict, forbidden, not_found, unknown};
 use carbondb_service_bindings::hash::hash;
-use carbondb_service_bindings::{Db, HandlerContext, Package, Reply, migrations};
+use carbondb_service_bindings::{Db, HandlerContext, Package, migrations, signature};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -46,6 +47,18 @@ struct Naming {
   tags: Vec<String>,
 }
 
+// A device `[@carbon]` enrolled, to list, with the signature by the op's
+// device key over it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Enrolled {
+  pubkey: String,
+  name: String,
+  #[serde(default)]
+  tags: Vec<String>,
+  signature: String,
+}
+
 // A device acting for the identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Device {
@@ -68,7 +81,7 @@ fn entry(context: Context) {
     ("POST", "/origin") => serde_json::from_value(context.input().clone()).map_err(Into::into).and_then(|origin| write_origin(context.as_ref(), origin)),
     ("GET", "/origin") => origin(context.as_ref()),
     ("GET", "/devices") => devices(context.as_ref()).map(|devices| json!(devices)),
-    ("POST", "/devices") => return enroll(context),
+    ("POST", "/devices") => list_device(context.as_ref()),
     ("PUT", resource) if resource.starts_with("/devices/") => rename(context.as_ref(), &resource["/devices/".len()..]),
     (method, resource) => Err(unknown(method, resource)),
   };
@@ -107,27 +120,14 @@ fn as_itself(context: &dyn HandlerContext) -> Result<()> {
   }
 }
 
-// Add a device: a handshake with the new device, as an effect, which answers
-// its key once it has accepted; or, without a code, a code for it to scan.
-fn enroll(context: Context) {
-  if let Err(error) = as_itself(context.as_ref()) {
-    let _ = context.settle(Err(error));
-    return;
-  }
-  let caller = Rc::clone(&context);
-  let reply: Reply = Box::new(move |enrolled| {
-    let added = enrolled.and_then(|enrolled| match enrolled["pubkey"].as_str() {
-      Some(pubkey) => {
-        let naming: Naming = serde_json::from_value(json!({"name": caller.input()["name"], "tags": caller.input()["tags"].as_array().cloned().unwrap_or_default()}))?;
-        caller.run("INSERT OR REPLACE INTO device (pubkey, name, tags) VALUES (?, ?, ?)", &[json!(pubkey), json!(naming.name), json!(naming.tags)])?;
-        Ok(json!({"pubkey": pubkey, "name": naming.name, "tags": naming.tags}))
-      }
-      None => Ok(enrolled),
-    });
-    let _ = caller.settle(added);
-  });
-  let input = context.input().clone();
-  Rc::clone(&context).effect("enroll", input, reply)
+// List a device `[@carbon]` enrolled, as the identity itself, once it shows the op's device signed it.
+fn list_device(context: &dyn HandlerContext) -> Result<Value> {
+  as_itself(context)?;
+  let enrolled: Enrolled = serde_json::from_value(context.input().clone())?;
+  let device = Device { pubkey: enrolled.pubkey, name: enrolled.name, tags: enrolled.tags };
+  signature::check(context.op(), "POST [identity]/devices", &json!(device), &enrolled.signature)?;
+  context.run("INSERT OR REPLACE INTO device (pubkey, name, tags) VALUES (?, ?, ?)", &[json!(device.pubkey), json!(device.name), json!(device.tags)])?;
+  Ok(json!(device))
 }
 
 fn rename(context: &dyn HandlerContext, pubkey: &str) -> Result<Value> {

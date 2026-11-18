@@ -14,7 +14,7 @@
 //! that looked up another row by its key: a handler that needs a value to be
 //! unique checks with a query, which is a read, never with a constraint.
 //!
-//! A space runs one service, so a rewind undoes every later op that touched
+//! A rewind stays within one service, so it undoes every later op that touched
 //! any of its tables, newest first. An op that read and wrote nothing cannot
 //! have depended on the late op, nor changed what it sees, so it stays. The
 //! undone ops lose their results and are pending again, so the late op
@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 
 use crate::error::Result;
 use crate::ops::oplog::ORDER;
+use crate::ops::pointers::Pointer;
 use crate::sql::authorizer::Read;
 use crate::store::changeset::{Row, rows};
 use crate::{Db, Op};
@@ -84,11 +85,28 @@ pub fn undo_set(later: &[Recorded]) -> Vec<&Recorded> {
   later.iter().filter(|op| op.sets.touched_any()).rev().collect()
 }
 
+// What undoing a run op takes, given it and the ops run after it, oldest
+// first: it, and every later op that touched a table, newest first.
+pub fn undo_from(run: &[Recorded]) -> Vec<&Recorded> {
+  let Some((first, later)) = run.split_first() else { return vec![] };
+  undo_set(later).into_iter().chain(std::iter::once(first)).collect()
+}
+
 // The ops after `op` in the shared order that this device has run, oldest first.
 pub fn after(db: &dyn Db, op: &Op) -> Result<Vec<Recorded>> {
-  let run = "SELECT o.hash, o.time, o.device, o.key, r.outcome, r.read_set, r.changeset FROM carbon_oplog o JOIN carbon_result r USING (hash)";
-  let sql = format!("SELECT * FROM ({run}) WHERE (time, COALESCE(device, ''), hash) > (?, ?, ?) {ORDER}");
-  let rows = db.all(&sql, &[json!(op.time), json!(op.device.clone().unwrap_or_default()), json!(op.hash)])?;
+  run_since(db, ">", op.time, op.device.as_deref(), &op.hash)
+}
+
+// An op this device has run and every op it has run after it, oldest first:
+// what undoing that op takes, when its cause has failed.
+pub fn from(db: &dyn Db, pointer: &Pointer) -> Result<Vec<Recorded>> {
+  run_since(db, ">=", pointer.time, pointer.device.as_deref(), &pointer.hash)
+}
+
+fn run_since(db: &dyn Db, comparison: &str, time: u64, device: Option<&str>, hash: &str) -> Result<Vec<Recorded>> {
+  let run = "SELECT p.hash, p.time, p.device, r.read_set, r.changeset FROM carbon_pointer p JOIN carbon_result r USING (hash)";
+  let sql = format!("SELECT * FROM ({run}) WHERE (time, COALESCE(device, ''), hash) {comparison} (?, ?, ?) {ORDER}");
+  let rows = db.all(&sql, &[json!(time), json!(device.unwrap_or_default()), json!(hash)])?;
   rows.into_iter().map(to_recorded).collect()
 }
 

@@ -38,16 +38,18 @@ const stop = foocorp.watch('GET [chat]/messages', render)
 
 ## [@carbon]
 
-A local builtin service that manages cryptographic identities and system calls.
+A builtin service that manages cryptographic identities and system calls. On the system handle it runs in the system, a local channel; on a channel's handle, in that channel, as the handle's identity, its ops replaying on every replica of the channel with their effects recorded. It alone creates channels and services and enrolls devices; what it records in a channel goes through that channel's own calls.
 
 | Call | Input | Output |
 |---|---|---|
 | `POST [@carbon]/identity` | `slug`, `device` (this device's name), `services` (the personal channel's), `code` (to join an existing identity) | `{slug, id, channel, personal, device}`: the identity, its own and personal channels, and this device's public key. Without a `code`, founds the identity and its personal channel; with one, joins it once a device already in it accepts, which is not built yet (`501`) |
-| `POST [@carbon]/devices` | | `{code, device}`: a key pair for this device to join an identity with, and the code that shows it, for a device already in the identity to scan with `POST [identity]/devices`. This device then joins the identity once that device sends it ([docs/sync.md](sync.md#enrolling-a-device)); single-node, `501 SINGLE_NODE` |
+| `POST [@carbon]/devices` | | `{code, device}`: a key pair for this device to join an identity with, and the code that shows it, for a device already in the identity to scan with `POST [@carbon]/enroll`. This device then joins the identity once that device sends it ([docs/sync.md](sync.md#enrolling-a-device)); single-node, `501 SINGLE_NODE` |
+| `POST [@carbon]/enroll` | `code`, `name`, `tags` | On the identity's handle: `{pubkey, name, tags}`, the device the code shows, now listed in `[identity]` and a member of the identity's spaces; single-node, `501 SINGLE_NODE` |
+| `POST [@carbon]/channel` | `kind`, `name`, `manage` (default: you), `slug`, `cascade` | `{channel, kind, name, slug, cascade}`: a new channel inside this one, which this one points to |
+| `POST [@carbon]/services` | `name`, `package` (default: the name) | `{name, service, version}`: a new service running the package, named `[name]` in this channel |
 | `GET [@carbon]/identities` | | `[{slug, id, channel, personal, device}]`: the identities on this device |
 | `GET [@carbon]/status` | `service` (optional) | `{name, access, sync, peers, state}` for a service, and `error` once stopped; for the channel, its own `state` and also `services: [{name, access, sync, state}]`. `state` is `initializing`, `idle`, `applying` or `stopped`. `access` is the acting identity's; `sync` is `off`, `waiting` or `on`; `peers` are the devices this one has synced with, and when |
 | `POST [@carbon]/sync/start`, `/sync/stop` | `service` (optional) | `{sync}`. For the channel, starts or stops it and each of its services this device runs |
-| `DELETE [@carbon]/data` | `service` (optional) | `{}`. Deletes this device's copy of the service, or of the channel with its services |
 
 ## [identity]
 
@@ -56,7 +58,7 @@ A replicated service shared between all the devices that belong to an identity.
 | Call | Input | Output |
 |---|---|---|
 | `GET [identity]/origin` | | `{id, device}`: the identity's id and its first device's public key, written when it was founded |
-| `POST [identity]/devices` | `code` (optional), `name`, `tags` | Without a `code`: `{code}` for a new device to scan. With the `code` the new device shows: `{pubkey, name, tags}`, the device now acting for the identity |
+| `POST [identity]/devices` | `pubkey`, `name`, `tags`, `signature` | `{pubkey, name, tags}`: lists a device `[@carbon]` enrolled, as the identity itself; only with the op's device key's signature over what it lists, which only `[@carbon]` makes |
 | `PUT [identity]/devices/:pubkey` | `name`, `tags` | `{pubkey, name, tags}` |
 | `GET [identity]/devices` | | `[{pubkey, name, tags}]` |
 
@@ -67,9 +69,9 @@ A channel mediates access to its services. `[channel]` is itself a replicated se
 | Call | Input | Output |
 |---|---|---|
 | `GET [channel]/origin` | | `{kind, name, manage}`: what the channel is, written when it was created |
-| `POST [channel]/channel` | `kind`, `name`, `manage` (default: you), `cascade` | `{channel, kind, name}`: a new channel inside this one, which this one points to |
 | `POST [channel]/seal` | | `{sealed: true}`: the channel refuses every later POST |
-| `POST [channel]/services` | `name`, `package`, `manage` | `{name, service, version}`: a new service running the package, named `[name]` in this channel |
+| `POST [channel]/services` | `name`, `space`, `package`, `version`, `signature` | `{name, service, version}`: names a service `[@carbon]` created; only with the op's device key's signature over what it names, which only `[@carbon]` makes |
+| `POST [channel]/ref` | `channel`, `kind`, `name`, `slug`, `cascade` | `{channel, kind, name, slug, cascade}`: points to a channel from this one |
 | `GET [channel]/services` | | `[{name, service, version}]` |
 | `POST [channel]/members` | `contact`, `access` | `{invitation, code}`: an invitation for the contact to accept with `POST [channel]/join`. The code carries the proof every member's device checks the acceptance against |
 | `GET [channel]/invitations` | | `[{invitation, contact, access, by}]`: invitations not yet accepted, visible to every member |

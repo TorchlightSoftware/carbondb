@@ -9,8 +9,8 @@
 //! from, or a device the identity's `[identity]` lists on this device. The
 //! p2panda signature covers the effects, which the op's hash does not.
 //!
-//! - A message that fails is acknowledged and kept as evidence in
-//!   `carbon_error`, never applied.
+//! - A message that fails is kept as evidence in its channel's log
+//!   (`carbon_error`), never applied, and acknowledged once kept.
 //! - One whose device is not yet listed is held unacknowledged and offered
 //!   again after every commit, since the op listing a newly enrolled device
 //!   can arrive later, from another space; after `UNLISTED_FOR` it fails as an
@@ -29,11 +29,11 @@ use std::time::Duration;
 use carbondb_svc_identity::id_of;
 use serde_json::json;
 
-use super::spaces::{Arrival, Followed, Held, Unrecorded};
+use super::spaces::{Arrival, Followed, Held};
 use crate::carbon::Carbon;
 use crate::Op;
 use crate::ops::clock;
-use crate::ops::errors::Evidence;
+use crate::ops::errors::{self, Evidence};
 use crate::ops::op::hash_holds;
 use crate::services::carbon as local;
 
@@ -105,12 +105,13 @@ impl Carbon {
     }));
   }
 
-  // Keep a message that failed the check as evidence, and acknowledge it.
+  // Keep a message that failed the check as evidence, and acknowledge it once kept.
   fn refuse_message(self: &Rc<Self>, followed: &Followed, arrival: &Arrival, failed: &str) {
     let evidence = Evidence { operation: arrival.operation.to_hex(), author: arrival.author.clone(), arrived: clock::wall(), failed: failed.to_string(), signed: arrival.signed.clone() };
-    followed.unrecorded.borrow_mut().push(Unrecorded::Error(evidence));
-    followed.ack(arrival.operation);
-    self.record_between_ops(&arrival.space);
+    match self.channel(&arrival.space).and_then(|channel| errors::record(channel.log(), &evidence)) {
+      Ok(()) => followed.ack(arrival.operation),
+      Err(error) => eprintln!("[carbondb] {} could not keep evidence: {}", arrival.space, error.message),
+    }
   }
 
   // Offer a space's held messages again, in the order they arrived.
