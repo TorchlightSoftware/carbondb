@@ -1,0 +1,4 @@
+name = "roles"
+
+[[sql]]
+binding = "db"

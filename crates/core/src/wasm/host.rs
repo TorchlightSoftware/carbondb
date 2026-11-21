@@ -196,6 +196,11 @@ pub(super) fn link(linker: &mut Linker<Turn>) -> Result<()> {
     let answered = ask(id, &input, |call, input, reply| HandlerContext::call(call, &key, input, reply));
     Box::pin(answer(answered))
   })?;
+  host.func_wrap_concurrent("callsync", |accessor: &Accessor<Turn>, (key, input): (String, String)| {
+    let id = accessor.with(|mut access| access.get().running);
+    let answered = ask(id, &input, |call, input, reply| HandlerContext::callsync(call, &key, input, reply));
+    Box::pin(answer(answered))
+  })?;
   host.func_wrap_concurrent("effect", |accessor: &Accessor<Turn>, (name, input): (String, String)| {
     let id = accessor.with(|mut access| access.get().running);
     let answered = ask(id, &input, |call, input, reply| HandlerContext::effect(call, &name, input, reply));

@@ -112,7 +112,7 @@ fn name_service(call: Rc<ServiceCall>, named: Named) {
     match input {
       Ok(input) => {
         let answering = Rc::clone(&caller);
-        HandlerContext::call(caller, "POST [channel]/services", input, Box::new(move |named| settle(&answering, named)))
+        HandlerContext::callsync(caller, "POST [channel]/services", input, Box::new(move |named| settle(&answering, named)))
       }
       Err(error) => settle(&caller, Err(error)),
     }
@@ -154,7 +154,7 @@ pub fn add_channel(call: Rc<ServiceCall>) {
     let reference = json!({"channel": created, "kind": request.kind, "name": request.name, "slug": request.slug, "cascade": request.cascade});
     let origin = Step { space: created, actor: caller.actor.clone(), key: "POST [channel]/origin", input: json!({"kind": request.kind, "name": request.name, "manage": request.manage.unwrap_or_else(|| vec![identity])}) };
     let answering = Rc::clone(&caller);
-    HandlerContext::call(Rc::clone(&caller), "POST [channel]/ref", reference, Box::new(move |referred| match referred {
+    HandlerContext::callsync(Rc::clone(&caller), "POST [channel]/ref", reference, Box::new(move |referred| match referred {
       Ok(referred) => {
         let finishing = Rc::clone(&answering);
         steps::run(answering, VecDeque::from([origin]), Box::new(move |written| settle(&finishing, written.map(|_| referred))))

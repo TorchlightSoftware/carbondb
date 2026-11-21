@@ -64,14 +64,18 @@ pub(crate) fn start_reading(access: &Shared) {
 impl Access {
   // Settle the statement that just ran: what it read joins the record, as the
   // one row it looked up when the only table it read is that row's, or else
-  // as the tables it read.
-  pub(crate) fn settle(&mut self, looked_up: Option<Row>) {
+  // as the tables it read. Returns whether it read that one row.
+  pub(crate) fn settle(&mut self, looked_up: Option<Row>) -> bool {
     let tables = std::mem::take(&mut self.statement);
     match looked_up {
       Some(row) if tables.len() == 1 && tables.contains(&row.table) => {
         self.read.insert(Read::Row(row));
+        true
       }
-      _ => self.read.extend(tables.into_iter().map(Read::Table)),
+      _ => {
+        self.read.extend(tables.into_iter().map(Read::Table));
+        false
+      }
     }
   }
 

@@ -650,4 +650,245 @@ Also, should we keep the name channel, or name it a space again, so that we don'
 
 ---
 
+    A replicated [@carbon] can't keep this device's own facts in its tables.
+
+Mmm... it's still nested under various levels.
+
+system
+  |_ identity:Brandon
+      |_ personal
+          |_ FooCorp
+          |_ Soccer Friends
+
+Things happening at system, identity, or personal wouldn't be shared with FooCorp or Soccer Friends.
+
+    This device's keys, identities and held channels stay in the system, a local channel, as today.
+
+Yes.
+
+---
+
+- causal bindings
+- consistent use of side effects allows us to replicate @local ops
+- services pull from a shared oplog but still maintain state isolation
+
+---
+
+    The system has [@carbon] only. Nothing needs a [channel] there yet.
+
+How are you storing refs to the identities?  I guess you have dedicated ways to list identities from the root... maybe that's fine.
+
+    A cause still running counts as applied. The first bug I hit was calls being undone the moment their cause settled.
+
+I don't know what you mean.  That doesn't sound right.
+
+    p2panda 0.8.1 pushes new ops only over a live sync session and offers no call to start one. When none is open, delivery waits on discovery backoff, up to 30 seconds and resetting after 1–3 minutes.
+
+That's some horrible latency.  Do we have no control over that?
+
+I don't understand what you're saying about live sessions.  What you're saying is very counterintuitive: you're saying the space is already open and you're using the existing one, so therefore it's not a "live session"?  Why is it not live, if it's had plenty of time to initialize, and has already passed messages?
+
+Do you have old processes that need to be freed up?  Can you check?  We're sitting at more memory consumption than we were.
+
+Can you update the agenda, adding these topics, removing items that were already implemented or are no longer relevant, and updating anything that needs to reflect our current state of code and architecture?
+
+Also add a topic for ensuring that documentation is up to date.
+
+---
+
+New topic: how about we don't store an infinitely growing repository in /tmp?
+
+---
+
+    My proposals:
+    - Confirm with one run of the relay test with p2panda's debug logs on.
+
+I'm good with that.
+
+    - If it confirms, ask p2panda upstream to expose add_topic, since that fits our model: CarbonDB tells p2panda which devices hold a channel. Until they do, patch it locally so the test stops depending on chance.
+
+I don't understand what's happening, can you explain it in plain terms?
+
+1) what's the intended lifecycle of the p2panda primitives?
+2) how do our API constructs map onto p2panda?
+3) what are the gaps?
+
+Can you maybe show a table: CarbonDB | p2panda | gaps
+
+---
+
+    CarbonDB already knows who shares each channel, and p2panda gives it no way to say so.
+
+Um.  Yes, the local node knows.  But p2panda is the way that our nodes talk to each other.
+
+    So every newly joined channel waits on p2panda's slow, random search
+
+Why is it slow and random?  Is that because we're connecting to a relay we don't control with a bunch of peers on it?  Or because even with control of the relay we can't control this behavior?
+
+Also, what you originally reported was that you didn't notice this behavior when we had separate spaces per service.  You noticed it when we combined those services into a single channel.  So I have heard two seemingly contradictory things from you:
+
+1) the problem occurs when using an existing channel, presumably already bootstrapped and prior messages sent
+2) the problem is with the initial discovery of peers for the space - no connection or transmission occurs until then
+
+The format you are giving me tables in is not rendering tables.  It's putting everything in sequence, like this:
+
+    CarbonDB: An identity on this device
+    p2panda: One Node, signing with that identity's device key
+      (crates/core/src/nodes/mod.rs:1)
+    Gap: No shutdown call. That's "A stopped node is shut down".
+    ────────────────────────────────────────
+    CarbonDB: A channel
+    p2panda: One Space, whose id is the channel id. The device that founds it
+      calls create_space; the others call space(id)
+      (crates/core/src/nodes/spaces.rs:117, :161).
+    Gap: —
+
+That's not particularly helpful or easy to read.  Can you try again?  Your later example worked correctly:
+
+┌───────────────────┬────────────────────────────┬───────────────────┐
+│   Configuration   │  Personal channel's sync   │ Message reaches   │
+│                   │       session opens        │     device 2      │
+├───────────────────┼────────────────────────────┼───────────────────┤
+
+In addition to trying to render in the chat, maybe you want to render a markdown table into docs/p2panda-impl.md, so I can view it with glow?  It might just be difficult to render the content in a slim terminal window.
+
+    a space knows its members but doesn't sync with them unless discovery finds them first
+
+It knows its members by cryptographic identity, but not by network location.  Is that accurate?
+
+    So the better question for upstream is whether a space should seed its own gossip from its member list
+
+Like maybe I tell you: I'm 192.168.1.6 on the local network, and I have a port forwarded from Well Known Relay X...  Basically a single entry of the same registry form that would be present on a bootstrap server?
+
+---
+
+    Two devices that already know each other's addresses still won't exchange a channel's ops until p2panda's discovery happens to compare that channel's topic between them.
+
+They know each other's addresses in what sense?  Does p2panda know?
+
+    p2panda-net has a call for it (AddressBook::add_topic), and setting it makes the node rejoin that space's gossip with the named peer at once.
+
+You're determining that from reading the code, but you can't test because it's not public, right?  So can you play this out as an example between Alice and Bob?  Because your language about "CarbonDB knows" and "p2panda knows" is vague, because you're not specifying which node knows what, at what time.
+
+---
+
+    Yes, p2panda knows the addresses: each node keeps its own address book. What's missing is a per-channel "this node holds this space" entry
+
+Ok.  So the nodes know each other's addresses, and we should be able to send a message from one node to another saying "look here, you're a member of this space now".  And that appears to be what is missing.  Am I getting that right?
+
+And is it possible to send that message:
+
+A) piggy backing on an existing message, already being sent as part of the protocol?
+B) as a new message, but on a channel already existing?
+C) as a new message, on an out of band channel, CarbonDB specific?
+
+With A being highest preference and C being lowest.
+
+    Timeline from the logged relay-only run
+
+That's still really hard to read Claude.  I need swim lanes per node, Alice and Bob.  As I already clearly requested, and which you did not do.  Maybe the term "swimlanes" helps you understand what I mean.
+
+
+---
+
+1) get rid of "own", instead use "identity:Alice"
+2) don't add separate lines for the channel/handle, prefix each call with it like "system: POST [@carbon]/identity"
+3) you don't have to include every single sub-call.  We know those already and they're not germaine to what you're trying to explain here.  "system: POST [@carbon]/identity" would have been sufficient to describe all of your first 9 entries on Phone.
+
+---
+
+    - What the patch adds: a call that lets the laptop name the phone as a holder itself. The laptop already knows this, because identity:alice lists alice's devices.
+
+If p2panda already knows this because of other messages that were sent, shouldn't p2panda internally be updating its state?  Without the need for any external call?
+
+---
+
+    So the laptop's node learns who belongs to personal:alice only after that space has synced
+
+    The rest is CarbonDB's data: that personal:alice exists and that the phone holds it come from identity:alice's ops
+
+So... if I understand correctly this is actually arising from the way we are daisy chaining spaces together.  We get identity:alice set up, so both endpoints have established communication on that space.  But then when we set up another space, we're waiting on the discovery process again instead of reusing the knowledge that we gained from the first space.
+
+It seems like what's missing is a broadcast upon membership add to the personal space:  the node that's adding it has knowledge of N peers that already exist in other spaces on the node... so it should be able to broadcast the new information to them.
+
+    - Instead: compare topics at once with the nodes it already knows, through the same private-intersection exchange it uses now.
+    - Result: the laptop asks the phone right away, finds personal:alice in common, and the gossip join follows within milliseconds. There's no new API, nothing CarbonDB has to say, and no topic is revealed to a node that doesn't hold it
+
+I'm not sure we're saying the same thing.  I think the salient detail is that the new node needs to be told that it's been added...  otherwise how would it know to initiate the "gossip join"?
+
+---
+
+    the laptop is already told it should join personal:alice; what nobody tells it is who to join with
+
+Oh.  So it just needs to connect the dots to know "I already know where that peer is on the network", and initiate a check in for new state.
+
+Is that correct?
+
+---
+
+    The test's bootstrap node lengthens the waits. It runs on another network id, so every discovery session with it fails;
+
+Is that user error?  Are you using it correctly?
+
+    Nodes can't be shut down. Every dropped node logs "Endpoint dropped without calling Endpoint::close",
+
+1) is that your log statement or a warning built into p2panda?
+2) is that a bug, or intended design per p2panda?
+3) what is the CarbonDB scenario where this happens?  Being evicted from a channel?
+
+    which is evidence for the topic "A stopped node is shut down".
+
+Can you update all topics to be in the form of describing the desired state?  I've updated the agenda SKILL.md to that effect.
+
+    Untraced panic: once in 20 check-in runs, a p2panda thread panicked while the nodes were being dropped, inside futures-lite (Unfold` must not be polled after it returned `Poll::Ready(None))
+
+That's a major issue.  We need to know:
+
+1) Are we using it improperly?
+2) Or is p2panda broken?
+3) Can we isolate/guard around the issue?
+
+This panic should be its own topic.
+
+    Propose the check-in to p2panda upstream, with the spike as the reproduction.
+
+Research:
+
+1) What do other pull requests look like on p2panda?
+2) Do they expect conversation to happen before a pull request?
+3) Is our spike a minimal reproduction framed in a way the p2panda team would easily understand?  We should set aside CarbonDB domain language and simply say that we have two spaces running on a node, and they should share knowledge of member network locations/connectivity.
+
+---
+
+    The milestone test builds it with p2panda::builder() and no network id
+
+How is network id used in normal p2panda usage?  Would we generate a single network id for all CarbonDB usage?  That's what it sounds like from what you're saying.  I'm not clear from what you said: would fixing the network ID reduce the latency in the spike, or in our CarbonDB implementation?
+
+And then it sounds like we need to initiate topic 7 as an issue before we get into providing a pull request.  Although I would like to offer to create said pull request, if they want to take me up on that.
+
+    p2panda/p2panda#1268, open since June with no replies, asks for an awaitable Node::shutdown for exactly this
+
+Hmm.  Do you think they'd be more responsive to a pull request?
+
+    Outside contributors' merged PRs fix an issue already filed
+
+So we could offer a pull request for topic 11, but would have to create an issue first for topic 7.
+
+---
+
+1: don't mess with it.
+2: yes, I do
+3: haven't we already determined what to do?
+
+---
+
+    I don't yet know what in that spike causes the delay.
+
+    the latency appears only in our setup. Candidate causes:
+      - that spike runs a multi-threaded tokio runtime, while p2panda's tests run single-threaded;
+      - it keeps the nodes of all 20 runs alive in one process, since nodes can't be shut down;
+      - its first space always waits exactly 3.0 s;
+      - its bootstrap node behaves differently
+
+---
 

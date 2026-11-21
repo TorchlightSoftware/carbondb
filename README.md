@@ -109,7 +109,7 @@ The interface is in [packages/carbondb/README.md](packages/carbondb/README.md); 
 - [crates/node/](crates/node/): the core's Node bindings, through napi-rs.
 - [packages/carbondb/](packages/carbondb/README.md): `carbondb`, the JS runtime apps use.
 - [packages/services/chat/](packages/services/chat/): `@tlsft/carbondb-svc-chat`, the [chat] service.
-- [spikes/](spikes/): experiments: the p2panda chat demo, an async JS handler inside a Rust transaction, and SQLite sessions on tables without a primary key.
+- [spikes/](spikes/): experiments: the p2panda chat demo, p2panda discovery checking in with known nodes, an async JS handler inside a Rust transaction, and SQLite sessions on tables without a primary key.
 - [perspectives/](perspectives/): reviews and position notes from contributors.
 
 Terminology follows the [Vision for Decentralized Web](https://github.com/bitmage/vision-for-decentralized-web) wiki.

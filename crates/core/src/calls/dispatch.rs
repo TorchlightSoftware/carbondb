@@ -27,10 +27,15 @@
 //! (`ops::effects`). A refused op's first run deletes what its effects
 //! created.
 //!
-//! An op made by another op's call is bound to it, its cause: it is refused
-//! once its cause has failed, and when what became of an op changes, the ops
-//! its calls made are taken up again, undone where they applied
-//! (`reconsider`), so a cause's calls follow it on every replica.
+//! An op made by another op's `callsync` write is bound to it, its cause: it
+//! is refused once its cause has failed, and when what became of an op
+//! changes, the ops its calls made are taken up again, undone where they
+//! applied (`reconsider`), so a cause's calls follow it on every replica.
+//!
+//! An op that read another service through `callsync` is that service's
+//! reader (`ops::reads`): when an op placed before it is applied or undone
+//! there, changing a row it read, it is taken up again the same way in its own
+//! store, and reads again as of its place.
 //!
 //! A system failure stops the space: the file or disk failed, not the op. It
 //! neither logs nor applies another op, and every call to it fails with a 503,
@@ -55,10 +60,13 @@ use crate::sql::authorizer::Read;
 use crate::ops::rewind::{self, Recorded, Sets};
 use crate::calls::service_call::{CallRecord, Conn, ServiceCall, Settle};
 use crate::services::{self, SERVICE_MISSING, Service};
-use crate::channels::service::{RunState, ServiceStore};
-use crate::store::Store;
+use crate::channels::service::{CaughtUp, RunState, ServiceStore};
+use crate::store::{Store, tables_read};
 use crate::store::changeset::tables;
 use crate::calls::watch::WatchId;
+use crate::ops::pointers::Pointer;
+use crate::ops::reads::{self, Reading};
+use crate::store::changeset::Row;
 use crate::ops::{oplog, pointers, results};
 use crate::channels::{cause_failed, pointer_to};
 use crate::{Actor, Call, Routing, HandlerContext, Op};
@@ -182,6 +190,27 @@ impl Carbon {
       }
     }
     space.draining.set(false);
+    self.wake_readers(space);
+  }
+
+  // Go on with a `callsync` read of a store once it has applied every op it
+  // holds before the reader's place, now or after a later turn; one with no
+  // place goes on at once. A read waiting on a store that is stopped waits on
+  // until its caller's deadline passes.
+  pub(crate) fn when_caught_up(self: &Rc<Self>, space: &Rc<ServiceStore>, reading: Option<Reading>, then: CaughtUp) {
+    let Some(reading) = reading else { return then(Ok(())) };
+    match caught_up(space, &reading.place) {
+      Ok(true) => then(Ok(())),
+      Ok(false) => space.wait_to_read(reading, then),
+      Err(failure) => then(Err(failure)),
+    }
+  }
+
+  // Go on with the reads waiting on a store that has now caught up with their places.
+  fn wake_readers(self: &Rc<Self>, space: &Rc<ServiceStore>) {
+    for (reading, then) in space.waiting_to_read() {
+      self.when_caught_up(space, Some(reading), then);
+    }
   }
 
   // Apply one op, with the version of its service it was made for: a first
@@ -238,7 +267,8 @@ impl Carbon {
       carbon.drain(&here);
     });
     let awaiting = space.awaiting(&op.hash);
-    Some(ServiceCall::new(self, space, actor(&op), call, op.input.clone(), Conn::Writer, Some(op), effects, awaiting, live, settle))
+    let reading = Reading { place: place_of(&op), store: space.id.clone() };
+    Some(ServiceCall::new(self, space, actor(&op), call, op.input.clone(), Conn::Writer, Some(op), effects, awaiting, live, settle, Some(reading)))
   }
 
   // An op settled. A late op whose run would not match applying it at its
@@ -261,6 +291,9 @@ impl Carbon {
       Ok(settled) => {
         self.set_run_state(space, RunState::Idle);
         self.outcome_changed(space, &op.hash, before, settled.is_ok());
+        if let Err(failure) = self.reread(space, &[(place_of(op), ran.sets.write_set.iter().cloned().collect())]) {
+          return self.stop(space, failure);
+        }
         let settled = settled.map(|settled| Settled { watches: self.committed(&space.id, &settled.tables), ..settled });
         space.answer(&op.hash, settled);
       }
@@ -308,13 +341,28 @@ impl Carbon {
     }
     let undone = rewind::undo_from(&run);
     let hashes: Vec<String> = undone.iter().map(|op| op.hash.clone()).collect();
+    let changed = changed_by(space.store(), &undone)?;
     let (_, changeset) = space.store().write(|store| {
       undone.iter().try_for_each(|op| store.undo(&op.changeset))?;
       results::forget(store, &hashes)
     })?;
     oplog::forget_outcomes(space.channel.log(), &hashes)?;
     self.committed(&space.id, &tables(&changeset)?);
-    Ok(())
+    self.reread(space, &changed)
+  }
+
+  // Take up again, in their own stores, the readers placed after ops here
+  // that read rows those ops changed: they read them as they no longer stand.
+  fn reread(self: &Rc<Self>, space: &ServiceStore, changed: &[(Pointer, Vec<Row>)]) -> Result<()> {
+    let found = changed.iter().map(|(place, rows)| reads::readers_of(space.store(), rows, place)).collect::<Result<Vec<Vec<Reading>>>>()?;
+    let readers: Vec<Reading> = found.concat();
+    reads::forget(space.store(), &readers)?;
+    readers.iter().try_for_each(|reader| {
+      let store = self.store(&reader.store)?;
+      store.reconsider(&reader.place.hash);
+      self.drain(&store);
+      Ok(())
+    })
   }
 
   // Roll back a late op's run, then undo the later ops that touched the
@@ -329,6 +377,10 @@ impl Carbon {
     self.set_run_state(space, RunState::Idle);
     let undone = rewind::undo_set(later);
     let hashes: Vec<String> = undone.iter().map(|op| op.hash.clone()).collect();
+    let changed = match changed_by(space.store(), &undone) {
+      Ok(changed) => changed,
+      Err(failure) => return self.stop(space, failure),
+    };
     let undo = made.iter().try_for_each(|made| oplog::record_effects(space.channel.log(), &op.hash, made)).and_then(|_| oplog::forget_outcomes(space.channel.log(), &hashes)).and_then(|_| {
       space.store().write(|store| {
         undone.iter().try_for_each(|op| store.undo(&op.changeset))?;
@@ -338,6 +390,9 @@ impl Carbon {
     match undo.and_then(|(_, changeset)| tables(&changeset)) {
       Ok(tables) => {
         self.committed(&space.id, &tables);
+        if let Err(failure) = self.reread(space, &changed) {
+          self.stop(space, failure);
+        }
       }
       Err(failure) => self.stop(space, failure),
     }
@@ -410,10 +465,10 @@ impl Carbon {
     let (carbon, here, snapshot, ended) = (Rc::clone(self), Rc::clone(space), Rc::clone(&reader), Rc::clone(&live));
     let settle: Settle = Box::new(move |result, _calls| {
       ended.set(false);
-      let tables = snapshot.end();
+      let tables = snapshot.end().map(|reads| tables_read(&reads));
       carbon.answer_read(&here, reply, result.and_then(|value| Ok(Settled { value, tables: tables?, watches: vec![] })));
     });
-    self.start(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, effects, awaiting, live, settle), Some(deadline));
+    self.start(ServiceCall::new(self, space, actor, call, input, Conn::Reader(reader), None, effects, awaiting, live, settle, None), Some(deadline));
   }
 
   fn answer_read(self: &Rc<Self>, space: &ServiceStore, reply: Reply, settled: Result<Settled>) {
@@ -460,10 +515,11 @@ fn answering(carbon: &Carbon, space: &ServiceStore, call: &Call) -> Result<Rc<Se
 // The `call` effect: a call to another service, posted to its store as the
 // caller's actor, or, for `[@carbon]`, as the actor it names. The store is
 // the one named, or the one the caller's channel names for the call's
-// service. A write within the caller's channel is bound to the op making it,
-// its cause; one into another channel is a message no cause binds. A write
-// into a store whose op waits on this call, directly or through other calls,
-// would wait behind that op until the timeout, so it is refused at once.
+// service. A write made through `callsync` within the caller's channel is
+// bound to the op making it, its cause; one through `call`, or into another
+// channel, is a message no cause binds. A write into a store whose op waits
+// on this call would wait behind that op until the timeout, so it is refused
+// at once (`waits_on`).
 pub(crate) fn call_effect(caller: Rc<ServiceCall>, input: Value, reply: crate::Reply) {
   let carbon = Rc::clone(caller.carbon());
   let made = Call::from_key(input["key"].as_str().unwrap_or_default()).and_then(|call| {
@@ -482,20 +538,28 @@ pub(crate) fn call_effect(caller: Rc<ServiceCall>, input: Value, reply: crate::R
     Err(error) => return reply(Err(error)),
   };
   let awaiting: Vec<String> = caller.awaiting().iter().cloned().chain(std::iter::once(caller.space().id.clone())).collect();
-  let target = carbon.service_space(&space, &call).and_then(|target| match call.writes() && awaiting.contains(&target.id) {
+  let target = carbon.service_space(&space, &call).and_then(|target| match call.writes() && waits_on(&carbon, &target, &awaiting) {
     true => Err(looped(&call)),
     false => Ok(target),
   });
   match target {
     Ok(target) => {
-      let cause = caller.cause_of(&target);
+      let cause = caller.cause_of(&target).filter(|_| input["caused"] == json!(true));
       carbon.post(&target, actor, call, input["input"].clone(), cause, awaiting, Box::new(move |settled| reply(settled.map(|settled| settled.value))))
     }
     Err(error) => reply(Err(error)),
   }
 }
 
-// A write posted back into a service whose op waits on the call posting it.
+// Whether the op applying in a store waits on a call, whose ops `awaiting`
+// wait on it in turn: one of them is that store's, having made the call
+// directly or through other calls, or the op applying there waits to read
+// one of their stores through `callsync`, until the op making the call applies.
+fn waits_on(carbon: &Rc<Carbon>, target: &ServiceStore, awaiting: &[String]) -> bool {
+  awaiting.contains(&target.id) || awaiting.iter().filter_map(|id| carbon.opened(id)).any(|store| store.holds_a_read_by(&target.id))
+}
+
+// A write posted into a service whose op waits on the call posting it.
 fn looped(call: &Call) -> ServiceError {
   ServiceError::new(508, "LOOP_DETECTED", format!("{} writes to a service whose op is waiting on this call, which would wait for itself", call.key()))
 }
@@ -531,6 +595,25 @@ fn point(space: &ServiceStore, row: &LogRow) -> Result<()> {
 pub(crate) fn take_up(space: &ServiceStore) -> Result<()> {
   let addressed = oplog::pointers(space.channel.log(), &space.runs.name)?;
   addressed.into_iter().try_for_each(|pointer| space.op_writer.write(space.store(), false, pointer))
+}
+
+// Whether a store has applied every op it holds before a place: it is idle
+// or applying, and no op before the place is pending, pointed to or held.
+fn caught_up(space: &ServiceStore, place: &Pointer) -> Result<bool> {
+  if !matches!(space.run_state(), RunState::Idle | RunState::Applying { .. }) || space.op_writer.holds_before(place) {
+    return Ok(false);
+  }
+  space.store().unrecorded(|store| pointers::pending_before(store, place)).map(|pending| !pending)
+}
+
+// Where an op sits in the shared order.
+fn place_of(op: &Op) -> Pointer {
+  Pointer { hash: op.hash.clone(), time: op.time, device: op.device.clone() }
+}
+
+// What ops about to be undone changed: each by its place, with the rows it wrote.
+fn changed_by(store: &Store, undone: &[&Recorded]) -> Result<Vec<(Pointer, Vec<Row>)>> {
+  undone.iter().filter_map(|op| pointers::get(store, &op.hash).transpose().map(|place| place.map(|place| (place, op.sets.write_set.iter().cloned().collect())))).collect()
 }
 
 // The next pending op's row, read from the channel's log.

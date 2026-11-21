@@ -21,6 +21,11 @@ impl Pointer {
   pub fn of(row: &Value) -> Pointer {
     Pointer { hash: row["hash"].as_str().unwrap_or_default().to_string(), time: row["time"].as_u64().unwrap_or_default(), device: row["device"].as_str().map(str::to_string) }
   }
+
+  // Whether it sorts before another in the shared order.
+  pub fn before(&self, other: &Pointer) -> bool {
+    (self.time, self.device.as_deref().unwrap_or_default(), &self.hash) < (other.time, other.device.as_deref().unwrap_or_default(), &other.hash)
+  }
 }
 
 // Point to an op; a pointer already there is kept.
@@ -39,6 +44,12 @@ pub fn get(db: &dyn Db, hash: &str) -> Result<Option<Pointer>> {
 pub fn next_pending(db: &dyn Db) -> Result<Option<String>> {
   let sql = format!("SELECT hash FROM carbon_pointer WHERE hash NOT IN (SELECT hash FROM carbon_result) {ORDER} LIMIT 1");
   Ok(db.all(&sql, &[])?.first().and_then(|row| row["hash"].as_str().map(str::to_string)))
+}
+
+// Whether an op placed before a place is pending: pointed to, with no result yet.
+pub fn pending_before(db: &dyn Db, place: &Pointer) -> Result<bool> {
+  let sql = "SELECT 1 AS pending FROM carbon_pointer WHERE hash NOT IN (SELECT hash FROM carbon_result) AND (time, COALESCE(device, ''), hash) < (?, ?, ?) LIMIT 1";
+  Ok(!db.get(sql, &[json!(place.time), json!(place.device.as_deref().unwrap_or_default()), json!(place.hash)])?.is_null())
 }
 
 // The ops this service points to, by hash, in the shared order.

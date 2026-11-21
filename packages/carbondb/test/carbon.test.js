@@ -262,6 +262,41 @@ async function hangingUp() {
   return {address: `127.0.0.1:${server.address().port}`, close: () => server.close()}
 }
 
+describe('across services', () => {
+  // A channel running [notes] and [roles], with Sarah the bookkeeper.
+  let books
+  beforeEach(async () => {
+    await carbon.services.add('roles', component('roles'))
+    books = await channelIn(personal, {name: 'Books', services: ['notes', 'roles']})
+    await books.call('POST [roles]/grants', {person: 'sarah', role: 'bookkeeper'})
+  })
+
+  const roles = () => books.call('GET [roles]/roles')
+
+  it('reads one row of another service through callsync, as of the op reading it', async () => {
+    await books.call('POST [notes]/checked', {through: 'callsync', person: 'sarah'})
+    await assert.rejects(books.call('POST [notes]/checked', {through: 'callsync', person: 'martha'}), {status: 409, details: {role: null}})
+    assert.deepStrictEqual(await texts(books), ['checked sarah'])
+  })
+
+  it('refuses a search through callsync, which reads more than one row, and answers it through call', async () => {
+    await assert.rejects(books.call('POST [notes]/searched', {through: 'callsync'}), {status: 400, message: /looks up one row of another service by its whole key/})
+    assert.deepStrictEqual(await books.call('POST [notes]/searched', {through: 'call'}), [{person: 'sarah', role: 'bookkeeper'}])
+  })
+
+  const granted = [
+    {through: 'call', why: 'a write through call stays when the op making it is refused', roles: [{person: 'martha', role: 'bookkeeper'}, {person: 'sarah', role: 'bookkeeper'}]},
+    {through: 'callsync', why: 'a write through callsync is undone with the op making it', roles: [{person: 'sarah', role: 'bookkeeper'}]}
+  ]
+
+  for (const {through, why, roles: expected} of granted) {
+    it(why, async () => {
+      await assert.rejects(books.call('POST [notes]/granted', {through, person: 'martha'}), {status: 409})
+      assert.deepStrictEqual(await roles(), expected)
+    })
+  }
+})
+
 describe('fetch', () => {
   let world, fetcher
   before(async () => {

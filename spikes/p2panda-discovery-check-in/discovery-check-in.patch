@@ -1,0 +1,291 @@
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,10 @@
+ 
+ ## Unreleased
+ 
++### Changed
++
++- net: Subscribing to a new topic runs a discovery session at once with every reachable node in the address book, so nodes already known learn of the shared topic without waiting for a random walk [#PR](https://github.com/p2panda/p2panda/pull/PR)
++
+ ## [0.8.1] - 13/11/2026
+ 
+ ### Changed
+--- a/p2panda-net/src/discovery/actors/manager.rs
++++ b/p2panda-net/src/discovery/actors/manager.rs
+@@ -13,7 +13,8 @@
+ use iroh::endpoint::QuicTransportConfig;
+ use iroh::protocol::ProtocolHandler;
+ use p2panda_discovery::DiscoveryResult;
+-use p2panda_store::address_book::NodeInfo as _;
++use p2panda_store::SqliteStore;
++use p2panda_store::address_book::{AddressBookStore, NodeInfo as _};
+ use ractor::concurrency::JoinHandle;
+ use ractor::thread_local::{ThreadLocalActor, ThreadLocalActorSpawner};
+ use ractor::{ActorId, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
+@@ -68,6 +69,11 @@
+     /// moments where the application needs discovery.
+     ResetWalkers,
+ 
++    /// Run a discovery session at once with every node we already know how to reach, outside the
++    /// random walk, so a topic we just subscribed to is compared with them right away instead of
++    /// whenever a walker happens to reach them.
++    CheckIn,
++
+     /// Subscribe to system events.
+     Events(RpcReplyPort<broadcast::Receiver<DiscoveryEvent>>),
+ 
+@@ -135,6 +141,20 @@
+         ));
+     }
+ 
++    /// Nodes we know how to reach and which are not stale, other than ourselves.
++    pub async fn reachable_nodes(&self) -> Result<Vec<NodeId>, ActorProcessingErr> {
++        let store = self.address_book.store().await?;
++        let nodes =
++            <SqliteStore as AddressBookStore<NodeId, NodeInfo>>::all_node_infos(&store).await?;
++        Ok(nodes
++            .into_iter()
++            .filter(|node| {
++                node.node_id != self.my_node_id && node.transports.is_some() && !node.is_stale()
++            })
++            .map(|node| node.node_id)
++            .collect())
++    }
++
+     /// Returns true if the given node is stale.
+     pub async fn is_stale(&self, remote_node_id: NodeId) -> bool {
+         let Ok(Some(node_info)) = self.address_book.node_info(remote_node_id).await else {
+@@ -161,7 +181,8 @@
+     Initiated {
+         remote_node_id: NodeId,
+         session_id: DiscoverySessionId,
+-        walker_ref: ActorRef<ToDiscoveryWalker>,
++        /// The walker that started this session, or none for a check-in.
++        walker_ref: Option<ActorRef<ToDiscoveryWalker>>,
+         session_ref: ActorRef<ToDiscoverySession>,
+         started_at: Instant,
+         #[allow(unused)]
+@@ -356,6 +377,11 @@
+                                 if difference.is_empty() || !difference.is_subset(&event.value) {
+                                     continue;
+                                 }
++
++                                // Compare the new topics with the nodes we already know at once.
++                                if myself.send_message(ToDiscoveryManager::CheckIn).is_err() {
++                                    break;
++                                }
+                             }
+                             Some(event) = node_info_rx.recv() => {
+                                 // Reset walkers if new transport info was set, ignore if we're
+@@ -392,41 +418,12 @@
+                     return Ok(());
+                 }
+ 
+-                let session_id = state.next_session_id();
+-
+-                let (session_ref, handle) = DiscoverySession::spawn_linked(
+-                    None,
+-                    DiscoverySessionArguments {
+-                        my_node_id: state.my_node_id,
+-                        remote_node_id,
+-                        store: state.address_book.store().await?,
+-                        endpoint: state.endpoint.clone(),
+-                        manager_ref: myself.clone(),
+-                        quic_transport_config: state.quic_transport_config.clone(),
+-                        args: DiscoverySessionRole::Connect,
+-                    },
+-                    myself.clone().into(),
+-                    state.pool.clone(),
+-                )
+-                .await?;
+-
+-                state.sessions.insert(
+-                    session_ref.get_id(),
+-                    DiscoverySessionInfo::Initiated {
+-                        remote_node_id,
+-                        session_id,
+-                        session_ref,
+-                        walker_ref,
+-                        started_at: Instant::now(),
+-                        handle,
+-                    },
+-                );
+-
+-                // Inform subscribers about this discovery "system" event.
+-                let _ = state.events_tx.send(DiscoveryEvent::SessionStarted {
+-                    role: SessionRole::Initiated,
+-                    remote_node_id,
+-                });
++                initiate_session(&myself, state, remote_node_id, Some(walker_ref)).await?;
++            }
++            ToDiscoveryManager::CheckIn => {
++                for remote_node_id in state.reachable_nodes().await? {
++                    initiate_session(&myself, state, remote_node_id, None).await?;
++                }
+             }
+             ToDiscoveryManager::AcceptSession(remote_node_id, connection) => {
+                 // TODO: Have a max. of concurrently running discovery sessions.
+@@ -487,7 +484,11 @@
+                     insert_address_book(state, discovery_result.clone()).await;
+                 state.metrics.newly_learned_transport_infos += newly_learned_transport_infos;
+ 
+-                if let DiscoverySessionInfo::Initiated { ref walker_ref, .. } = session_info {
++                if let DiscoverySessionInfo::Initiated {
++                    walker_ref: Some(ref walker_ref),
++                    ..
++                } = session_info
++                {
+                     // Continue random walk.
+                     state.next_walk_step(
+                         walker_ref.clone(),
+@@ -532,7 +533,11 @@
+                     "failed discovery session: {err:#}"
+                 );
+ 
+-                if let DiscoverySessionInfo::Initiated { ref walker_ref, .. } = session_info {
++                if let DiscoverySessionInfo::Initiated {
++                    walker_ref: Some(ref walker_ref),
++                    ..
++                } = session_info
++                {
+                     // Continue random walk.
+                     state.repeat_last_walk_step(walker_ref.clone());
+                 }
+@@ -605,6 +610,52 @@
+     }
+ }
+ 
++/// Start a discovery session with a remote node, for a walker's step or for a check-in.
++async fn initiate_session(
++    myself: &ActorRef<ToDiscoveryManager>,
++    state: &mut DiscoveryManagerState,
++    remote_node_id: NodeId,
++    walker_ref: Option<ActorRef<ToDiscoveryWalker>>,
++) -> Result<(), ActorProcessingErr> {
++    let session_id = state.next_session_id();
++
++    let (session_ref, handle) = DiscoverySession::spawn_linked(
++        None,
++        DiscoverySessionArguments {
++            my_node_id: state.my_node_id,
++            remote_node_id,
++            store: state.address_book.store().await?,
++            endpoint: state.endpoint.clone(),
++            manager_ref: myself.clone(),
++            quic_transport_config: state.quic_transport_config.clone(),
++            args: DiscoverySessionRole::Connect,
++        },
++        myself.clone().into(),
++        state.pool.clone(),
++    )
++    .await?;
++
++    state.sessions.insert(
++        session_ref.get_id(),
++        DiscoverySessionInfo::Initiated {
++            remote_node_id,
++            session_id,
++            session_ref,
++            walker_ref,
++            started_at: Instant::now(),
++            handle,
++        },
++    );
++
++    // Inform subscribers about this discovery "system" event.
++    let _ = state.events_tx.send(DiscoveryEvent::SessionStarted {
++        role: SessionRole::Initiated,
++        remote_node_id,
++    });
++
++    Ok(())
++}
++
+ /// Populates the address book with results from discovery session and returns number of newly
+ /// learned transport infos.
+ async fn insert_address_book(
+--- a/p2panda-net/src/discovery/tests.rs
++++ b/p2panda-net/src/discovery/tests.rs
+@@ -1,10 +1,15 @@
+ // SPDX-License-Identifier: MIT OR Apache-2.0
+ 
++use std::time::Duration;
++
++use p2panda_core::Topic;
+ use p2panda_core::test_utils::setup_logging;
+ use tokio::task::JoinHandle;
++use tokio::time::timeout;
+ 
+-use crate::discovery::{DiscoveryEvent, SessionRole};
+-use crate::test_utils::TestNode;
++use crate::NodeId;
++use crate::discovery::{DiscoveryConfig, DiscoveryEvent, SessionRole};
++use crate::test_utils::{TestNode, test_args_from_seed};
+ 
+ async fn session_ended_handle(node: &TestNode) -> JoinHandle<()> {
+     let mut events = node.discovery.events().await.unwrap();
+@@ -53,3 +58,63 @@
+     let result = bob.address_book.node_info(alice.node_id()).await.unwrap();
+     assert!(result.is_some());
+ }
++
++/// A node whose discovery runs no random walkers, so it starts no discovery session on its own.
++async fn without_walkers(seed: [u8; 32]) -> TestNode {
++    let mut args = test_args_from_seed(seed);
++    args.discovery_config = DiscoveryConfig {
++        random_walkers_count: 0,
++        ..DiscoveryConfig::default()
++    };
++    TestNode::spawn_with_args(args, None).await
++}
++
++/// Wait until the node's address book lists the other node as interested in the topic.
++async fn learns_interest(node: &TestNode, other: NodeId, topic: Topic) {
++    let mut interested = node.address_book.watch_topic(topic, false).await.unwrap();
++    while let Some(update) = interested.recv().await {
++        if update.value.contains(&other) {
++            return;
++        }
++    }
++}
++
++#[tokio::test]
++async fn subscribing_to_a_topic_checks_in_with_known_nodes() {
++    setup_logging();
++
++    // Alice and Bob know each other's addresses, as after an earlier discovery session or a
++    // shared topic, but neither runs random walkers.
++    let mut alice = without_walkers([20; 32]).await;
++    let mut bob = without_walkers([21; 32]).await;
++    alice
++        .address_book
++        .insert_node_info(bob.node_info())
++        .await
++        .unwrap();
++    bob.address_book
++        .insert_node_info(alice.node_info())
++        .await
++        .unwrap();
++
++    // Alice is interested in a topic, then Bob subscribes to it too.
++    let topic: Topic = [1; 32].into();
++    alice
++        .address_book
++        .add_topic(alice.node_id(), topic)
++        .await
++        .unwrap();
++    bob.address_book
++        .add_topic(bob.node_id(), topic)
++        .await
++        .unwrap();
++
++    // Bob compares his new topic with Alice at once, and both learn they share it.
++    let wait = Duration::from_secs(5);
++    timeout(wait, learns_interest(&bob, alice.node_id(), topic))
++        .await
++        .expect("bob learns alice is interested in the topic");
++    timeout(wait, learns_interest(&alice, bob.node_id(), topic))
++        .await
++        .expect("alice learns bob is interested in the topic");
++}

@@ -1,0 +1,22 @@
+[package]
+name = "p2panda-check-in"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+# Discovery checks in with the nodes it already knows when this node starts holding a new topic.
+check-in = ["p2panda-net/check-in"]
+
+[dependencies]
+iroh-relay = { version = "1.4.1", features = ["server"] }
+p2panda = "0.8.1"
+p2panda-net = "0.8.1"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time"] }
+tokio-stream = "0.1.19"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# p2panda-net 0.8.1 with the check-in, behind its `check-in` feature; without it, as released.
+[patch.crates-io]
+p2panda-net = { path = "p2panda-net" }

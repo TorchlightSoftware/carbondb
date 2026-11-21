@@ -79,8 +79,8 @@ fn independent(one: &Sets, other: &Sets) -> bool {
   !one.write_set.iter().any(|row| other.reads(row)) && !other.write_set.iter().any(|row| one.reads(row)) && one.write_set.is_disjoint(&other.write_set)
 }
 
-// The later ops a rewind undoes, newest first: those that touched a service
-// the late op touched, widened to every service they touched in turn.
+// The later ops a rewind undoes, newest first: every one that read or wrote
+// a row of this service's tables; one that touched nothing stays.
 pub fn undo_set(later: &[Recorded]) -> Vec<&Recorded> {
   later.iter().filter(|op| op.sets.touched_any()).rev().collect()
 }

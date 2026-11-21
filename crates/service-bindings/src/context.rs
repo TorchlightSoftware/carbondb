@@ -44,8 +44,19 @@ pub trait HandlerContext: Db {
   // Make a call by its service key, as the same actor. A call to this service
   // runs within the op, sees its writes, and when it fails only its own writes
   // roll back. A call to another service, named in this service's channel, is
-  // a message to it: the `call` effect. It answers through `reply`, now or later.
+  // a message to it, the `call` effect: made once, on the op's first run, its
+  // answer recorded and replayed; a write it makes stays when this op is later
+  // refused. It answers through `reply`, now or later.
   fn call(self: Rc<Self>, key: &str, input: Value, reply: Reply);
+
+  // Make a call by its service key consistently with this op's place in its
+  // channel's shared order. A call to this service is as `call`. A write to
+  // another service is the `call` effect bound to this op, which it follows:
+  // undone when this op is. A read of another service runs on every run, as of
+  // this op's place, once that service has applied every op before it; each
+  // statement looks up one row by its whole key, and an op applied there later
+  // at an earlier place, changing a row it read, runs this op again.
+  fn callsync(self: Rc<Self>, key: &str, input: Value, reply: Reply);
 
   // Make an effect by name: something outside this service's own tables. On
   // an op's first run the effect is made and its output, success or failure,

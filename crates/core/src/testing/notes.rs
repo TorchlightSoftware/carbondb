@@ -9,8 +9,12 @@
 //!   {"delete": "a"}                                delete note a, or fail with a 404
 //!   {"unless": "a", "do": [..]}                    run the steps in `do` only when no note says a
 //!   {"read": true}                                 add the texts this handler sees to the output
+//!   {"get": "k"}                                   add the text of the note keyed k, looked up by its
+//!                                                  key, or null, to the output
 //!   {"call": "POST [notes]/run", "input": {..}}    make a call, adding its answer to the output
-//!   {"call": .., "catch": true}                    the same, adding a failure's status instead of failing
+//!   {"callsync": "GET [notes]/run", ..}            the same through `callsync`
+//!   {"call": .., "catch": true}                    either, adding a failure's status instead of failing
+//!   {"call": .., "expect": answer}                 either, failing with a 409 unless it answers `answer`
 //!   {"fail": "why"}                                fail with a 409
 //!   {"hang": true}                                 never settle, keeping the call for `hung`
 //!
@@ -105,6 +109,14 @@ fn set(db: &dyn Db, key: &Value, text: &Value) -> Result<()> {
   db.run(sql, &[text.clone(), key.clone()]).map(|_| ())
 }
 
+// A call's answer, failing with a 409 unless it is the one expected, when one is.
+fn expect(value: Value, expected: Option<Value>) -> Result<Value> {
+  match expected {
+    Some(expected) if expected != value => Err(conflict(format!("Expected {expected}, and the call answered {value}"))),
+    _ => Ok(value),
+  }
+}
+
 // Run the rest of a script, then settle with what it gathered.
 fn step(context: Context, mut script: VecDeque<Value>, mut output: Vec<Value>) {
   let Some(next) = script.pop_front() else {
@@ -130,15 +142,17 @@ fn step(context: Context, mut script: VecDeque<Value>, mut output: Vec<Value>) {
     })
   } else if next.get("read").is_some() {
     seen(context.as_ref()).map(|texts| output.push(texts))
+  } else if let Some(key) = next.get("get") {
+    context.get("SELECT text FROM note WHERE id = ?", std::slice::from_ref(key)).map(|row| output.push(row["text"].clone()))
   } else if let Some(why) = next["fail"].as_str() {
     Err(conflict(why))
   } else if next.get("hang").is_some() {
     return hang(context);
   } else {
     let catch = next["catch"] == json!(true);
+    let expected = next.get("expect").cloned();
     let caller = Rc::clone(&context);
-    let key = next["call"].as_str().unwrap().to_string();
-    return context.call(&key, next["input"].clone(), Box::new(move |result| match result {
+    let answered: crate::Reply = Box::new(move |result| match result.and_then(|value| expect(value, expected)) {
       Ok(value) => {
         output.push(value);
         step(caller, script, output)
@@ -150,7 +164,11 @@ fn step(context: Context, mut script: VecDeque<Value>, mut output: Vec<Value>) {
       Err(error) => {
         let _ = caller.settle(Err(error));
       }
-    }));
+    });
+    return match next["callsync"].as_str() {
+      Some(key) => context.callsync(key, next["input"].clone(), answered),
+      None => context.call(next["call"].as_str().unwrap(), next["input"].clone(), answered),
+    };
   };
   match done {
     Ok(()) => step(context, script, output),

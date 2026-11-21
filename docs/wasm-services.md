@@ -26,7 +26,8 @@ What a service may ask of the core, all for the call it is handling:
 | `run(sql, params)` | a statement on its `sql` binding, inside the op's transaction; never in a GET |
 | `all(sql, params)` | the rows a query answers, from the op's transaction or the GET's snapshot |
 | `draw()` | the next value drawn from the op: ids and randomness, the same on every replica, never twice within one op, even across calls inside it |
-| `call(key, input)` | a call by service key: inside the op to the same service, a message (the `call` effect) to another the channel names |
+| `call(key, input)` | a call by service key: inside the op to the same service, a message (the `call` effect) to another the channel names, bound to nothing |
+| `callsync(key, input)` | a call by service key consistent with the op's place: a write to another service bound to the op, a read of one as of the op's place, by key ([replication.md](replication.md#consistent-reads)) |
 | `effect(name, input)` | an effect, made on the op's first run and replayed after (see [replication.md](replication.md)) |
 | `log(level, message)` | a message for whoever runs the device, never part of the op |
 

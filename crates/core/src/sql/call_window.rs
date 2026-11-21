@@ -6,6 +6,10 @@
 //! the service's own tables and records what it read (`sql::authorizer`), and
 //! `op_id()` draws from the window's op. The core's own statements run outside
 //! any window, with neither.
+//!
+//! A read through `callsync` runs its statements elsewhere, on a scratch
+//! connection holding the row each looks up as it stood (`store::as_of`), in
+//! a call window of its own.
 
 use std::sync::Arc;
 
@@ -17,6 +21,7 @@ use serde_json::Value;
 use crate::error::{Result, sqlite};
 use crate::sql::Statements;
 use crate::sql::authorizer::{Shared, authorize, unrecorded};
+use crate::store::changeset::Row;
 use crate::store::{Failure, all, run};
 use crate::{Db, Op};
 
@@ -61,24 +66,30 @@ pub struct Scoped<'a> {
 }
 
 impl Scoped<'_> {
-  // Run a statement inside the call window, then restore the window it
-  // replaced and settle what it read.
+  // Run a statement inside the call window, and settle what it read.
   fn inside<T>(&self, sql: &str, params: &[Value], work: impl FnOnce(&str) -> Result<T>) -> Result<T> {
     let analysed = match self.window.service {
       true => Some(unrecorded(self.access, || self.statements.get(self.connection, self.failure, sql))?),
       false => None,
     };
-    let previous = {
-      let mut access = self.access.lock().expect("access");
-      access.settle(None);
-      std::mem::replace(&mut access.window, self.window.clone())
-    };
-    let result = work(sql);
-    let mut access = self.access.lock().expect("access");
-    access.window = previous;
-    access.settle(analysed.and_then(|analysed| analysed.looked_up(params)));
-    result
+    within(self.access, &self.window, analysed.and_then(|analysed| analysed.looked_up(params)), || work(sql))
   }
+}
+
+// Run a statement on a connection inside a call window, then restore the
+// window it replaced and settle what it read: the row it looked up, when the
+// only table it read is that row's, or else the tables it read.
+pub(crate) fn within<T>(access: &Shared, window: &CallWindow, looked_up: Option<Row>, work: impl FnOnce() -> Result<T>) -> Result<T> {
+  let previous = {
+    let mut access = access.lock().expect("access");
+    access.settle(None);
+    std::mem::replace(&mut access.window, window.clone())
+  };
+  let result = work();
+  let mut access = access.lock().expect("access");
+  access.window = previous;
+  access.settle(looked_up);
+  result
 }
 
 impl Db for Scoped<'_> {

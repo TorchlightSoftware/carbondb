@@ -2,7 +2,7 @@
 
 This is for anyone who needs to know how CarbonDB keeps the copies of a service on different devices identical: what decides the order ops apply in, what happens when an op arrives late, what is undone and re-run, what a handler does outside its own tables, and why.
 
-Each service runs in a channel. The channel keeps one log of the ops addressed to every service in it; each service keeps its own store, one SQLite file holding its tables, a pointer to each op addressed to it and its results, so an op and its transaction always cover one service's data. Services call each other by message, and a call within a channel is bound to the op that made it, its cause, whose fate it follows (see [causes](#causes)).
+Each service runs in a channel. The channel keeps one log of the ops addressed to every service in it; each service keeps its own store, one SQLite file holding its tables, a pointer to each op addressed to it and its results, so an op and its transaction always cover one service's data. Services call each other by message. A write made through `callsync` within a channel is bound to the op that made it, its cause, whose fate it follows (see [causes](#causes)); a read made through `callsync` answers as of the reader's place in the shared order, and runs again when that changes (see [consistent reads](#consistent-reads)).
 
 Rewind and replay are built and tested on a single device: a device receives rows from other devices through `Carbon::receive`, and applies them in the shared order. p2panda carries a channel's rows between devices, one p2panda space per channel, as [sync.md](sync.md) tells.
 
@@ -67,7 +67,7 @@ Everything CarbonDB reads in a service's SQL lives in `crates/core/src/sql/`. A 
 
 When the check fails, the late op's run rolls back and the service rewinds:
 
-1. **Choose what to undo.** Every later op that read or wrote any of the service's tables. An op that touched nothing neither depended on the late op nor changed what it sees, so it stays. The rewind itself stays within the service; another service is reached only through causes: when an op's outcome changes, the ops its calls made follow it ([causes](#causes)).
+1. **Choose what to undo.** Every later op that read or wrote any of the service's tables. An op that touched nothing neither depended on the late op nor changed what it sees, so it stays. The rewind itself stays within the service; another service is reached only through causes and readers: when an op's outcome changes, the ops its calls made follow it ([causes](#causes)), and when an op is undone, the ops of other services that read a row it wrote run again ([consistent reads](#consistent-reads)).
 2. **Undo them.** In one transaction, the chosen ops' changesets are inverted and applied, newest first, and their results are forgotten. They are pending again. Effects the late op's in-place run made are kept on its row, so its run at its place replays them.
 3. **Apply in order.** The late op is now the first pending op, so it applies at its place, then the undone ops re-run after it, in order. Each is checked in place like any late op, against the ops still applied after it.
 
@@ -77,7 +77,7 @@ An undone op that re-runs may now succeed where it was refused, or be refused wh
 
 Every replica re-runs every op's handler, but what the handler does outside its own tables happens once: on the op's first run, on the device that made it.
 
-- **Calls between services.** A call to the same service runs inside the op, under a savepoint. A call to another service is a message: the `call` effect logs it in the channel's log as an op addressed to that service, and the answer is recorded. Within the caller's channel the op is bound to the caller's op, its cause; a call into another channel is bound to nothing, and only its delivery is guaranteed. The answer is what the other service answered on this device at that moment; the caller decides by its own logic what a failed call means for it.
+- **Calls between services.** A call to the same service runs inside the op, under a savepoint, whichever binding makes it. Through `call`, a call to another service is a message: the `call` effect logs it in the channel's log as an op addressed to that service, and the answer is recorded; the answer is what the other service answered on this device at that moment, and a write is bound to nothing. Through `callsync`, a write is the same message bound to the caller's op, its cause, within the caller's channel; a read is no effect, but made on every run ([consistent reads](#consistent-reads)). A call into another channel is bound to nothing, and only its delivery is guaranteed. The caller decides by its own logic what a failed call means for it.
 - **Recorded on the row.** Each effect's output, success or failure, is kept on the op's log row in the order the handler asked for it, whatever order the outputs came back in, when its first run settles, whatever its outcome, and travels with the op. An effect still out when the row is written is recorded as unfinished. The core never interprets an output; the service decides what is a failure.
 - **Replayed after.** Every later run, on another device or after a rewind here, gets the recorded outputs in order instead of making the effects again, even when the handler now asks for something else. A run asking for more effects than the first run made gets an unreachable failure, the same on every replica.
 - **Made again when declared.** A service may declare an effect `replicate = "always"` in its `service.toml`; it is made on every run on every replica and never recorded.
@@ -88,13 +88,24 @@ Every replica re-runs every op's handler, but what the handler does outside its 
 
 ## Causes
 
-A call one service makes to another in its channel is logged as an op bound to the caller's op, its cause, and follows it on every replica:
+A write one service makes to another in its channel through `callsync` is logged as an op bound to the caller's op, its cause, and follows it on every replica:
 
 - **Optimistic.** A call applies while its cause is still running, as though the cause will apply; the cause's handler needs its answer.
 - **Undone with its cause.** When what became of an op changes, from applied to refused or back, each op its calls made is taken up again in its service: undone, with every later op there that touched a table, and run again at its place, where it is refused while its cause has failed. So when a late op makes the cause refused at its place, as a late revocation does, every replica undoes its calls the same way.
 - **The caller judges.** A call that fails fails its cause only if the caller's handler fails on it; a caller may tolerate a failed call, such as a chat message that could not be sent.
 - **Published only after.** An op is published only once it applied here and so did every cause above it, so a failed cause's calls never leave the device.
 - **Within a channel.** A call into another channel carries no cause: across channels only delivery is guaranteed.
+- **Not through `call`.** A write made through `call` carries no cause, and stays when its caller is later refused; undoing it takes a compensating call, as in a saga.
+
+## Consistent reads
+
+A read one service makes of another in its channel through `callsync`, inside an op, answers as of that op's place in the shared order, on every replica, rather than from whatever the other service holds on the author's device:
+
+- **Each row as it stood at the reader's place.** A store applies ops in the order they reach it, not in their places, so no one commit need hold every row as it stood at a place. One row's history is in order, though: an op that writes a row a later op already read or wrote never fits in place. So each statement, which must look up one row by its whole key, reads that row as it is now with the changes of the ops placed after the reader undone, newest first, from the changesets their results keep; each store indexes the rows its ops wrote by place (`carbon_write`). The statement runs unchanged against that row alone, on a scratch connection where its table is declared as the store declares it. Why not a kept WAL: [wal-vs-changesets.md](wal-vs-changesets.md). A statement that reads anything more, such as a search, is refused, the same on every replica; a service searches through `call`, then reads the ids it chose through `callsync`.
+- **Only the reader waits.** The read waits until the service it reads has applied every op it holds before the reader's place. A service that reads no other never waits; a reader of a stopped service waits until its deadline. An op of the service read that writes, meanwhile, into the reader's service would queue behind the op waiting on it, so that write is refused at once with `508 LOOP_DETECTED`, as a write back into a service whose op waits on the call is.
+- **Read again when it changes.** The rows a read read are kept in the store it read (`carbon_read`), with the reader's op, place and store. When an op placed before the reader is applied there, or undone, and changes one of those rows, the reader is taken up again in its own store, as a call is when its cause changes, and reads again as of its place.
+- **Nested.** A `callsync` read made inside a `callsync` read is as of the first reader's place, and kept as read by its op.
+- **The past stays readable as long as the changesets do.** Rewinds keep every op's changeset; nothing prunes them yet.
 
 ## What stays on each device
 

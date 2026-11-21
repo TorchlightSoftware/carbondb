@@ -160,6 +160,11 @@ impl HandlerContext for GuestCall {
     wit_bindgen::spawn_local(async move { reply(answered(host::call(key, input).await)) });
   }
 
+  fn callsync(self: Rc<Self>, key: &str, input: Value, reply: Reply) {
+    let (key, input) = (key.to_string(), input.to_string());
+    wit_bindgen::spawn_local(async move { reply(answered(host::callsync(key, input).await)) });
+  }
+
   fn effect(self: Rc<Self>, name: &str, input: Value, reply: Reply) {
     let (name, input) = (name.to_string(), input.to_string());
     wit_bindgen::spawn_local(async move { reply(answered(host::effect(name, input).await)) });

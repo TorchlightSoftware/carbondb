@@ -27,6 +27,14 @@ fn outcomes(space: &crate::ServiceStore) -> Vec<Result<(), u16>> {
   }).collect()
 }
 
+// A row from alice's other device, at a time of its own, received here.
+fn arrives(carbon: &Rc<crate::Carbon>, space: &crate::ServiceStore, script: Value, time: u64) {
+  let call = crate::Call::from_key(&format!("POST [{}]/run", space.runs.name)).unwrap();
+  let actor = Actor { identity: Some("alice".into()), device: Some("laptop".into()) };
+  let op = crate::ops::op::stamp(&actor, &call, &json!({"do": script}), &carbon.services().version(&space.runs.package), time);
+  carbon.receive_in(&carbon.opened(&space.id).unwrap(), oplog::LogRow::new(op)).unwrap();
+}
+
 mod transactions;
 mod oplog_entries;
 mod run_states;
@@ -41,3 +49,4 @@ mod replicas;
 mod nodes;
 mod milestone;
 mod causes;
+mod reads;

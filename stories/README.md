@@ -122,6 +122,7 @@ What a person can do on a single device is built, and explained in [docs/](../do
 - [A person learns a call was rejected after merge](backlog/rejected-after-merge.md)
 - [A service calls other services only by the names its channel gives them](backlog/call-by-id.md)
 - [A service can store files](backlog/file-bindings.md)
+- [A write that would wait for itself through other services is refused at once](backlog/wait-cycles.md)
 - [An app can sign a message as an identity and verify one](backlog/sign-and-verify.md)
 - [An app developer can install carbondb on any desktop platform](backlog/native-packaging-per-platform.md)
 - [An app developer can run a Worker's D1 queries on CarbonDB unchanged](backlog/d1-compatibility.md)

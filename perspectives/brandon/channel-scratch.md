@@ -892,3 +892,170 @@ Again, we're translating RBAC from Otto.  [pull, read, write, manage] on a space
     [identity] has no private key to hold. It runs on many devices and many managers. A service key pair would be a secret shared among them
 
 Its `origin` can hold keys of approved managers.
+
+---
+
+    Grants travel inside the op as tokens
+
+Mmm... they're part of the response body of the service call, but we don't record that in an op.
+
+    Your token model translates Otto almost unchanged.
+
+I like what I'm hearing.  I think it would just be instrumenting the JWT revocations so they call the parent channel.
+
+    Revocations only grow, and that makes observing them safe. Two [books] replicas may hold different revocations
+
+No, I just proposed to put the revocations on channels only and not distribute them to the services.  You don't appear to be caught up with that.
+
+    Something outside a service has to be able to start a rewind.
+
+Yes, that's really key.  I think that's a power that the `channel` should have over the services it contains.  The channel's purpose is to route control signals like this.  Whatever we're talking about here... I'll go back to the name "causal bindings"... needs to be something that a service listens to and says "oh wait, I need to rewind".  Maybe the channel can support a tree of state:
+
+jwt:
+    bob: 'valid'
+    sarah: 'revoke'
+
+And Ops that mutate said state.
+
+    channel.watch('GET [channel]/state')
+
+Or maybe we separate out auth:
+
+    channel.watch('GET [channel]/auth')
+
+I'm illustrating these as .watch() commands.  That's from the application context.  I'm still not clear how we would do this properly from inside a service, or tie everything together so that the causal windows are enforced.  Help?
+
+---
+
+    [identity]'s handler writes opaque facts in its own op, for example jwt/sarah → revoked
+
+The only issue (and you've pointed this out before) is that [identity] may not be synced to all devices that need to read from it.
+
+---
+
+    Causes do work for this, though, if the direction is flipped so [identity] calls [books]
+
+Hmm.  In terms of "side effects" and "dependencies", "cause" is meant to record side effects, but RBAC is a dependency.  Cause maps the chain of "writes", and dependencies map the chain of "reads".
+
+    A GET from [books] to [identity] is answered from [identity]'s current state on the author's device
+
+Right... within an Op application on a single service, we have transactional semantics that allow a consistent view of reads and writes.  Our "cause" tag on ops gets us consistent writes, but we haven't implemented anything for consistent reads.  Does that feel accurate to you?
+
+    The shared channel order makes "[identity] as of this op's place" well defined. It needs three changes:
+    - Cross-service GETs answered at the caller's place instead of recorded.
+
+You mean instead of at the current snapshot.
+
+    - Their reads added to the caller's read set.
+    - Rewind able to reach across services in a channel.
+
+Yes.  I think we are thinking along the same lines.  It feels like this is extending database semantics to cover and envelop the services themselves.  Which is certainly interesting.  I think it will have both pros (consistency gaurantees) and cons (restrictions on the programming model).  Let's talk further.
+
+Your Route A I don't think is tenable.  I don't think you can merely reverse the direction of the binding and call it good: you need reads and writes to both have their own correct semantics, it's not one or the other.
+
+---
+
+    The simplest way is one apply sequence per channel, which gives up services applying side by side. This is the main decision.
+
+You're saying we give up concurrent application of services in a channel if we want to gaurantee consistency between them.
+
+    Rewinds spread across services
+
+Performance consequences.  Unknown how much this will bite us in real world use cases.
+
+    A late write in [identity] re-runs every op in the channel that read what it wrote.
+
+Which is basically 1:1 with the requirement of service op application consistent with access controls.
+
+    Lookups by whole key keep that narrow; any other query counts as reading the whole table. So authors will be pushed toward key lookups for cross-service reads.
+
+What are "lookups by whole key"?  By "key lookups for cross-service reads" I think you mean you should reference by ID exactly what you are referring to...
+
+So that pattern that flows from that from the application's perspective is probably:
+
+- call [identity]/members/search
+- call [chat]/invite (with specific member ids)
+
+E.g. services that make subservice calls do so by ID; the application should conduct a search first to determine IDs it wants to work with.  The application then is responsible for connecting the dots on this, because the services cannot do so in a performant fashion, because it would implicitly be wrapped in a transaction.  Transactional control - being able to run the search outside the context of a transaction - is the missing link if you wanted to implement this purely within a service.
+
+    A GET reached from a write must be pure.
+
+I don't think that's true because we memoize side effects.  That documentation may be out of date.
+
+    Across channels, only delivery is guaranteed.
+
+Yes.  Unless we allow causal binding to extend into subchannels.
+
+    Do you accept one apply sequence per channel as the price of consistent reads?
+
+Not clear on that right now.  That's a really big question.
+
+Can you add a topic to the agenda for this? "Should reads be consistent within a channel?"
+
+Propose test cases that would illustrate the tradeoff.  Place these in stories/backlog/consistent-channel-reads.md.  On the "pro consistent reads" you should show:
+
+- inconsistencies that could show up without the gaurantee, and their consequences
+- how human beings would identify and correct
+
+And on the other side:
+
+- performance scenarios that could occur in normal operation, and in more extreme cases
+- whatever can be done to mitigate those performance hits
+
+Write that down in the document for my review, but don't talk extensively about it.  I will read the document.  Then discuss with me:
+
+Is there a third path: where we only reject inconsistencies and rewind if the changes fall outside a certain time threshold.  E.g. if Sarah regains connectivity and reveals that she rejected your membership at midnight, then we have to rewind a bunch of stuff to process that.  But if you're both online and transactions are midstream, we don't care whether Sarah's decision falls 5 minutes before, or 5 minutes after.
+
+---
+
+Let's set aside the threshold and continue talking about read consistency.  I'm reading your document.
+
+    The test's bootstrap node lengthens the waits. It runs on another network id, so every discovery session with it fails;
+
+    The simplest way to answer at the caller's place is for the channel to apply its ops in one sequence across services
+
+But that's not the most performant way, right?  There's a more nuanced understanding of dependencies that we could be applying.
+
+    5. A slow op in one service delays another service's ops
+
+I guess what I'm going for is: a service that depends on another service is accepting the consequences of that dependency.  Failures or performance issues in the dependency will cause problems within their own service.  But services that don't depend on others should not be forced to bear the consequences.  So we need something that's a bit more intelligent, where we're only serializing operations that are truly dependent.  If [chat] is decoupled from everything, then it should be able to run blissfully unaware as two services go to lunch beside it.
+
+---
+
+    How a waiting op could work, as my proposal for the open question:
+    1. It waits only until [identity] has applied every op before its place. If [identity] is behind, [books] waits. If [identity] is stopped, [books]'s readers stall and [chat] carries on.
+    2. If [identity] is ahead, it reads rows as of its place without stopping [identity]. Each later [identity] op's changeset holds the old value of every row it wrote. The row as of place P is the old value in the first op after P that wrote it, or the current row if none did. Since services read each other by id, this is one lookup per row.
+    3. A late [identity] op re-runs only the readers of the rows it wrote. It never re-runs [identity] itself or anything that didn't read those rows.
+    4. It can't deadlock. Every wait targets an earlier place in the shared order, so two services reading each other can't wait on each other forever.
+
+This sounds perfect, exactly what I'm looking for.  Thank you.
+
+    Question: Should a whole-table read in another service wait at its place, or be refused, which would force callers to read by id?
+
+What if we refuse it, but we provide two mechanisms:
+
+- a service can bind `callsync`, which calls to an any service in the same channel and ensures transactional consistency
+- a service can bind `call` which provides no transactional consistency and functions more like our other side effects
+
+Then service implementors can decide.
+
+Question: Do we have meta data that is attached to the service keys that tells us what their shape is?  Or are we getting that from a runtime query plan?  I can't remember how we implemented that.
+
+---
+
+    Question: Do writes made through call still keep their cause, so only reads lose consistency? Or is call a plain message with no cause at all?
+
+I think they should lose the cause - we're now treating them as side effects and memoizing them.  We're not going to rewind or replay them in any circumstance.  Does that sound right to you?
+
+Can you update the agenda and the consistent-channel-reads.md doc?
+
+---
+
+    the write itself still lives on as an ordinary op in its target service.  What it loses is any tie to its caller
+    Through call, the write stays and gets published, like an email already sent
+
+Yes.
+
+
+
+

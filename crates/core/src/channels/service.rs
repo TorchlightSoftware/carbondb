@@ -22,6 +22,7 @@ use crate::calls::dispatch::{Reply, Settled};
 use crate::error::{Result, ServiceError, conflict, internal, not_found};
 use crate::channels::channel::Channel;
 use crate::ops::op_writer::OpWriter;
+use crate::ops::reads::Reading;
 use crate::sql::schema::check_keys;
 use crate::services::Service;
 use crate::store::Store;
@@ -32,7 +33,10 @@ use carbondb_service_bindings::migrations::Migration;
 // The core's own tables in every service's store, its pointers and results,
 // as forward-only migrations. Each name carries its set, since the system's
 // store tracks the system database's migrations beside these.
-pub const MIGRATIONS: &[Migration] = &[("store/0001_pointers_and_results", include_str!("../../migrations/store/0001_pointers_and_results.sql"))];
+pub const MIGRATIONS: &[Migration] = &[
+  ("store/0001_pointers_and_results", include_str!("../../migrations/store/0001_pointers_and_results.sql")),
+  ("store/0002_rows_written_and_read", include_str!("../../migrations/store/0002_rows_written_and_read.sql")),
+];
 
 // Where a space is in applying its ops: initializing until its package is
 // here and compiled, set up and healthy (`crate::channels::lifecycle`), then idle, or
@@ -80,7 +84,14 @@ pub struct ServiceStore {
   pub(crate) draining: Cell<bool>,
   // The ops to take up again between turns, their cause's outcome having changed.
   reconsidering: RefCell<Vec<String>>,
+  // The `callsync` reads waiting for it to apply every op before their places,
+  // each by the op reading and the store it applies in.
+  waiting_reads: RefCell<Vec<(Reading, CaughtUp)>>,
 }
+
+// How a `callsync` read goes on once the store it reads has caught up with its
+// place, or with the failure that store met.
+pub(crate) type CaughtUp = Box<dyn FnOnce(Result<()>)>;
 
 impl ServiceStore {
   // The system's `[@carbon]` store, over the system database, whose file
@@ -128,6 +139,7 @@ impl ServiceStore {
       run_state: RefCell::new(RunState::Idle),
       draining: Cell::new(false),
       reconsidering: RefCell::default(),
+      waiting_reads: RefCell::default(),
     })
   }
 
@@ -139,6 +151,21 @@ impl ServiceStore {
   // The ops to take up again now, taken.
   pub(crate) fn reconsidering(&self) -> Vec<String> {
     std::mem::take(&mut *self.reconsidering.borrow_mut())
+  }
+
+  // Hold a `callsync` read until this store has applied every op before its place.
+  pub(crate) fn wait_to_read(&self, reading: Reading, then: CaughtUp) {
+    self.waiting_reads.borrow_mut().push((reading, then));
+  }
+
+  // The reads waiting, taken, to go on or wait again.
+  pub(crate) fn waiting_to_read(&self) -> Vec<(Reading, CaughtUp)> {
+    std::mem::take(&mut *self.waiting_reads.borrow_mut())
+  }
+
+  // Whether an op of another store is waiting here to read.
+  pub(crate) fn holds_a_read_by(&self, store: &str) -> bool {
+    self.waiting_reads.borrow().iter().any(|(reading, _)| reading.store == store)
   }
 
   // Whether it runs `[@carbon]`.

@@ -47,6 +47,23 @@ export const calls = {
       return {seen}
     }
   },
+  // Reach [roles] through `call` or `callsync`, as `input.through` says:
+  // write a note only when a person reads as the bookkeeper there; answer a
+  // search of everyone's roles; or grant a role there, then refuse.
+  'POST [notes]/checked': {
+    handler: async ({input, op, env: {db}, ...reach}) => {
+      const role = await reach[input.through](`GET [roles]/roles/${input.person}`)
+      if (role !== 'bookkeeper') throw conflict(`${input.person} is not the bookkeeper`, {role})
+      insert(db, op, `checked ${input.person}`)
+    }
+  },
+  'POST [notes]/searched': {handler: ({input, ...reach}) => reach[input.through]('GET [roles]/roles')},
+  'POST [notes]/granted': {
+    handler: async ({input, ...reach}) => {
+      await reach[input.through]('POST [roles]/grants', {person: input.person, role: 'bookkeeper'})
+      throw conflict('Refused after granting')
+    }
+  },
   // An effect this device cannot carry out alone.
   'POST [notes]/reach': {handler: ({effect}) => effect('invite', {contact: 'sally'})},
   'POST [notes]/unawaited': {

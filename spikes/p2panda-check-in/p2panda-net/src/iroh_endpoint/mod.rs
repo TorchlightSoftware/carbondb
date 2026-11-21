@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Establish encrypted, direct connections over Internet Protocol with QUIC.
+mod actors;
+mod api;
+pub mod authoriser;
+mod builder;
+mod config;
+mod discovery;
+mod hooks;
+#[cfg(feature = "supervisor")]
+mod supervisor;
+#[cfg(test)]
+mod tests;
+pub(crate) mod user_data;
+
+// Re-export useful iroh types.
+pub use iroh::endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, EndpointHooks};
+pub use iroh::{EndpointAddr, RelayUrl};
+
+pub use api::{Endpoint, EndpointError};
+pub use builder::Builder;
+pub use config::IrohConfig;

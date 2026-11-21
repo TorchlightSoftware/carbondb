@@ -25,8 +25,16 @@ interface host {
 
   /// A call by service key, as the same actor: to this service, inside the
   /// op; to another the channel names, a message to it, made as the `call`
-  /// effect. Answers the callee's answer.
+  /// effect, whose write stays when the op is later refused. Answers the
+  /// callee's answer.
   call: async func(key: string, input: string) -> result<string, string>;
+
+  /// A call by service key consistent with the op's place in the channel's
+  /// shared order: to this service, as `call`; a write to another, the `call`
+  /// effect bound to the op, undone when it is; a read of another, made on
+  /// every run as of the op's place, each statement looking up one row by its
+  /// whole key, and run again when an op placed earlier changes a row it read.
+  callsync: async func(key: string, input: string) -> result<string, string>;
 
   /// An effect by name, made on an op's first run and its output recorded;
   /// every replay gets the recorded output, unless the service declares the

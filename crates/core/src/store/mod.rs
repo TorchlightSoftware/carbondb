@@ -15,7 +15,11 @@
 //!
 //! Each top-level GET opens its own read-only `Reader`, which in WAL mode sees
 //! only committed state and records every table it reads, the read set a watch
-//! re-runs on. Reads therefore never wait for a write, nor for each other.
+//! re-runs on. Reads therefore never wait for a write, nor for each other. A
+//! read through `callsync` reads as of the reader's place instead
+//! (`store::as_of`), each row rebuilt from the changesets rewinds keep and read
+//! on the store's scratch connection (`store::scratch`); SQLite checkpoints
+//! the WAL as usual.
 //!
 //! A service's statements run inside a call window
 //! (`crate::sql::call_window`); the core's own run outside one. Statements
@@ -41,15 +45,20 @@ use serde_json::{Map, Value};
 pub use carbondb_service_bindings::Db;
 use carbondb_service_bindings::migrations::{self, Migration};
 
+pub mod as_of;
 pub mod changeset;
+pub(crate) mod scratch;
 
+use crate::ops::reads::Reading;
 use crate::sql::call_window::{CallWindow, Scoped, guard};
 use crate::sql::Statements;
+use as_of::AsOf;
+use scratch::Scratch;
 use crate::sql::authorizer::{Read, Shared, start_reading, stop_reading, unrecorded};
 use crate::error::{Result, ServiceError, bad_request, is_system_failure, sqlite, system_failure};
 
 // The core's own record of a space, which no rewind undoes.
-const UNRECORDED: [&str; 3] = ["carbon_pointer", "carbon_result", MIGRATED];
+const UNRECORDED: [&str; 5] = ["carbon_pointer", "carbon_result", "carbon_write", "carbon_read", MIGRATED];
 
 // Where a file tracks the migrations of the core's own tables.
 const MIGRATED: &str = "carbon_migrations";
@@ -74,6 +83,7 @@ pub struct Store {
   access: Shared,
   failure: Failure,
   statements: Rc<Statements>,
+  scratch: Rc<Scratch>,
 }
 
 impl Store {
@@ -83,7 +93,9 @@ impl Store {
     connection.pragma_update(None, "journal_mode", "wal").map_err(sqlite)?;
     connection.pragma_update(None, "foreign_keys", "on").map_err(sqlite)?;
     let access = guard(&connection)?;
-    Ok(Store { path: path.to_path_buf(), writer: Writer::new(connection, |_| RefCell::default()), access, failure: Failure::default(), statements: Rc::default() })
+    let failure = Failure::default();
+    let scratch = Rc::new(Scratch::open(Rc::clone(&failure))?);
+    Ok(Store { path: path.to_path_buf(), writer: Writer::new(connection, |_| RefCell::default()), access, failure, statements: Rc::default(), scratch })
   }
 
   pub fn path(&self) -> &Path {
@@ -201,6 +213,12 @@ impl Store {
     Reader::over(&self.path, Rc::clone(&self.failure), Rc::clone(&self.statements))
   }
 
+  // A read through `callsync` as of the place of the op reading: each
+  // statement reads its one row as it stood then (`as_of`).
+  pub fn reader_as_of(&self, reading: Reading) -> Result<AsOf> {
+    Ok(AsOf::over(self.reader()?, Rc::clone(&self.scratch), reading))
+  }
+
   // Bring the core's own tables in this file up to date, in one transaction:
   // forward only, refusing a file that newer code has migrated.
   pub fn migrate(&self, migrations: &[Migration]) -> Result<()> {
@@ -217,6 +235,12 @@ impl Store {
     Scoped { connection: self.connection(), access: &self.access, failure: &self.failure, statements: &self.statements, window }
   }
 
+  // Run the core's own reads on the writer, between or inside an op, without
+  // their joining what the op read.
+  pub(crate) fn unrecorded<T>(&self, work: impl FnOnce(&Store) -> T) -> T {
+    unrecorded(&self.access, || work(self))
+  }
+
 }
 
 impl Db for Store {
@@ -229,7 +253,7 @@ impl Db for Store {
   }
 }
 
-// A GET's snapshot of committed state, recording the tables it reads.
+// A GET's snapshot of committed state, recording what it reads.
 pub struct Reader {
   connection: Connection,
   access: Shared,
@@ -252,16 +276,22 @@ impl Reader {
     Ok(Reader { connection, access, failure, statements })
   }
 
-  // End the read and return the tables it read, which watches re-run on.
-  pub fn end(&self) -> Result<Vec<String>> {
+  // End the read and return what it read: the tables and rows it read.
+  pub fn end(&self) -> Result<Vec<Read>> {
     let ended = batch(&self.connection, &self.failure, "COMMIT");
-    let tables: std::collections::BTreeSet<String> = stop_reading(&self.access).iter().map(|read| read.table().to_string()).collect();
-    ended.map(|_| tables.into_iter().collect())
+    let read = stop_reading(&self.access);
+    ended.map(|_| read)
   }
 
   pub fn scoped(&self, window: CallWindow) -> Scoped<'_> {
     Scoped { connection: &self.connection, access: &self.access, failure: &self.failure, statements: &self.statements, window }
   }
+}
+
+// The tables reads read, in name order, which watches re-run on.
+pub fn tables_read(reads: &[Read]) -> Vec<String> {
+  let tables: std::collections::BTreeSet<String> = reads.iter().map(|read| read.table().to_string()).collect();
+  tables.into_iter().collect()
 }
 
 impl Db for Reader {
@@ -457,7 +487,7 @@ mod tests {
     store.run("INSERT INTO message (id, text) VALUES ('m1', 'hi')", &[]).unwrap();
     let reader = store.reader().unwrap();
     let rows = reader.all("SELECT m.id FROM message m JOIN member p ON p.id = m.id", &[]).unwrap();
-    assert_eq!((rows, reader.end().unwrap()), (vec![], vec!["member".to_string(), "message".to_string()]));
+    assert_eq!((rows, tables_read(&reader.end().unwrap())), (vec![], vec!["member".to_string(), "message".to_string()]));
     store.end_write(true).unwrap();
     assert_eq!(store.reader().unwrap().get("SELECT text FROM message", &[]).unwrap(), json!({"text": "hi"}));
   }

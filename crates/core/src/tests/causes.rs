@@ -1,6 +1,7 @@
-//! Causes: an op a call made is bound to the op that made it, within one
-//! channel, and follows it on every replica: undone when its cause is undone,
-//! and never published unless its cause succeeded.
+//! Causes: an op a `callsync` write made is bound to the op that made it,
+//! within one channel, and follows it on every replica: undone when its cause
+//! is undone, and never published unless its cause succeeded. A write made
+//! through `call` is bound to nothing, and stays.
 
 use super::*;
 use crate::testing::{awaited, register_script, replicated, until};
@@ -15,21 +16,13 @@ fn room_with_jots() -> (tempfile::TempDir, Rc<crate::Carbon>, crate::Identity, S
   (directory, carbon, identity, room)
 }
 
-// A row from alice's other device, at a time of its own, received here.
-fn arrives(carbon: &Rc<crate::Carbon>, space: &crate::ServiceStore, script: Value, time: u64) {
-  let call = crate::Call::from_key(&format!("POST [{}]/run", space.runs.name)).unwrap();
-  let actor = Actor { identity: Some("alice".into()), device: Some("laptop".into()) };
-  let op = crate::ops::op::stamp(&actor, &call, &json!({"do": script}), &carbon.services().version(&space.runs.package), time);
-  carbon.receive_in(&carbon.opened(&space.id).unwrap(), oplog::LogRow::new(op)).unwrap();
-}
-
 #[test]
 fn a_call_follows_its_cause_when_a_late_op_refuses_the_cause_at_its_place() {
   let (_directory, carbon, identity, room) = room_with_jots();
   let (notes, jots) = (service(&carbon, &room, "notes"), service(&carbon, &room, "jots"));
   arrives(&carbon, &notes, json!([{"insert": "allowed"}]), 1);
   // Sally closes the books, which posts to [jots], only while she is allowed.
-  let close = json!({"do": [{"replace": ["allowed", "allowed"]}, {"call": "POST [jots]/run", "input": {"do": [{"insert": "closed"}]}}]});
+  let close = json!({"do": [{"replace": ["allowed", "allowed"]}, {"callsync": "POST [jots]/run", "input": {"do": [{"insert": "closed"}]}}]});
   on(&carbon, &room, &identity, "POST [notes]/run", close).unwrap();
   assert_eq!(texts(&jots.store().reader().unwrap()).unwrap(), json!(["closed"]));
   let posted = &entries(&jots)[0];
@@ -57,7 +50,7 @@ fn an_op_refused_on_its_first_run_undoes_its_calls_and_none_of_them_is_published
   let (_directory, carbon) = replicated();
   register_script(&carbon, "jots");
   let identity = crate::testing::found(&carbon, "alice", &["notes", "jots"]);
-  let called = awaited(|answer| carbon.call(Some(&identity.personal), Some(&identity.id), "POST [notes]/run", json!({"do": [{"call": "POST [jots]/run", "input": {"do": [{"insert": "j"}]}}, {"fail": "no"}]}), answer));
+  let called = awaited(|answer| carbon.call(Some(&identity.personal), Some(&identity.id), "POST [notes]/run", json!({"do": [{"callsync": "POST [jots]/run", "input": {"do": [{"insert": "j"}]}}, {"fail": "no"}]}), answer));
   assert_eq!(called.unwrap_err().status, 409);
   let jots = service(&carbon, &identity.personal, "jots");
   until(|| outcomes(&jots) == vec![Err(409)]);
@@ -78,4 +71,19 @@ fn a_call_into_another_channel_carries_no_cause() {
   let caused = |key: &str| rows.iter().filter(|row| row.op.key == key).map(|row| row.cause.is_some()).collect::<Vec<bool>>();
   assert_eq!(caused("POST [@carbon]/services"), [false], "founding called [@carbon] here from the system, another channel");
   assert_eq!(caused("POST [channel]/services"), [true], "[@carbon] here named the service under its own op");
+}
+
+#[test]
+fn a_write_through_call_stays_when_its_caller_is_refused_and_one_through_callsync_is_undone() {
+  let cases = [("call", json!(["closed"]), vec![Ok(())]), ("callsync", json!([]), vec![Err(409)])];
+  for (binding, left, posted) in cases {
+    let (_directory, carbon, identity, room) = room_with_jots();
+    let (notes, jots) = (service(&carbon, &room, "notes"), service(&carbon, &room, "jots"));
+    arrives(&carbon, &notes, json!([{"insert": "allowed"}]), 1);
+    let close = json!({"do": [{"replace": ["allowed", "allowed"]}, {binding: "POST [jots]/run", "input": {"do": [{"insert": "closed"}]}}]});
+    on(&carbon, &room, &identity, "POST [notes]/run", close).unwrap();
+    arrives(&carbon, &notes, json!([{"delete": "allowed"}]), 2);
+    assert_eq!(outcomes(&notes), vec![Ok(()), Ok(()), Err(404)], "{binding}: the close is refused at its place");
+    assert_eq!((texts(&jots.store().reader().unwrap()).unwrap(), outcomes(&jots)), (left, posted), "{binding}");
+  }
 }

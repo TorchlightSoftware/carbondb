@@ -6,10 +6,20 @@
 //!
 //! A call to the same service runs inside the same op, under a savepoint, so
 //! it sees the writes before it, and a failure rolls back only its own writes
-//! and throws to the handler that made it. A call to another service is a
-//! message to it, made as the `call` effect: on the op's first run it is
-//! posted to that service and its answer recorded; every later run gets the
-//! recorded answer (`ops::effects`).
+//! and throws to the handler that made it, whichever binding makes it.
+//!
+//! A call to another service in the channel takes one of two bindings:
+//!
+//! - **`call`**, a message made as the `call` effect: on the op's first run it
+//!   is posted to that service and its answer recorded; every later run gets
+//!   the recorded answer (`ops::effects`). A write it posts is bound to no
+//!   cause, so it stays when its caller is later refused.
+//! - **`callsync`**, consistent with the caller's place in the shared order. A
+//!   write is the same message, bound to the op making it, its cause, which it
+//!   follows. A read runs on every run, once the service read has applied
+//!   every op before the caller's place, each row read as it stood then, and
+//!   is kept in the service read as read by the caller's op (`ops::reads`), so
+//!   an op applied there at an earlier place re-runs it.
 //!
 //! A call that outlives its deadline expires: the core settles it with a
 //! timeout, and its handler's own answer, when it comes, is dropped.
@@ -27,19 +37,24 @@ use crate::carbon::{Cancel, Carbon};
 use crate::calls::deadline::Deadline;
 use crate::error::{Result, ServiceError, bad_request, conflict, forbidden, internal, timed_out};
 use crate::ops::effects::{EffectLog, Turn};
+use crate::ops::reads::Reading;
 use crate::channels::service::ServiceStore;
-use crate::sql::call_window::{CallWindow, Scoped};
+use crate::sql::call_window::CallWindow;
 use crate::store::Reader;
+use crate::store::as_of::AsOf;
 use crate::{Actor, Call, Routing, Db, HandlerContext, Op, Reply};
 
 // How a service call ends: what it settled with, and the calls it made.
 pub(crate) type Settle = Box<dyn FnOnce(Result<Value>, Vec<CallRecord>)>;
 
-// The connection a service call queries: the space's writer inside an op, or a GET's own reader.
+// The connection a service call queries: the space's writer inside an op, a
+// GET's own reader, or, for a read through `callsync` made within an op, a
+// read as of that op's place.
 #[derive(Clone)]
 pub(crate) enum Conn {
   Writer,
   Reader(Rc<Reader>),
+  AsOf(Rc<AsOf>),
 }
 
 // A call a service call made, kept with the op's result on this device: what
@@ -94,6 +109,10 @@ pub struct ServiceCall {
   effects: Rc<RefCell<EffectLog>>,
   // The stores whose ops wait on the run it belongs to.
   awaiting: Vec<String>,
+  // The op whose reads it makes, by its place, when it runs within one or is
+  // a `callsync` read made inside one: what its reads of another service are
+  // as of, and who they are kept as read by.
+  reading: Option<Reading>,
   // Whether the top-level call it belongs to is still open; nothing queries after.
   live: Rc<Cell<bool>>,
   calls: RefCell<Vec<CallRecord>>,
@@ -121,6 +140,7 @@ impl ServiceCall {
     awaiting: Vec<String>,
     live: Rc<Cell<bool>>,
     settle: Settle,
+    reading: Option<Reading>,
   ) -> Rc<ServiceCall> {
     Rc::new(ServiceCall {
       carbon: Rc::clone(carbon),
@@ -132,6 +152,7 @@ impl ServiceCall {
       op,
       effects,
       awaiting,
+      reading,
       live,
       calls: RefCell::default(),
       pending: Cell::new(0),
@@ -234,7 +255,7 @@ impl ServiceCall {
     if !self.call.confined {
       return reply(Err(forbidden(format!("Only a local service calls into a space by its id, or as another actor, not {}", self.call.key()))));
     }
-    let request = json!({"space": space, "key": call.key(), "input": input, "as": actor});
+    let request = json!({"space": space, "key": call.key(), "input": input, "as": actor, "caused": true});
     HandlerContext::effect(Rc::clone(self), "call", request, reply)
   }
 
@@ -249,23 +270,65 @@ impl ServiceCall {
     let (record_call, record_input) = (call.clone(), input.clone());
     let settle: Settle = Box::new(move |result, calls| {
       let result = if guarded { caller.close(result) } else { result };
-      caller.returned(CallRecord::of(&record_call, record_input, &result, calls));
-      reply(result)
+      caller.answered(&record_call, record_input, result, calls, reply)
     });
-    let callee = ServiceCall::new(&self.carbon, &self.space, self.actor.clone(), call, input, self.conn.clone(), self.op.clone(), Rc::clone(&self.effects), self.awaiting.clone(), Rc::clone(&self.live), settle);
+    let callee = ServiceCall::new(&self.carbon, &self.space, self.actor.clone(), call, input, self.conn.clone(), self.op.clone(), Rc::clone(&self.effects), self.awaiting.clone(), Rc::clone(&self.live), settle, self.reading.clone());
     self.carbon.route(callee);
   }
 
   // A call to another service: a message, made as the `call` effect and kept
-  // among the calls this one made.
-  fn message(self: &Rc<Self>, call: Call, input: Value, reply: Reply) {
+  // among the calls this one made; a write it posts is bound to this call's
+  // op when `caused`.
+  fn message(self: &Rc<Self>, call: Call, input: Value, caused: bool, reply: Reply) {
     let caller = Rc::clone(self);
     let (record_call, record_input) = (call.clone(), input.clone());
-    let request = json!({"key": call.key(), "input": input});
+    let request = json!({"key": call.key(), "input": input, "caused": caused});
     HandlerContext::effect(Rc::clone(self), "call", request, Box::new(move |result| {
       caller.calls.borrow_mut().push(CallRecord::of(&record_call, record_input, &result, vec![]));
       reply(result)
     }));
+  }
+
+  // A `callsync` read of another service in this one's channel: answered once
+  // that service has applied every op it holds before this call's place, and
+  // read as of it. A GET outside any op has no place, and reads as things stand.
+  fn read_sync(self: &Rc<Self>, call: Call, input: Value, reply: Reply) {
+    let target = match self.carbon.service_space(&self.space.channel.id, &call) {
+      Ok(target) => target,
+      Err(error) => return reply(Err(error)),
+    };
+    self.pending.set(self.pending.get() + 1);
+    let (caller, read) = (Rc::clone(self), Rc::clone(&target));
+    self.carbon.when_caught_up(&target, self.reading.clone(), Box::new(move |caught_up| match caught_up {
+      Ok(()) => caller.read_in(&read, call, input, reply),
+      Err(error) => caller.answered(&call, input, Err(error), vec![], reply),
+    }));
+  }
+
+  // Run a `callsync` read in the service read, on a reader as of this call's
+  // place, keeping there what it read. Its effects are this call's run's.
+  fn read_in(self: &Rc<Self>, target: &Rc<ServiceStore>, call: Call, input: Value, reply: Reply) {
+    let opened = match &self.reading {
+      Some(reading) => target.store().reader_as_of(reading.clone()).map(|as_of| Conn::AsOf(Rc::new(as_of))),
+      None => target.store().reader().map(|reader| Conn::Reader(Rc::new(reader))),
+    };
+    let conn = match opened {
+      Ok(conn) => conn,
+      Err(error) => return self.answered(&call, input, Err(error), vec![], reply),
+    };
+    let (caller, read, here, record_call, record_input) = (Rc::clone(self), conn.clone(), Rc::clone(target), call.clone(), input.clone());
+    let settle: Settle = Box::new(move |result, calls| {
+      let kept = keep_reads(&here, &read);
+      caller.answered(&record_call, record_input, kept.and(result), calls, reply)
+    });
+    let callee = ServiceCall::new(&self.carbon, target, self.actor.clone(), call, input, conn, None, Rc::clone(&self.effects), self.awaiting.clone(), Rc::clone(&self.live), settle, self.reading.clone());
+    self.carbon.route(callee);
+  }
+
+  // A call this one made inside its run has answered: keep it among its calls, and answer.
+  fn answered(&self, call: &Call, input: Value, result: Result<Value>, calls: Vec<CallRecord>, reply: Reply) {
+    self.returned(CallRecord::of(call, input, &result, calls));
+    reply(result)
   }
 
   // End a call's savepoint, keeping its writes or rolling them back.
@@ -288,15 +351,27 @@ impl ServiceCall {
 
   // The `db` binding: the service's own tables on this call's connection,
   // with its op. `[@carbon]`'s statements are the core's own.
-  fn db(&self) -> Result<Scoped<'_>> {
+  fn db(&self) -> Result<Box<dyn Db + '_>> {
     if !self.live.get() {
       return Err(self.ended());
     }
     let window = CallWindow { service: !self.call.confined, op: self.writing().cloned() };
     Ok(match &self.conn {
-      Conn::Writer => self.space.store().scoped(window),
-      Conn::Reader(reader) => reader.scoped(window),
+      Conn::Writer => Box::new(self.space.store().scoped(window)),
+      Conn::Reader(reader) => Box::new(reader.scoped(window)),
+      Conn::AsOf(as_of) => Box::new(as_of.scoped(window)),
     })
+  }
+}
+
+// End a `callsync` read. One as of an op's place keeps the rows it read in
+// the service read, as read by that op; one made outside an op reads only
+// what is there now, which no later op changes.
+fn keep_reads(target: &ServiceStore, conn: &Conn) -> Result<()> {
+  match conn {
+    Conn::AsOf(as_of) => target.op_writer.record_reads(target.store(), target.is_applying(), as_of.end()?, as_of.reading().clone()),
+    Conn::Reader(reader) => reader.end().map(|_| ()),
+    Conn::Writer => Ok(()),
   }
 }
 
@@ -345,7 +420,22 @@ impl HandlerContext for ServiceCall {
     };
     match self.space.answers(&call) {
       true => self.inside(call, input, reply),
-      false => self.message(call, input, reply),
+      false => self.message(call, input, false, reply),
+    }
+  }
+
+  fn callsync(self: Rc<Self>, key: &str, input: Value, reply: Reply) {
+    if !self.live.get() {
+      return reply(Err(self.ended()));
+    }
+    let call = match Call::from_key(key).and_then(|call| allowed(&self.call, &call).map(|_| call)) {
+      Ok(call) => call,
+      Err(error) => return reply(Err(error)),
+    };
+    match (self.space.answers(&call), call.writes()) {
+      (true, _) => self.inside(call, input, reply),
+      (false, true) => self.message(call, input, true, reply),
+      (false, false) => self.read_sync(call, input, reply),
     }
   }
 

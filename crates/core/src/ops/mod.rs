@@ -5,7 +5,8 @@
 //! (`results`), and undone and re-run when an op arrives late, or when its
 //! cause fails (`rewind`). What an op does outside its service's own tables are its
 //! effects (`effects`), made on its first run and replayed after, an HTTP request
-//! to the outside world among them (`fetch`). How replicas
+//! to the outside world among them (`fetch`). An op reads another service of
+//! its channel as of its own place (`reads`). How replicas
 //! order, rewind and replay ops is told in docs/replication.md.
 
 pub mod clock;
@@ -17,5 +18,6 @@ pub mod op_writer;
 pub mod pointers;
 pub mod oplog;
 pub mod published;
+pub mod reads;
 pub mod results;
 pub mod rewind;

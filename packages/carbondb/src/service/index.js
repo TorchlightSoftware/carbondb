@@ -8,8 +8,8 @@
 //
 // Each call arrives as `handle`'s request. The handler receives its path
 // parameters and input; `env`, its `sql` binding under the name its
-// service.toml gives it, as a Worker's env holds it; `call` and `effect`; and
-// the op, when the call writes. Everything reaches the core through the
+// service.toml gives it, as a Worker's env holds it; `call`, `callsync` and
+// `effect`; and the op, when the call writes. Everything reaches the core through the
 // world's host imports, and a failure crosses as a service error's JSON.
 // `console` logs through the host, and `fetch` reaches the outside world
 // through the core (./fetch.js).
@@ -86,10 +86,10 @@ function dbOf(writes) {
 // draws from a generator seeded by this device's clock.
 function handlerContextOf({input, op, binding}, path) {
   Math.random = op ? opOf(op, path).random : seeded(Date.now())
-  const call = (key, callInput = null) => reachingLater(async () => JSON.parse(await host.call(key, JSON.stringify(callInput))))
-  const effect = (name, effectInput = null) => reachingLater(async () => JSON.parse(await host.effect(name, JSON.stringify(effectInput))))
+  const across = (reach) => (key, callInput = null) => reachingLater(async () => JSON.parse(await reach(key, JSON.stringify(callInput))))
+  const [call, callsync, effect] = [across(host.call), across(host.callsync), across(host.effect)]
   const env = binding ? {[binding]: dbOf(Boolean(op))} : {}
-  const context = {path, input, env, call, effect}
+  const context = {path, input, env, call, callsync, effect}
   return op ? {...context, op: opOf(op, path)} : context
 }
 

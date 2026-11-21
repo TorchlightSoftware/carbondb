@@ -1,0 +1,217 @@
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,10 @@
+ 
+ ## Unreleased
+ 
++### Fixed
++
++- net: Stop the gossip receiver actor when its event stream ends, instead of polling the ended stream and panicking [#PR](https://github.com/p2panda/p2panda/pull/PR)
++
+ ## [0.8.1] - 13/11/2026
+ 
+ ### Changed
+--- a/p2panda-net/src/gossip/actors/receiver.rs
++++ b/p2panda-net/src/gossip/actors/receiver.rs
+@@ -6,7 +6,7 @@
+ use iroh_gossip::api::GossipReceiver as IrohGossipReceiver;
+ use ractor::thread_local::ThreadLocalActor;
+ use ractor::{ActorProcessingErr, ActorRef};
+-use tracing::error;
++use tracing::{error, trace};
+ 
+ use crate::gossip::actors::session::ToGossipSession;
+ 
+@@ -84,19 +84,23 @@
+                 let _ = myself.cast(ToGossipReceiver::WaitForEvent);
+             }
+             ToGossipReceiver::WaitForEvent => {
+-                if let Some(receiver) = &mut state.receiver
+-                    && let Some(received) = receiver.next().await
+-                {
+-                    match received {
+-                        Ok(event) => {
++                if let Some(receiver) = &mut state.receiver {
++                    match receiver.next().await {
++                        Some(Ok(event)) => {
+                             // Send the event up the chain for processing.
+                             let _ = state.session_ref.cast(ToGossipSession::ProcessEvent(event));
+                         }
+-                        Err(err) => {
++                        Some(Err(err)) => {
+                             error!("gossip receiver actor: {}", err);
+                             myself.stop(Some("channel closed".to_string()));
+                             return Ok(());
+                         }
++                        None => {
++                            // The stream must not be polled again once it has ended.
++                            trace!("gossip receiver actor: event stream ended");
++                            myself.stop(Some("event stream ended".to_string()));
++                            return Ok(());
++                        }
+                     }
+                 }
+ 
+@@ -108,3 +112,162 @@
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::time::Duration;
++
++    use iroh_gossip::net::Gossip as IrohGossip;
++    use p2panda_core::Topic;
++    use p2panda_core::test_utils::setup_logging;
++    use ractor::thread_local::{ThreadLocalActor, ThreadLocalActorSpawner};
++    use ractor::{ActorProcessingErr, ActorRef, SupervisionEvent};
++    use tokio::sync::mpsc;
++    use tokio::time::timeout;
++
++    use super::GossipReceiver;
++    use crate::address_book::AddressBook;
++    use crate::gossip::actors::session::ToGossipSession;
++    use crate::hash_protocol_id_with_network_id;
++    use crate::iroh_endpoint::Endpoint;
++    use crate::test_utils::{ApplicationArguments, test_args};
++    use crate::utils::from_verifying_key;
++
++    /// What the receiver actor's supervisor sees.
++    #[derive(Debug, PartialEq)]
++    enum Seen {
++        Joined,
++        Stopped,
++        Failed,
++    }
++
++    /// Stands in for the gossip session actor: supervises the receiver and reports what it sees.
++    #[derive(Default)]
++    struct Session;
++
++    impl ThreadLocalActor for Session {
++        type State = mpsc::UnboundedSender<Seen>;
++        type Msg = ToGossipSession;
++        type Arguments = mpsc::UnboundedSender<Seen>;
++
++        async fn pre_start(
++            &self,
++            _myself: ActorRef<Self::Msg>,
++            seen: Self::Arguments,
++        ) -> Result<Self::State, ActorProcessingErr> {
++            Ok(seen)
++        }
++
++        async fn handle(
++            &self,
++            _myself: ActorRef<Self::Msg>,
++            message: Self::Msg,
++            seen: &mut Self::State,
++        ) -> Result<(), ActorProcessingErr> {
++            if let ToGossipSession::ProcessJoined(_) = message {
++                let _ = seen.send(Seen::Joined);
++            }
++            Ok(())
++        }
++
++        async fn handle_supervisor_evt(
++            &self,
++            _myself: ActorRef<Self::Msg>,
++            event: SupervisionEvent,
++            seen: &mut Self::State,
++        ) -> Result<(), ActorProcessingErr> {
++            match event {
++                SupervisionEvent::ActorTerminated(..) => {
++                    let _ = seen.send(Seen::Stopped);
++                }
++                SupervisionEvent::ActorFailed(..) => {
++                    let _ = seen.send(Seen::Failed);
++                }
++                _ => (),
++            }
++            Ok(())
++        }
++    }
++
++    /// A node's endpoint, its address book knowing the other node.
++    async fn endpoint(args: &ApplicationArguments, other: &mut ApplicationArguments) -> Endpoint {
++        let address_book = AddressBook::builder().spawn().await.unwrap();
++        address_book
++            .insert_node_info(other.node_info().bootstrap())
++            .await
++            .unwrap();
++        Endpoint::builder(address_book)
++            .config(args.iroh_config.clone())
++            .signing_key(args.signing_key.clone())
++            .spawn()
++            .await
++            .unwrap()
++    }
++
++    /// An iroh gossip instance on a node's endpoint, set up as the gossip manager does.
++    async fn iroh_gossip(endpoint: &Endpoint) -> IrohGossip {
++        let alpn = hash_protocol_id_with_network_id(iroh_gossip::ALPN, endpoint.network_id());
++        let gossip = IrohGossip::builder()
++            .alpn(alpn)
++            .spawn(endpoint.endpoint().await.unwrap());
++        endpoint
++            .accept(iroh_gossip::ALPN, gossip.clone())
++            .await
++            .unwrap();
++        gossip
++    }
++
++    #[tokio::test]
++    async fn stops_when_the_gossip_event_stream_ends() {
++        setup_logging();
++
++        let (mut ant_args, mut bat_args) = (test_args(), test_args());
++        let ant_endpoint = endpoint(&ant_args, &mut bat_args).await;
++        let bat_endpoint = endpoint(&bat_args, &mut ant_args).await;
++        let ant_gossip = iroh_gossip(&ant_endpoint).await;
++        let bat_gossip = iroh_gossip(&bat_endpoint).await;
++
++        // Ant and bat join one topic, and ant's events go to a receiver actor.
++        let topic: Topic = [1; 32].into();
++        let ant_topic = ant_gossip
++            .subscribe(
++                topic.into(),
++                vec![from_verifying_key(bat_args.verifying_key)],
++            )
++            .await
++            .unwrap();
++        let _bat_topic = bat_gossip
++            .subscribe(
++                topic.into(),
++                vec![from_verifying_key(ant_args.verifying_key)],
++            )
++            .await
++            .unwrap();
++        let (_ant_sender, ant_receiver) = ant_topic.split();
++
++        let pool = ThreadLocalActorSpawner::new();
++        let (seen_tx, mut seen) = mpsc::unbounded_channel();
++        let (session, _) = Session::spawn(None, seen_tx, pool.clone()).await.unwrap();
++        GossipReceiver::spawn_linked(
++            None,
++            (ant_receiver, session.clone()),
++            session.get_cell(),
++            pool,
++        )
++        .await
++        .unwrap();
++
++        let wait = Duration::from_secs(10);
++        assert_eq!(
++            timeout(wait, seen.recv()).await.unwrap(),
++            Some(Seen::Joined)
++        );
++
++        // Shutting down ant's gossip ends the receiver's event stream: the receiver stops.
++        ant_gossip.shutdown().await.unwrap();
++        assert_eq!(
++            timeout(wait, seen.recv()).await.unwrap(),
++            Some(Seen::Stopped)
++        );
++    }
++}
